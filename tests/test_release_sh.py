@@ -19,6 +19,8 @@ resolve Windows absolute paths.
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,8 +87,16 @@ def _git_tags(repo: Path) -> str:
     return _run_git(repo, "tag").stdout.strip()
 
 
-def _run_release(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    """Invoke the real scripts/release.sh with cwd set to the throwaway repo."""
+def _run_release(
+    repo: Path, *args: str, env: "dict[str, str] | None" = None
+) -> subprocess.CompletedProcess:
+    """Invoke the real scripts/release.sh with cwd set to the throwaway repo.
+
+    Args:
+        repo: throwaway repo to run in (becomes cwd).
+        *args: arguments forwarded to release.sh.
+        env: extra environment variables layered over the inherited environment.
+    """
     script = Path(__file__).resolve().parent.parent / "scripts" / "release.sh"
     assert script.is_file(), f"release.sh not found at {script}"
     return subprocess.run(
@@ -97,6 +107,7 @@ def _run_release(repo: Path, *args: str) -> subprocess.CompletedProcess:
         encoding="utf-8",
         errors="replace",
         timeout=60,
+        env={**os.environ, **env} if env else None,
     )
 
 
@@ -180,3 +191,122 @@ def test_release_dry_run_on_clean_trunk(skill_root: Path, tmp_path: Path) -> Non
     )
     status = _run_git(repo, "status", "--porcelain").stdout.strip()
     assert status == "", f"--dry-run left the working tree dirty: {status!r}"
+
+
+# ---------------------------------------------------------------------------
+# Release URL derivation
+#
+# The slug was originally a hardcoded constant, so every fork of this skill
+# printed the original author's release page — a genericization defect that no
+# test covered. These cases pin the derivation, the override, and the absence
+# of any hardcoded slug.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_BASH is None, reason="bash not available on this runner (Windows: Git Bash not found at standard path)")
+@pytest.mark.skipif(_GIT is None, reason="git not available on this runner")
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/acme/widget.git",
+        "https://github.com/acme/widget",
+        "git@example.com:acme/widget.git",
+        "ssh://git@example.com/acme/widget.git",
+        "https://someuser@example.com/acme/widget.git",
+    ],
+)
+def test_release_url_derives_slug_from_origin(
+    skill_root: Path, tmp_path: Path, remote_url: str
+) -> None:
+    """The printed release URL comes from origin, in every remote spelling.
+
+    The ssh/userinfo cases use RFC-2606 `example.com` rather than a real forge
+    host: a literal user@host in a shipped file trips this repo's own
+    publication guard (`test_no_infrastructure_leaks`). The host is irrelevant
+    here anyway — only the trailing owner/repo is derived, and the URL is
+    always built against github.com.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo, version="0.1.0")
+    assert _run_git(repo, "remote", "add", "origin", remote_url).returncode == 0
+
+    result = _run_release(repo, "--dry-run")
+
+    assert result.returncode == 0, (
+        f"Expected exit 0.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    assert "https://github.com/acme/widget/releases/tag/v0.1.0" in result.stdout, (
+        f"release URL not derived from origin {remote_url!r}.\n"
+        f"STDOUT:\n{result.stdout}"
+    )
+
+
+@pytest.mark.skipif(_BASH is None, reason="bash not available on this runner (Windows: Git Bash not found at standard path)")
+@pytest.mark.skipif(_GIT is None, reason="git not available on this runner")
+def test_release_url_override_beats_origin(skill_root: Path, tmp_path: Path) -> None:
+    """SUPERHUMAN_REPO_SLUG wins when origin is not the publishing remote."""
+    repo = tmp_path / "repo"
+    _init_repo(repo, version="0.1.0")
+    assert _run_git(
+        repo, "remote", "add", "origin", "https://github.com/upstream/fork-source.git"
+    ).returncode == 0
+
+    result = _run_release(
+        repo, "--dry-run", env={"SUPERHUMAN_REPO_SLUG": "acme/widget"}
+    )
+
+    assert result.returncode == 0, (
+        f"Expected exit 0.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    assert "https://github.com/acme/widget/releases/tag/v0.1.0" in result.stdout
+    assert "upstream/fork-source" not in result.stdout, (
+        f"override did not take precedence over origin.\nSTDOUT:\n{result.stdout}"
+    )
+
+
+@pytest.mark.skipif(_BASH is None, reason="bash not available on this runner (Windows: Git Bash not found at standard path)")
+@pytest.mark.skipif(_GIT is None, reason="git not available on this runner")
+def test_release_url_omitted_without_origin(skill_root: Path, tmp_path: Path) -> None:
+    """No origin is not an error — it omits the link rather than guessing one.
+
+    Throwaway repos (including the ones in this file) have no remote, so a
+    derivation that hard-failed here would break every guard test.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo, version="0.1.0")
+
+    result = _run_release(repo, "--dry-run")
+
+    assert result.returncode == 0, (
+        f"Expected exit 0 with no origin.\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    assert "https://github.com/" not in result.stdout, (
+        f"a release URL was printed with no origin to derive it from.\n"
+        f"STDOUT:\n{result.stdout}"
+    )
+    assert "SUPERHUMAN_REPO_SLUG" in result.stdout, (
+        f"the missing-URL line should name the override.\nSTDOUT:\n{result.stdout}"
+    )
+
+
+def test_release_sh_has_no_hardcoded_slug(skill_root: Path) -> None:
+    """release.sh must not carry a baked-in "<owner>/<repo>".
+
+    Stated as a property rather than a search for one operator's name, so the
+    guard keeps working for whoever forks this next.
+    """
+    text = (skill_root / "scripts" / "release.sh").read_text(encoding="utf-8")
+
+    literal_assign = re.search(
+        r'^\s*REPO_SLUG=(["\']?)[\w.-]+/[\w.-]+\1\s*$', text, re.MULTILINE
+    )
+    assert literal_assign is None, (
+        "REPO_SLUG is assigned a literal <owner>/<repo> — derive it from the "
+        f"origin remote instead: {literal_assign.group(0).strip()!r}"  # type: ignore[union-attr]
+    )
+
+    hardcoded_url = re.search(r"https://github\.com/[\w.-]+/[\w.-]+/releases", text)
+    assert hardcoded_url is None, (
+        "a release URL is built from a literal slug rather than $REPO_SLUG: "
+        f"{hardcoded_url.group(0)!r}"  # type: ignore[union-attr]
+    )

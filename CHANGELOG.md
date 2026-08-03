@@ -25,6 +25,14 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **`scripts/release.sh` printed the original author's release page from every fork.** `REPO_SLUG`
+  was a hardcoded constant feeding `RELEASE_URL`, so a fork that ran the release driver was told
+  its release lived in a repository it does not own — a functional genericization defect,
+  contradicting v1.0.0's central claim. The slug is now derived from the cwd repo's `origin`
+  remote (both HTTPS and scp-style forms), overridable with `SUPERHUMAN_REPO_SLUG` when `origin`
+  is not the publishing remote. A repo with no origin omits the link instead of guessing one.
+  Covered by `tests/test_release_sh.py`, including a property-shaped guard that fails on any
+  literal `<owner>/<repo>` reappearing in the script.
 - **The activation gate enforced one and a half of the four preconditions `SKILL.md` claimed it
   checked deterministically** (roadmap #143). All four now hold, and the belt-and-suspenders
   design intent is true rather than asserted:

@@ -16,7 +16,9 @@
 #   5. Hook smoke: ./hooks/session-start must exit 0.
 #   6. Create a SIGNED tag: git tag -s vX.Y.Z -m "superhuman vX.Y.Z".
 #   7. git push && git push --tags.
-#   8. Print the release URL.
+#   8. Print the release URL, built from the cwd repo's origin remote (NOT a
+#      hardcoded slug — a fork must report its own release page). Override with
+#      SUPERHUMAN_REPO_SLUG=<owner>/<repo>; with no origin the link is omitted.
 #
 # --dry-run: run the guards, print the planned actions, exit 0. Side-effect-free
 # and network-free — no pytest, no hook smoke, no VERSION write, no tag, no push.
@@ -36,7 +38,49 @@
 
 set -euo pipefail
 
-REPO_SLUG="OrionAIDev/superhuman"
+# Repository slug ("<owner>/<repo>"), used only to print the release URL at the
+# end of a run. DERIVED from the cwd repo's origin remote rather than hardcoded:
+# a hardcoded slug makes every fork of this skill print the ORIGINAL author's
+# release page, which contradicts the skill's claim to be organisation-neutral.
+# Override with SUPERHUMAN_REPO_SLUG when origin is not the publishing remote
+# (a mirror, or a clone whose origin points at an upstream you do not own).
+#
+# Empty is a valid result: throwaway test repos have no origin, and a missing
+# URL is better than a wrong one. Callers must handle the empty case.
+repo_slug() {
+  if [ -n "${SUPERHUMAN_REPO_SLUG:-}" ]; then
+    printf '%s' "$SUPERHUMAN_REPO_SLUG"
+    return 0
+  fi
+
+  local url
+  url="$(git remote get-url origin 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+
+  # Reduce every remote form to its trailing "<owner>/<repo>". Hosts are shown
+  # as <host> placeholders so this comment does not itself trip the repo's
+  # publication guard, which reads a literal user@host as an ssh target:
+  #   https://<host>/owner/repo.git   ssh://git@<host>/owner/repo.git
+  #   git@<host>:owner/repo.git       https://user@<host>/owner/repo
+  # The greedy ".*[/:]" backtracks to whichever separator leaves exactly two
+  # segments, so it handles the scp-style colon and the URL slash alike.
+  #
+  # Only the slug is derived; the URL is built against github.com below. A fork
+  # hosted elsewhere gets the right owner/repo but a GitHub link — deriving the
+  # host too would need per-forge release paths (GitLab uses /-/releases/).
+  local slug
+  slug="$(printf '%s' "$url" \
+    | sed -E 's#\.git$##; s#/$##; s#^.*[/:]([^/:]+)/([^/]+)$#\1/\2#')"
+
+  # A remote that does not reduce to exactly "<owner>/<repo>" (a bare local
+  # path, say) yields nothing rather than a plausible-looking wrong slug.
+  case "$slug" in
+    */*/*|/*|*/) return 0 ;;
+    ?*/?*) printf '%s' "$slug" ;;
+  esac
+}
+
+REPO_SLUG="$(repo_slug)"
 
 usage() {
   cat <<'EOF'
@@ -53,6 +97,11 @@ Options:
   --dry-run       Run the guards, print the planned actions, and exit 0
                   without running tests, writing VERSION, tagging, or pushing.
   --help, -h      Show this help and exit.
+
+Environment:
+  SUPERHUMAN_REPO_SLUG   <owner>/<repo> for the printed release URL. Defaults
+                         to the slug derived from this repo's origin remote;
+                         set it when origin is not the publishing remote.
 
 Guards (always run first):
   * Refuses a dirty working tree.
@@ -147,7 +196,13 @@ EOF
 fi
 
 TAG="v${NEW}"
-RELEASE_URL="https://github.com/${REPO_SLUG}/releases/tag/${TAG}"
+# No derivable slug (no origin, or a remote that is not a hosting URL) means no
+# link to print. The release itself does not depend on this — it is display only.
+if [ -n "$REPO_SLUG" ]; then
+  RELEASE_URL="https://github.com/${REPO_SLUG}/releases/tag/${TAG}"
+else
+  RELEASE_URL="(no origin remote — set SUPERHUMAN_REPO_SLUG to print a release URL)"
+fi
 
 # ---------------------------------------------------------------------------
 # --dry-run: print the plan and exit, fully side-effect-free.
