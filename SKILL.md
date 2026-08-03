@@ -26,14 +26,16 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
 
 5. **HITL-M (Medium) and HITL-L (Low) may run only where your deployment profile permits them.** Whether an unattended loop may operate at the current location is a declared policy, not a judgment call: it is the `act_unattended` approval on the rung this project resolves to, evaluated deterministically. Never reason about it yourself.
 
-   Enforcement: run `scripts/autonomous-precondition.sh <project-root> --level <M|L>` (`<dispatch:bash>`) and ABORT the requested level on any non-zero exit, surfacing the message verbatim:
+   Enforcement: run `scripts/autonomous-precondition.sh <project-root> --level <M|L> --slug <slug>` (`<dispatch:bash>`) and ABORT the requested level on any non-zero exit, surfacing the message verbatim:
 
    | Exit | Meaning | Action |
    |---|---|---|
-   | 0 | permitted at this rung | proceed |
+   | 0 | every precondition holds | proceed |
    | 2 | no profile found while one is required, or a malformed profile | ABORT; surface verbatim |
-   | 3 | forbidden by policy at this rung, or a missing `ROLLBACK.md` at HITL-L | ABORT; fall back to `phases/3-implementation.md` |
-   | 4 | the rung declares no policy for this action | ABORT; a human must declare it before any unattended run — never infer or precedent-mine this |
+   | 3 | a precondition was measured and failed — this rung forbids it, no git remote, no `GOAL.md`, or a missing/undeclared rollback plan at HITL-L | ABORT; fall back to `phases/3-implementation.md` |
+   | 4 | the question could not be answered — the rung declares no policy, or no `--slug` scoped a project-state check | ABORT; a human must settle it before any unattended run — never infer or precedent-mine this |
+
+   Always pass `--slug`. Omitting it does not widen the check; it makes the project-state preconditions unanswerable and returns 4.
 
    The HARD-GATE prose is the belt; the resolver is the suspenders. **HITL-H is always allowed everywhere** and never consults the ladder.
 
@@ -102,12 +104,19 @@ the project's lifetime (read from SUPERHUMAN.md `HITL-level:` on resume, never r
 *(The legacy spellings `0`/`1`/`2` still parse and map to H/M/L, so projects started before v0.8.0 resume unchanged. They mean the same thing; the letters were adopted because a rising number meant falling oversight, which read backwards.)*
 
 HITL-M and HITL-L activate only when ALL activation preconditions hold, checked deterministically by
-`scripts/autonomous-precondition.sh <project-root> --level <M|L>`:
+`scripts/autonomous-precondition.sh <project-root> --level <M|L> --slug <slug>`:
 
 - Git is enabled with a remote configured.
 - The rung this project resolves to permits unattended operation (HARD-GATE rule 5). This is the profile's decision, not the project's — see the ceiling rule below.
-- A `GOAL.md` is provided (file-first) or elicited at G1.
-- **HITL-L only:** if the project modifies existing code (`SUPERHUMAN.md Modifies-existing-code: yes`), a `ROLLBACK.md` naming the exact revert target and procedure must exist (`templates/artifacts/ROLLBACK.md.tpl`). Net-new/greenfield projects are exempt — nothing pre-existing to revert to.
+- A `GOAL.md` is provided (file-first: `<project-root>/GOAL.md` or `docs/superhuman/<slug>/GOAL.md`) or elicited at G1.
+- **HITL-L only:** if the project modifies existing code (`SUPERHUMAN.md Modifies-existing-code: yes`), a `ROLLBACK.md` naming the exact revert target and procedure must exist (`templates/artifacts/ROLLBACK.md.tpl`). Net-new/greenfield projects are exempt — nothing pre-existing to revert to. An **undeclared** `Modifies-existing-code:` field is a gap, not an exemption: the absence of a declared fact is not evidence the fact is false.
+
+**Pass `--slug`.** The last two are questions about *one* project and a repo may hold several in
+`docs/superhuman/`. Without a slug the gate exits 4 ("policy declared but unresolved") rather than
+answering about whichever sibling it happens to find first. The one exception is
+`phases/0-kickoff.md` Step 3, which runs the gate with `--kickoff` before the project's own state
+exists; that flag defers only the two project-state checks and kickoff re-runs the gate unflagged
+once `SUPERHUMAN.md` and `GOAL.md` are written.
 
 **The ceiling rule.** The HITL level is a *project* setting; the rung's `act_unattended` policy is a *location* setting. Where they disagree, the location wins and the level is reduced: a rung of `never` forbids M and L outright. A project may always take more human oversight than its location requires — never less. If a requested level is refused, fall back one step (L → M → H) rather than proceeding at the requested level.
 

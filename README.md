@@ -222,10 +222,14 @@ A surrogate-user role answers a subset of the Type A gates using the declared `G
 
 ### Preconditions
 
+All four are checked by `scripts/autonomous-precondition.sh <project-root> --level <M|L> --slug <slug>`.
+Pass `--slug`: preconditions 3 and 4 are about one project, and a repo may hold several under
+`docs/superhuman/`; without it the gate exits 4 rather than answering about a sibling.
+
 1. **Git with a remote must be configured** — the loop operates on a dedicated `autonomous/<slug>/<run-id>` branch; no remote = precondition fails.
-2. **Only where your profile permits it** — `scripts/autonomous-precondition.sh --level <M|L>` resolves the current location to a rung and refuses unless that rung's `act_unattended` policy allows an unattended run. It also refuses when the rung declares *no* policy (exit 4): an undeclared policy must be settled by a human, never inferred. Enforced deterministically in code, not prose.
-3. **GOAL.md must be provided** — file-first (you drop a `GOAL.md` at the project root before invocation) or elicited at G1 during kickoff. The loop measures every iteration against it.
-4. **Level 2 only:** if the project modifies existing code, a `ROLLBACK.md` (revert target + procedure) must exist — `scripts/autonomous-precondition.sh --level 2` checks for it. Net-new/greenfield projects are exempt.
+2. **Only where your profile permits it** — the gate resolves the current location to a rung and refuses unless that rung's `act_unattended` policy allows an unattended run. It also refuses when the rung declares *no* policy (exit 4): an undeclared policy must be settled by a human, never inferred. Enforced deterministically in code, not prose.
+3. **GOAL.md must be provided** — file-first (`<project-root>/GOAL.md` or `docs/superhuman/<slug>/GOAL.md`) or elicited at G1 during kickoff. The loop measures every iteration against it.
+4. **Level 2 only:** if the project modifies existing code, a `ROLLBACK.md` (revert target + procedure) must exist. Net-new/greenfield projects are exempt — but the exemption requires an explicit `Modifies-existing-code: no`; an undeclared field is a gap, not an exemption.
 5. **Level 0 by default** — HITL-M/L are opt-in. The PM asks at G1 which level you want.
 
 ### The hard block

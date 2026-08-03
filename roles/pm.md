@@ -359,7 +359,7 @@ If the user overrides PM's recommendation 3+ times on the same theme in one proj
 
 ## HITL-M/L behavior
 
-Applies ONLY when HITL-M or 2 was selected at G1 AND `scripts/autonomous-precondition.sh <project-root> --level <1|2>` exited 0 (`<dispatch:bash>`). Otherwise run standard HITL (level 0) — this section does not apply. Full recipe: `phases/3-autonomous-loop.md`; rules: `conventions/autonomous.md`; level-specific gate policy: `roles/surrogate-user.md`.
+Applies ONLY when HITL-M or 2 was selected at G1 AND `scripts/autonomous-precondition.sh <project-root> --level <1|2> --slug <slug>` exited 0 (`<dispatch:bash>`) — the slug-scoped run, not kickoff's `--kickoff` one. Otherwise run standard HITL (level 0) — this section does not apply. Full recipe: `phases/3-autonomous-loop.md`; rules: `conventions/autonomous.md`; level-specific gate policy: `roles/surrogate-user.md`.
 
 ### Surrogate vs human, by level
 

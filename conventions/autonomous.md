@@ -9,7 +9,11 @@ are locked; they may not be loosened by project configuration.
 HITL-M (Medium) and HITL-L (Low) are allowed wherever the deployment profile's `act_unattended`
 policy permits them, and nowhere else. This is never a judgment call — it is declared data,
 evaluated deterministically by
-`scripts/autonomous-precondition.sh <project-root> --level <M|L>`.
+`scripts/autonomous-precondition.sh <project-root> --level <M|L> --slug <slug>`.
+
+`--slug` scopes the preconditions that are questions about one project — its `GOAL.md` and, at
+HITL-L, its rollback plan. A repo may hold several projects under `docs/superhuman/`; without a
+slug the gate exits 4 instead of answering about whichever one it finds first.
 
 The gate fails **closed** for any rung whose policy is `never`, and for any rung that declares no
 policy at all (exit 4 — an undeclared policy must be settled by a human before an unattended run;

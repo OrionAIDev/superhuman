@@ -52,9 +52,39 @@ def _pinned_env() -> dict:
     return env
 
 
-def _run_precond(project_root: Path) -> subprocess.CompletedProcess:
+def _satisfy_project_preconditions(proj: Path) -> None:
+    """Make a bare tmp dir able to reach a ladder verdict.
+
+    From v1.1.0 the gate also enforces git+remote and ``GOAL.md`` (roadmap
+    #143 — both were enforced before v0.7.0 and were lost when the ladder moved
+    into the resolver). The tests in this module are about *rung* verdicts, so
+    they satisfy the project-state preconditions and let the ladder answer.
+
+    Args:
+        proj: Project root, created if absent.
+    """
+    proj.mkdir(parents=True, exist_ok=True)
+    bare = proj.parent / f"{proj.name}-origin.git"
+    env = dict(
+        os.environ,
+        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e",
+        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e",
+    )
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(bare)],
+        cwd=proj, check=True, capture_output=True, env=env,
+    )
+    (proj / "GOAL.md").write_text("# Goal\nfitness: pytest\n", encoding="utf-8")
+
+
+def _run_precond(project_root: Path, slug: str | None = None) -> subprocess.CompletedProcess:
+    args = [_BASH, str(PRECOND), str(project_root)]
+    if slug:
+        args += ["--slug", slug]
     return subprocess.run(
-        [_BASH, str(PRECOND), str(project_root)],
+        args,
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         env=_pinned_env(),
     )
@@ -64,7 +94,7 @@ def _run_precond(project_root: Path) -> subprocess.CompletedProcess:
 def test_precondition_allows_plain_lab_path(tmp_path: Path) -> None:
     """A neutral project dir with no UAT/Prod markers is allowed (exit 0)."""
     proj = tmp_path / "myproj"
-    proj.mkdir()
+    _satisfy_project_preconditions(proj)
     cp = _run_precond(proj)
     assert cp.returncode == 0, f"expected allow, got rc={cp.returncode}: {cp.stderr}"
 
@@ -108,12 +138,13 @@ def test_precondition_blocks_environment_marker(tmp_path: Path, env: str) -> Non
 def test_precondition_allows_lab_test_marker(tmp_path: Path, env: str) -> None:
     """An explicit lab/test environment marker is allowed."""
     proj = tmp_path / "neutral"
+    _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "x"
     sh.mkdir(parents=True)
     (sh / "SUPERHUMAN.md").write_text(
         f"# Superhuman: x\n\n## Environment: {env}\n", encoding="utf-8"
     )
-    assert _run_precond(proj).returncode == 0
+    assert _run_precond(proj, slug="x").returncode == 0
 
 
 @requires_bash
@@ -126,13 +157,14 @@ def test_precondition_allows_laptop_prelab_checkout(tmp_path: Path) -> None:
     ``## Environment:`` marker.
     """
     proj = tmp_path / "Users" / "Chris" / ".claude" / "skills" / "my-project"
+    _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "collector"
     sh.mkdir(parents=True)
     (sh / "SUPERHUMAN.md").write_text(
         "# Superhuman: collector\n\n(no Environment marker — laptop authoring)\n",
         encoding="utf-8",
     )
-    cp = _run_precond(proj)
+    cp = _run_precond(proj, slug="collector")
     assert cp.returncode == 0, f"laptop/pre-lab must pass, got rc={cp.returncode}: {cp.stderr}"
 
 
@@ -151,9 +183,14 @@ def test_precondition_still_blocks_uat_beside_laptop_allow(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def _run_precond_level(project_root: Path, level: str) -> subprocess.CompletedProcess:
+def _run_precond_level(
+    project_root: Path, level: str, slug: str | None = None
+) -> subprocess.CompletedProcess:
+    args = [_BASH, str(PRECOND), str(project_root), "--level", level]
+    if slug:
+        args += ["--slug", slug]
     return subprocess.run(
-        [_BASH, str(PRECOND), str(project_root), "--level", level],
+        args,
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         env=_pinned_env(),
     )
@@ -163,26 +200,28 @@ def _run_precond_level(project_root: Path, level: str) -> subprocess.CompletedPr
 def test_level1_ignores_modifies_existing_code(tmp_path: Path) -> None:
     """Level 1 never requires a ROLLBACK.md, even when Modifies-existing-code: yes."""
     proj = tmp_path / "neutral"
+    _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "x"
     sh.mkdir(parents=True)
     (sh / "SUPERHUMAN.md").write_text(
         "# Superhuman: x\n\n**Modifies-existing-code:** yes\n\n## Environment: lab\n",
         encoding="utf-8",
     )
-    assert _run_precond_level(proj, "1").returncode == 0
+    assert _run_precond_level(proj, "1", slug="x").returncode == 0
 
 
 @requires_bash
 def test_level2_blocks_without_rollback_plan(tmp_path: Path) -> None:
     """Level 2 refuses to run when Modifies-existing-code: yes and no ROLLBACK.md exists."""
     proj = tmp_path / "neutral"
+    _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "x"
     sh.mkdir(parents=True)
     (sh / "SUPERHUMAN.md").write_text(
         "# Superhuman: x\n\n**Modifies-existing-code:** yes\n\n## Environment: lab\n",
         encoding="utf-8",
     )
-    cp = _run_precond_level(proj, "2")
+    cp = _run_precond_level(proj, "2", slug="x")
     assert cp.returncode != 0
     assert "ROLLBACK.md" in (cp.stdout + cp.stderr)
 
@@ -191,6 +230,7 @@ def test_level2_blocks_without_rollback_plan(tmp_path: Path) -> None:
 def test_level2_allows_with_rollback_plan_present(tmp_path: Path) -> None:
     """Level 2 allows once ROLLBACK.md exists alongside SUPERHUMAN.md."""
     proj = tmp_path / "neutral"
+    _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "x"
     sh.mkdir(parents=True)
     (sh / "SUPERHUMAN.md").write_text(
@@ -198,20 +238,21 @@ def test_level2_allows_with_rollback_plan_present(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (sh / "ROLLBACK.md").write_text("# Rollback plan\n\nrevert to <sha>\n", encoding="utf-8")
-    assert _run_precond_level(proj, "2").returncode == 0
+    assert _run_precond_level(proj, "2", slug="x").returncode == 0
 
 
 @requires_bash
 def test_level2_exempts_greenfield_projects(tmp_path: Path) -> None:
     """Level 2 does not require ROLLBACK.md when Modifies-existing-code: no."""
     proj = tmp_path / "neutral"
+    _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "x"
     sh.mkdir(parents=True)
     (sh / "SUPERHUMAN.md").write_text(
         "# Superhuman: x\n\n**Modifies-existing-code:** no\n\n## Environment: lab\n",
         encoding="utf-8",
     )
-    assert _run_precond_level(proj, "2").returncode == 0
+    assert _run_precond_level(proj, "2", slug="x").returncode == 0
 
 
 @requires_bash

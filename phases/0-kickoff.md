@@ -62,13 +62,15 @@ consulted: [business-expert]
    - **If HITL-M or 2 was chosen, validate the precondition** before accepting it:
      - Require git + remote to already be selected above — refuse level 1/2 without it, falling
        back to asking again with level 0 as the only option until git/remote is set.
-     - Run `scripts/autonomous-precondition.sh <project> --level <1|2>` (`<dispatch:bash>`). On
-       non-zero exit, surface the script's message verbatim and fall back one level (2→1→0) rather
-       than silently proceeding — never continue at a level whose precondition failed.
-     - **Level 2 only, when `Modifies-existing-code: yes`:** the precondition above already checks
-       for `ROLLBACK.md`; if it's missing, elicit the revert target + procedure from the user now
-       and write `docs/superhuman/<slug>/ROLLBACK.md` from `templates/artifacts/ROLLBACK.md.tpl`,
-       then re-run the precondition script to confirm it now passes. Net-new/greenfield projects
+     - Run `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug> --kickoff`
+       (`<dispatch:bash>`). `--kickoff` is correct **only here**: the project's own `SUPERHUMAN.md`
+       front-matter and `GOAL.md` are written further down this same step, so those two checks
+       cannot yet be answered. It defers exactly those two; the rung and git+remote are still
+       enforced. On non-zero exit, surface the script's message verbatim and fall back one level
+       (2→1→0) rather than silently proceeding — never continue at a level whose precondition failed.
+     - **Level 2 only, when `Modifies-existing-code: yes`:** elicit the revert target + procedure
+       from the user now and write `docs/superhuman/<slug>/ROLLBACK.md` from
+       `templates/artifacts/ROLLBACK.md.tpl`. Net-new/greenfield projects
        (`Modifies-existing-code: no`) skip this — there's nothing pre-existing to roll back to.
    - **If HITL-M or 2, handle GOAL.md** (file-first override): if
      `<project-root>/GOAL.md` or `<project>/docs/superhuman/<slug>/GOAL.md` already exists, use it
@@ -76,7 +78,13 @@ consulted: [business-expert]
      command, and budget interactively, then write `GOAL.md` from `templates/artifacts/GOAL.md.tpl`.
      Phase 3 then uses `phases/3-autonomous-loop.md` instead of `phases/3-implementation.md`.
    - Update SUPERHUMAN.md front-matter with the chosen values, including `HITL-level:` and
-     `Modifies-existing-code:`.
+     `Modifies-existing-code:`. Declare the latter explicitly as `yes` or `no` — leaving it blank
+     is not an implicit `no`, and the gate treats an undeclared field as a gap.
+   - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
+     `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
+     deferred checks needed now exists, so this is the run that actually authorizes the level. On
+     non-zero exit, fall back one level as above. This re-run is not optional — skipping it is how
+     a level gets accepted with no fitness function and no rollback plan.
    - **Present G0 (and G1):**
      - **HITL-H or 1:** present G0 (vision) using gate-headers Type A — recommendation
        "approve and proceed to G1" with alternatives "refine VISION further" / "narrow scope" /

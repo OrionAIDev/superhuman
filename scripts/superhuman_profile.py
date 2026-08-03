@@ -28,7 +28,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal, NamedTuple, Sequence
 
 try:
     import yaml
@@ -827,42 +827,173 @@ def resolve(root: Path, profile: Profile) -> Resolution:
 # --------------------------------------------------------------------------- #
 
 
-def rollback_plan_gap(root: Path) -> str | None:
-    """Check the low-HITL rollback-plan precondition.
+class Gap(NamedTuple):
+    """A project-state precondition that did not hold.
 
-    This is a *project-state* precondition, not ladder policy: a run that edits
-    pre-existing code at the lowest human-involvement level must have a written
-    revert procedure. Ported unchanged from the pre-0.7.0 gate's Guard 3.
+    Attributes:
+        code: Exit code to surface. ``EXIT_DENIED`` (3) for a gap that was
+            measured; ``EXIT_UNRESOLVED`` (4) for one that could not be
+            evaluated at all, which a human must settle rather than a guess.
+        message: Explanation, printed verbatim by the gate.
+    """
+
+    code: int
+    message: str
+
+
+def project_dir(root: Path, slug: str) -> Path:
+    """Return the artifact directory for one project.
+
+    Args:
+        root: Repository root.
+        slug: Project slug.
+
+    Returns:
+        ``<root>/docs/superhuman/<slug>``.
+    """
+    return root / "docs" / "superhuman" / slug
+
+
+def git_remote_gap(root: Path) -> Gap | None:
+    """Check the git-with-remote precondition.
+
+    An unattended loop keeps work only by committing it, and its rollback story
+    is a revert against a remote that outlives the working tree. A local-only
+    repo, or none at all, cannot offer that. Enforced before v0.7.0, lost when
+    the ladder moved into this resolver, restored here.
 
     Args:
         root: Project root.
 
     Returns:
-        A message describing the gap, or ``None`` when satisfied.
+        A :class:`Gap`, or ``None`` when satisfied.
     """
-    base = root / "docs" / "superhuman"
-    if not base.is_dir():
+    if _git(root, "rev-parse", "--is-inside-work-tree") != "true":
+        return Gap(
+            EXIT_DENIED,
+            f"HITL-M/L require git; {root.as_posix()} is not inside a git "
+            "work tree (run `git init` and add a remote, or use HITL-H)",
+        )
+    if not _git(root, "remote", "get-url", "origin"):
+        return Gap(
+            EXIT_DENIED,
+            f"HITL-M/L require a remote; {root.as_posix()} has no `origin` "
+            "(run `git remote add origin <url>`, or use HITL-H)",
+        )
+    return None
+
+
+def goal_gap(root: Path, slug: str | None) -> Gap | None:
+    """Check the ``GOAL.md`` fitness-function precondition.
+
+    The autonomous loop measures every iteration against ``GOAL.md``; without
+    one there is no fitness function, so "keep or roll back" has nothing to
+    read. File-first, per ``phases/0-kickoff.md``: a root-level ``GOAL.md``
+    satisfies this without a slug.
+
+    Args:
+        root: Project root.
+        slug: Project slug, or ``None`` when the caller did not name one.
+
+    Returns:
+        A :class:`Gap`, or ``None`` when satisfied.
+    """
+    if (root / "GOAL.md").is_file():
         return None
-    for path in sorted(base.rglob("SUPERHUMAN.md")):
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            match = re.match(
-                r"^\*\*Modifies-existing-code:\*\*\s*(.*)$", line, re.IGNORECASE
-            )
-            if not match:
-                continue
-            if re.sub(r"\s+", "", match.group(1)).lower() == "yes":
-                slug_dir = path.parent
-                if not (slug_dir / "ROLLBACK.md").is_file():
-                    return (
-                        f"HITL-L requires {slug_dir.as_posix()}/ROLLBACK.md when "
-                        "Modifies-existing-code: yes "
-                        "(templates/artifacts/ROLLBACK.md.tpl) — none found"
-                    )
+    if slug is None:
+        return Gap(
+            EXIT_UNRESOLVED,
+            "HITL-M/L require a GOAL.md fitness function, and no --slug was "
+            f"given to locate one under {root.as_posix()}/docs/superhuman/ "
+            "(pass --slug <project>, or place GOAL.md at the project root)",
+        )
+    if (project_dir(root, slug) / "GOAL.md").is_file():
+        return None
+    return Gap(
+        EXIT_DENIED,
+        f"HITL-M/L require {project_dir(root, slug).as_posix()}/GOAL.md or "
+        f"{root.as_posix()}/GOAL.md (templates/artifacts/GOAL.md.tpl) — "
+        "neither found",
+    )
+
+
+def rollback_plan_gap(root: Path, slug: str | None) -> Gap | None:
+    """Check the low-HITL rollback-plan precondition.
+
+    This is a *project-state* precondition, not ladder policy: a run that edits
+    pre-existing code at the lowest human-involvement level must have a written
+    revert procedure.
+
+    Scoped to the named project. Before v1.1.0 this took only a root and
+    ``rglob``-ed every ``SUPERHUMAN.md`` beneath it, so in a repo with
+    concurrent projects it answered about whichever sibling sorted first — and
+    when no sibling tripped it, it returned ``None`` having inspected nothing
+    about the running project (roadmap #143).
+
+    A missing ``Modifies-existing-code:`` field is a gap, not a pass: the
+    absence of a declared fact is not evidence that the fact is false.
+
+    Args:
+        root: Repository root.
+        slug: Project slug, or ``None`` when the caller did not name one.
+
+    Returns:
+        A :class:`Gap`, or ``None`` when satisfied.
+    """
+    if slug is None:
+        return Gap(
+            EXIT_UNRESOLVED,
+            "HITL-L checks the rollback plan of one project and no --slug was "
+            "given; refusing to guess across sibling projects under "
+            f"{root.as_posix()}/docs/superhuman/ (pass --slug <project>)",
+        )
+
+    slug_dir = project_dir(root, slug)
+    manifest = slug_dir / "SUPERHUMAN.md"
+    if not manifest.is_file():
+        return Gap(
+            EXIT_UNRESOLVED,
+            f"HITL-L cannot evaluate the rollback precondition: no "
+            f"{manifest.as_posix()} for project {slug!r}",
+        )
+
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return Gap(
+            EXIT_UNRESOLVED,
+            f"HITL-L cannot read {manifest.as_posix()}: {exc}",
+        )
+
+    declared: str | None = None
+    for line in text.splitlines():
+        match = re.match(
+            r"^\*\*Modifies-existing-code:\*\*\s*(.*)$", line, re.IGNORECASE
+        )
+        if match:
+            declared = re.sub(r"\s+", "", match.group(1)).lower()
             break
+
+    if not declared:
+        return Gap(
+            EXIT_DENIED,
+            f"HITL-L requires {manifest.as_posix()} to declare "
+            "`**Modifies-existing-code:** yes|no`; the field is absent or "
+            "empty, and an undeclared field is not a declaration of `no`",
+        )
+    if declared not in {"yes", "no"}:
+        return Gap(
+            EXIT_DENIED,
+            f"HITL-L cannot read `Modifies-existing-code: {declared}` in "
+            f"{manifest.as_posix()} — expected `yes` or `no`",
+        )
+    if declared == "yes" and not (slug_dir / "ROLLBACK.md").is_file():
+        return Gap(
+            EXIT_DENIED,
+            f"HITL-L requires {slug_dir.as_posix()}/ROLLBACK.md when "
+            "Modifies-existing-code: yes "
+            "(templates/artifacts/ROLLBACK.md.tpl) — none found",
+        )
     return None
 
 
@@ -1069,15 +1200,31 @@ def cmd_check(args: argparse.Namespace) -> int:
         )
         return EXIT_UNRESOLVED
 
-    if level == "L":
-        gap = rollback_plan_gap(res.context.root)
-        if gap:
-            print(f"superhuman-profile: BLOCKED — {gap}", file=sys.stderr)
-            return EXIT_DENIED
+    # Project-state preconditions, checked only for the unattended action class:
+    # `promote_into` is a ladder question and has no project state to inspect.
+    if args.action == "act_unattended":
+        slug = getattr(args, "slug", None)
+        checks: list[Gap | None] = [git_remote_gap(res.context.root)]
+        if not getattr(args, "kickoff", False):
+            checks.append(goal_gap(res.context.root, slug))
+            if level == "L":
+                checks.append(rollback_plan_gap(res.context.root, slug))
 
+        for gap in checks:
+            if gap is None:
+                continue
+            label = "UNRESOLVED" if gap.code == EXIT_UNRESOLVED else "BLOCKED"
+            print(f"superhuman-profile: {label} — {gap.message}", file=sys.stderr)
+            return gap.code
+
+    scope = f", project {args.slug}" if getattr(args, "slug", None) else ""
+    deferred = " [kickoff: project-state checks deferred]" if getattr(
+        args, "kickoff", False
+    ) else ""
     print(
         f"superhuman-profile: OK (rung {res.stage.name}, HITL-{level}, "
-        f"{args.action}={policy.describe()}) — {res.context.root.as_posix()}"
+        f"{args.action}={policy.describe()}{scope}) — "
+        f"{res.context.root.as_posix()}{deferred}"
     )
     return EXIT_OK
 
@@ -1632,6 +1779,28 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--action", default="act_unattended", choices=ACTION_CLASSES)
     check.add_argument(
         "--level", default="M", help="HITL level: H, M or L (legacy 0/1/2 accepted)"
+    )
+    check.add_argument(
+        "--slug",
+        "--project",
+        dest="slug",
+        default=None,
+        metavar="SLUG",
+        help=(
+            "project slug under docs/superhuman/ whose state the project "
+            "preconditions apply to. Without it they cannot be scoped and the "
+            "gate exits 4 rather than guessing across sibling projects."
+        ),
+    )
+    check.add_argument(
+        "--kickoff",
+        action="store_true",
+        help=(
+            "the project's own state is still being written (phases/0-kickoff.md "
+            "Step 3): check the ladder and git+remote, and defer GOAL.md and the "
+            "rollback plan to the re-run at the end of kickoff. Never pass this "
+            "to authorize a loop."
+        ),
     )
     check.set_defaults(func=cmd_check)
     return parser

@@ -36,13 +36,15 @@ Otherwise — HITL-H, or the precondition fails — the standard human-in-the-lo
 Run the deterministic guard via `<dispatch:bash>`, passing the project's declared HITL-level:
 
 ```
-scripts/autonomous-precondition.sh <project-root> --level <1|2>
+scripts/autonomous-precondition.sh <project-root> --level <1|2> --slug <slug>
 ```
+
+**`--slug` is mandatory here.** The project-state preconditions (`GOAL.md`, the rollback plan) are questions about *one* project, and a repo may hold several. Without it the gate exits 4 rather than guessing across siblings — it does not fall back to a repo-wide scan.
 
 - **On non-zero exit:** ABORT the autonomous loop immediately. Surface the resolver's message verbatim, then fall back to standard HITL `phases/3-implementation.md`. **ZERO surrogate dispatches occur** if this step fails — the surrogate-user is never spawned where the profile forbids unattended operation, and HITL-L never runs against existing code without a checked-in rollback plan.
   - exit 2 — no profile found while one is required, or the profile is malformed. Fix the configuration; do not proceed.
-  - exit 3 — this rung forbids unattended operation, or `ROLLBACK.md` is missing at HITL-L.
-  - exit 4 — this rung declares no policy for the action. A human must declare it first; this is explicitly NOT precedent-mineable, at any level.
+  - exit 3 — a precondition was measured and failed: this rung forbids unattended operation, git has no `origin` remote, no `GOAL.md` exists, or at HITL-L the project declares `Modifies-existing-code: yes` with no `ROLLBACK.md` (or fails to declare the field at all).
+  - exit 4 — the question could not be answered: this rung declares no policy for the action, or no `--slug` was given so a project-state precondition has no scope. A human must settle it first; this is explicitly NOT precedent-mineable, at any level.
 - **On exit 0:** continue to Step 1. The guard passes wherever the resolved rung's `act_unattended` policy permits it — and, with no profile declared, on any non-trunk branch under the built-in ladder. Passing this gate governs only *where the loop runs*; it does NOT grant approval to promote the result anywhere. Landing work at a protected rung still requires that rung's declared `promote_into` approver, separately and explicitly.
 
 ### Step 1 — set up the run

@@ -11,28 +11,46 @@
 # unchanged. It preserves the pre-0.7.0 command line and exit codes exactly:
 #
 #   Usage:  autonomous-precondition.sh [<project-root>] [--level 1|2]
+#                                      [--slug <project>] [--kickoff]
 #           (level defaults to 1 if omitted, preserving pre-v0.5.0 callers;
 #            the letter spellings H|M|L are also accepted)
 #   Exit:   0 = allowed
 #           2 = usage error, or no profile found while SUPERHUMAN_REQUIRE_PROFILE=1
-#           3 = blocked by ladder policy, or missing rollback plan at HITL-L
+#           3 = blocked by ladder policy, no git remote, missing GOAL.md, or a
+#               missing/undeclared rollback plan at HITL-L
 #           4 = policy declared but unresolved — halt and escalate (new in 0.7.0;
-#               safe because every caller aborts on any non-zero exit)
+#               safe because every caller aborts on any non-zero exit). Also
+#               returned when a project-state precondition cannot be scoped
+#               because no --slug was given.
 #
-# Equivalence with the v0.6.0 implementation is proven by
-# tests/test_golden_verdicts.py over a table of representative paths, including
-# the legacy `*prod*` glob's known false positives. Do not edit policy here —
-# edit the profile.
+# `--slug` names the project under docs/superhuman/ whose state is checked. It
+# is not optional in effect: without it the project-state preconditions cannot
+# be scoped, and the gate exits 4 rather than guessing across sibling projects
+# (roadmap #143 — the unscoped check answered about the wrong project, and
+# passed vacuously when no sibling tripped it).
+#
+# `--kickoff` is for phases/0-kickoff.md Step 3 only, where the project's own
+# state is still being written: it checks the ladder and git+remote and defers
+# GOAL.md and the rollback plan to the unflagged re-run at the end of kickoff.
+# Never pass it to authorize a loop.
+#
+# Do not edit policy here — edit the profile.
 
 set -euo pipefail
 
 ROOT="."
 LEVEL="1"
+SLUG=""
+KICKOFF=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --level)     LEVEL="${2:-}"; shift 2 ;;
     --level=*)   LEVEL="${1#--level=}"; shift ;;
+    --slug|--project)   SLUG="${2:-}"; shift 2 ;;
+    --slug=*)    SLUG="${1#--slug=}"; shift ;;
+    --project=*) SLUG="${1#--project=}"; shift ;;
+    --kickoff)   KICKOFF="1"; shift ;;
     *)           ROOT="$1"; shift ;;
   esac
 done
@@ -66,5 +84,14 @@ if [ -z "${PY:-}" ]; then
   exit 2
 fi
 
-exec "$PY" "$SCRIPT_DIR/superhuman_profile.py" check "$ROOT" \
-  --action act_unattended --level "$LEVEL"
+# Built with `if`, not `[ -n "$X" ] && ARGS+=(…)`: under `set -e` a trailing
+# `&&` list whose test fails takes the whole script's exit status with it.
+ARGS=(check "$ROOT" --action act_unattended --level "$LEVEL")
+if [ -n "$SLUG" ]; then
+  ARGS+=(--slug "$SLUG")
+fi
+if [ -n "$KICKOFF" ]; then
+  ARGS+=(--kickoff)
+fi
+
+exec "$PY" "$SCRIPT_DIR/superhuman_profile.py" "${ARGS[@]}"

@@ -321,15 +321,22 @@ def test_builtin_trunk_precedes_work() -> None:
 
 
 def test_builtin_allows_a_plain_directory(tmp_path: Path) -> None:
-    """A non-git directory is allowed, not denied, under zero-config."""
+    """A non-git directory resolves to an allowing rung under zero-config.
+
+    The *ladder* allows it; the gate still refuses at M because an unattended
+    loop needs git+remote (roadmap #143). `--action promote_into` asks the
+    ladder question on its own, without the project-state preconditions.
+    """
     root = tmp_path / "plain"
     root.mkdir()
-    rc = _cli(
-        ["check", str(root), "--level", "M"],
+    common = dict(
         profile=None,
         extra={"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)},
     )
-    assert rc == sp.EXIT_OK
+    assert _cli(
+        ["check", str(root), "--level", "M", "--action", "promote_into"], **common
+    ) == sp.EXIT_OK
+    assert _cli(["check", str(root), "--level", "M"], **common) == sp.EXIT_DENIED
 
 
 def test_builtin_blocks_unattended_at_a_stable_tag(tmp_path: Path) -> None:

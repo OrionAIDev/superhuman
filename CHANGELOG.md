@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Added
 
+- **`--slug` / `--project` on `superhuman_profile.py check`**, threaded through
+  `scripts/autonomous-precondition.sh`. Project-state preconditions are questions about one
+  project, and a repo may hold several under `docs/superhuman/`; the slug says which.
+- **`--kickoff`** on the same pair, for `phases/0-kickoff.md` Step 3 only, where the project's own
+  state is still being written. It defers the two project-state checks and nothing else — the rung
+  and git+remote are still enforced — and kickoff now re-runs the gate unflagged once
+  `SUPERHUMAN.md` and `GOAL.md` exist. That re-run is the one that authorizes the level.
+- `tests/test_precondition_scope.py` — the multi-project regression fixture whose absence let all
+  of the below ship: two project dirs in one repo, one compliant and one not, asserting the gate
+  answers about the one it was named.
+
 ### Changed
 
 ### Deprecated
@@ -13,6 +24,28 @@ All notable changes to this project will be documented in this file. Format adap
 ### Removed
 
 ### Fixed
+
+- **The activation gate enforced one and a half of the four preconditions `SKILL.md` claimed it
+  checked deterministically** (roadmap #143). All four now hold, and the belt-and-suspenders
+  design intent is true rather than asserted:
+  - **The rollback-plan check answered about the wrong project.** `rollback_plan_gap()` took only a
+    repo root and `rglob`-ed every `SUPERHUMAN.md` beneath it, returning on the first sibling that
+    declared `Modifies-existing-code: yes` with no `ROLLBACK.md`. In a repo with concurrent
+    projects that produced a false BLOCK on a compliant project — and, worse, a **vacuous PASS**
+    when no sibling tripped it, authorizing a HITL-L run having inspected nothing about itself. It
+    is now scoped to `--slug`, and with no slug it exits 4 rather than guessing.
+  - **A missing `Modifies-existing-code:` field is now a gap, not a pass.** The absence of a
+    declared fact is not evidence that the fact is false. Hand-written, pre-v0.8.0, and
+    mid-Phase-0 manifests all previously slipped through unexamined.
+  - **`GOAL.md` is enforced again at HITL-M/L.** The resolver contained zero references to it; a
+    project root with no `GOAL.md` exited 0, so a loop could start with no fitness function.
+  - **git-with-a-remote is enforced again at HITL-M/L.** `has_remote` was computed but reached only
+    profile *inference*, never the `act_unattended` decision, so a repo with no remote passed at
+    both levels.
+
+  Both of the last two were enforced by the pre-v0.7.0 gate and were lost when the ladder moved
+  into the resolver; this restores them rather than adding them. Exit codes 0/2/3/4 keep their
+  meanings — 3 for a precondition measured and failed, 4 for one that could not be answered.
 
 - `scripts/superhuman_profile.py` and the Test promotion script were committed without the
   executable bit despite carrying shebangs, so direct invocation failed with "Permission denied".
