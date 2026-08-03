@@ -1,0 +1,38 @@
+# Generic ladder fixture for MECHANISM tests.
+#
+# Mechanism tests (does the guard block? does the marker outrank the path? does a
+# missing ROLLBACK.md refuse at HITL-L?) must not depend on any particular
+# organisation's environment names — otherwise the framework's test suite is
+# quietly installation-specific, which is the very coupling v0.8.0 removes.
+#
+# Installation-specific POLICY is pinned separately, by the golden fixtures under
+# tests/fixtures/golden/, which are on the pre-publication removal list.
+
+version: 1
+citation: "Release policy: promotion to a protected environment requires human approval"
+
+ladder:
+  - name: declared-protected
+    kind: acceptance
+    detect: { env_marker: [uat, prod, production] }
+    approvals: { act_unattended: never, promote_into: [human] }
+
+  - name: production
+    kind: production
+    detect: { path_segments: ["*prod*"] }
+    approvals: { act_unattended: never, promote_into: [human] }
+
+  - name: staging
+    kind: acceptance
+    detect: { path_segments: [staging, uat] }
+    approvals: { act_unattended: never, promote_into: [human] }
+
+  - name: dev
+    kind: development
+    detect: { path_segments: [dev] }
+    approvals: { act_unattended: [self], promote_into: none }
+
+  - name: workstation
+    kind: authoring
+    detect: { default: true }
+    approvals: { act_unattended: [self], promote_into: none }

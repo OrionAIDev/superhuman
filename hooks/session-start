@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Superhuman SessionStart hook
+# Reads role prompts and canonical references in stable order to prime the prompt cache.
+# Output is sent to stdout; the harness captures it as additional session context.
+
+SKILL_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Stable read order (DO NOT REORDER without bumping VERSION):
+#  1) Dispatch adaptation (always first; everything downstream depends on it)
+#  2) Conventions (project-default behaviors)
+#  3) Role prompts (PM first since orchestrator IS the PM thread)
+#  4) Phase recipes
+#  5) Templates root + delta-report + SUPERHUMAN
+#  6) Reference SKILL.md entries (in deterministic alphabetical order)
+
+read_file() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    echo "### $f"
+    cat "$f"
+    echo
+  fi
+}
+
+read_file "$SKILL_ROOT/adaptation/dispatch.md"
+
+for f in "$SKILL_ROOT/conventions"/*.md; do
+  read_file "$f"
+done
+
+read_file "$SKILL_ROOT/roles/pm.md"
+for f in "$SKILL_ROOT/roles"/*.md; do
+  [ "$(basename "$f")" = "pm.md" ] && continue
+  read_file "$f"
+done
+
+for f in $(ls "$SKILL_ROOT/phases" | sort); do
+  read_file "$SKILL_ROOT/phases/$f"
+done
+
+read_file "$SKILL_ROOT/templates/gate-headers.md"
+read_file "$SKILL_ROOT/templates/delta-report.md.tpl"
+read_file "$SKILL_ROOT/templates/SUPERHUMAN.md.tpl"
+
+for d in $(ls "$SKILL_ROOT/references" | sort); do
+  read_file "$SKILL_ROOT/references/$d/SKILL.md"
+done

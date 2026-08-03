@@ -1,0 +1,42 @@
+# Preset: solo-git — one machine, one repo, no deployment environments.
+#
+# Uses git refs as the ladder: a feature branch is where work happens, trunk is
+# what you protect, a release tag is untouchable. This is the same machinery a
+# multi-environment ladder uses, with the deployment axis simply absent.
+#
+# Install:  cp profiles/presets/solo-git.yaml ~/.superhuman/profile.yaml
+# Verify:   scripts/superhuman_profile.py explain .
+#
+# Rungs are ordered narrowest-first: rungs matching equally-specific detectors
+# are broken by declaration order, so `trunk` must precede `work`.
+
+version: 1
+
+ladder:
+  - name: release
+    kind: production
+    detect: { tag_channel: stable }
+    approvals:
+      act_unattended: never       # never let a loop run against a checked-out release
+      promote_into: [human]
+
+  - name: trunk
+    kind: integration
+    detect: { branch: [main, master, trunk] }
+    approvals:
+      act_unattended: never       # don't let a loop commit directly to trunk
+      promote_into: [human]       # merging into trunk is your promotion gate
+
+  - name: work
+    kind: authoring
+    detect: { branch: ["*"] }
+    approvals:
+      act_unattended: [self]
+      promote_into: none
+
+  - name: local
+    kind: authoring
+    detect: { default: true }     # catch-all: not a git repo, or no commits yet
+    approvals:
+      act_unattended: [self]
+      promote_into: none

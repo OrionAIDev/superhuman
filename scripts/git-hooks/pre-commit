@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# pre-commit — fast-test gate for the superhuman skill (F15).
+#
+# Refuses a commit when the repo's fast test suite fails, so broken code never
+# lands. It runs the suite with the integration smoke EXCLUDED so the hook stays
+# under ~10s (the smoke is a Test-tier concern, not a per-commit gate).
+#
+# INSTALL (per clone):
+#   scripts/install-hooks.sh
+#     -> creates .git/hooks/pre-commit (symlink, or a copy as fallback).
+#
+# BYPASS (emergencies only — prefer fixing the tests):
+#   git commit --no-verify
+#
+# A git pre-commit hook runs with cwd = the repo top-level, so the pytest call
+# here operates on the repo being committed.
+
+set -euo pipefail
+
+# Nothing to check if there is no test suite.
+if [ ! -d tests ]; then
+    exit 0
+fi
+
+# Pick a python interpreter that exists on this platform. The laptop has `python`;
+# Linux (a deployed environment) has only `python3`. Prefer `python` (covers Windows + most
+# Linux), fall back to `python3`.
+PY="$(command -v python || command -v python3 || true)"
+if [ -z "$PY" ]; then
+    echo "pre-commit: no python interpreter found (need python or python3)." >&2
+    exit 1
+fi
+
+# --ignore of a path that does not exist is harmless to pytest, so excluding the
+# integration smoke is safe even in repos that lack it.
+if "$PY" -m pytest tests/ -x --ignore=tests/test_integration_smoke.py -q; then
+    exit 0
+fi
+
+echo "pre-commit: fast tests FAILED — commit refused." >&2
+echo "Fix the tests, or bypass in an emergency with: git commit --no-verify" >&2
+exit 1

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# promote.sh — EXAMPLE promotion driver. Copy, adapt, keep it in YOUR OWN repo.
+#
+# Superhuman never performs a promotion. It *gates* one: the resolver decides
+# whether the destination rung's `promote_into` policy is satisfied, and if a
+# rung declares a `promote:` command, superhuman may invoke it once the required
+# approver has signed off.
+#
+#   # ~/.superhuman/profile.yaml
+#   - name: staging
+#     detect:   { path_segments: [staging] }
+#     approvals: { promote_into: [human], act_unattended: [self] }
+#     promote:  { command: "~/.superhuman/deploy/promote.sh staging" }
+#
+# Deployment mechanics are organisation-specific by nature — ssh targets,
+# absolute paths, container names, credentials. None of that belongs in a
+# published skill, which is why this is an example rather than a script.
+#
+# The shape below is worth copying even if nothing else is: fetch a RELEASED
+# TAG, run the test suite AT the destination, and fail loudly. Deploying a
+# branch, or deploying without re-verifying at the destination, is how a green
+# local build becomes a broken environment.
+#
+# Usage:  promote.sh <rung> <version> [--dry-run]
+
+set -euo pipefail
+
+RUNG="${1:?usage: promote.sh <rung> <version> [--dry-run]}"
+VERSION="${2:?usage: promote.sh <rung> <version> [--dry-run]}"
+DRY_RUN=0
+[ "${3:-}" = "--dry-run" ] && DRY_RUN=1
+
+# Normalise 1.2.3 or v1.2.3 -> v1.2.3
+TAG="v${VERSION#v}"
+
+# --- adapt everything below this line -------------------------------------
+case "$RUNG" in
+  staging)    HOST="deploy@staging.example.internal"; DEST="/srv/app" ;;
+  production) HOST="deploy@prod.example.internal";    DEST="/srv/app" ;;
+  *) echo "promote.sh: unknown rung '$RUNG'" >&2; exit 2 ;;
+esac
+
+REMOTE_CMD="cd ${DEST} \
+  && git fetch --tags --prune \
+  && git checkout ${TAG} \
+  && \$(command -v python3 || command -v python) -m pytest tests/ -x -q \
+  && echo 'promote: ${TAG} OK'"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "==> promote.sh --dry-run (no ssh, no network)"
+  echo "    rung:    ${RUNG}"
+  echo "    tag:     ${TAG}"
+  echo "    target:  ${HOST}"
+  echo "    command: ssh ${HOST} \"${REMOTE_CMD}\""
+  exit 0
+fi
+
+echo "==> Promoting ${TAG} to ${RUNG} (${HOST})"
+if ssh "$HOST" "$REMOTE_CMD"; then
+  echo "==> promote: ${TAG} deployed and verified on ${RUNG}"
+else
+  status=$?
+  echo "promote.sh: deploy/verify FAILED for ${TAG} on ${RUNG} (ssh exit ${status})" >&2
+  exit "$status"
+fi

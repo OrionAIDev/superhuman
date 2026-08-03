@@ -1,0 +1,11 @@
+# Force LF for files that must be executable on POSIX systems
+hooks/session-start text eol=lf
+scripts/cleanup-project.sh text eol=lf
+scripts/release.sh text eol=lf
+scripts/git-hooks/pre-commit text eol=lf
+scripts/install-hooks.sh text eol=lf
+examples/promote.sh.example text eol=lf
+scripts/autonomous-precondition.sh text eol=lf
+scripts/autonomous-rollback.sh text eol=lf
+scripts/autonomous-summary.sh text eol=lf
+scripts/autonomous-iter.sh text eol=lf

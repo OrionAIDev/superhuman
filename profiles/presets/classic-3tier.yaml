@@ -1,0 +1,63 @@
+# Preset: classic-3tier — dev -> staging -> production.
+#
+# Detects environments by path segment AND by an explicit marker, so a checkout
+# whose path does not carry the environment name (a container, a CI runner) can
+# still identify itself via `## Environment:` in its SUPERHUMAN.md.
+#
+# Install:  cp profiles/presets/classic-3tier.yaml ~/.superhuman/profile.yaml
+#           then edit the path_segments to match your layout.
+# Verify:   scripts/superhuman_profile.py explain .
+#
+# Ordering is load-bearing twice over:
+#   1. Narrower rungs first — deny rungs precede allow rungs, so a path matching
+#      two equally-specific detectors resolves to the safer verdict.
+#   2. Allow rungs carry no `env_marker`. Markers outrank paths, so marking an
+#      allow rung would let a `dev` marker inside a production path override the
+#      production block.
+
+version: 1
+citation: "Release policy"
+
+ladder:
+  - name: production
+    kind: production
+    detect:
+      path_segments: [production, prod]
+      env_marker: [prod, production]
+    approvals:
+      act_unattended: never
+      promote_into: { all_of: [agent:security-reviewer, human] }
+    promote: { manual: true }
+
+  - name: staging
+    kind: acceptance
+    detect:
+      path_segments: [staging, uat]
+      env_marker: [staging, uat]
+    approvals:
+      act_unattended: never
+      promote_into: [human]
+
+  - name: dev
+    kind: development
+    detect:
+      path_segments: [dev, development]
+    approvals:
+      act_unattended: [self]
+      promote_into: none
+    tests: [unit, integration]
+
+  - name: workstation-trunk
+    kind: authoring
+    detect: { default: true, branch: [main, master] }
+    approvals:
+      act_unattended: never
+      promote_into: [human]
+
+  - name: workstation
+    kind: authoring
+    detect: { default: true }
+    approvals:
+      act_unattended: [self]
+      promote_into: none
+    tests: [unit]
