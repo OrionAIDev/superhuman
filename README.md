@@ -40,7 +40,7 @@ The skill bundle lives at `~/.claude/skills/superhuman/`. To register the Sessio
 
 Edit your Claude Code `settings.json` (typically `~/.claude/settings.json` or per-project `.claude/settings.json`).
 
-> **Windows note:** the POSIX `~` does not expand inside Claude Code's `settings.json` reliably on Windows. Use the `.cmd` shim form shown below instead, OR substitute the full Windows path (e.g. `C:\\Users\\Chris\\.claude\\skills\\superhuman\\hooks\\session-start`).
+> **Windows note:** the POSIX `~` does not expand inside Claude Code's `settings.json` reliably on Windows. Use the `.cmd` shim form shown below instead, OR substitute the full Windows path (e.g. `C:\\Users\\<you>\\.claude\\skills\\superhuman\\hooks\\session-start`).
 
 ```json
 {

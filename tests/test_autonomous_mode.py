@@ -156,7 +156,7 @@ def test_precondition_allows_laptop_prelab_checkout(tmp_path: Path) -> None:
     not be treated as forbidden. Mirrors ~/.claude/skills/<name>/ with no
     ``## Environment:`` marker.
     """
-    proj = tmp_path / "Users" / "Chris" / ".claude" / "skills" / "my-project"
+    proj = tmp_path / "Users" / "devuser" / ".claude" / "skills" / "my-project"
     _satisfy_project_preconditions(proj)
     sh = proj / "docs" / "superhuman" / "collector"
     sh.mkdir(parents=True)

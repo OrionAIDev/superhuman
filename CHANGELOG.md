@@ -25,6 +25,20 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **The publication guard could not see 11 of the 163 tracked files.** `SCANNED_SUFFIXES` was an
+  *allowlist* of twelve extensions, so every file type nobody thought to add was invisible —
+  including `hooks/session-start` and `scripts/git-hooks/pre-commit`, both shipped executables and
+  exactly where an absolute server path would hide, plus `LICENSE`, `VERSION`, `.gitignore`, two
+  `pyproject.toml`s and `examples/promote.sh.example`. The suite's silence about them was
+  suffix-blindness, not a clean read. Replaced with `SKIPPED_SUFFIXES`, a binary denylist, behind an
+  `is_scanned()` predicate: the default is now *scanned*, so a new file type is covered the day it
+  lands. Coverage went 152 → 161 of 163; the only two exclusions are the guard's own pattern and
+  test modules, each exempt for a stated reason. `test_guard_covers_every_tracked_file_but_binaries`
+  pins it so the allowlist cannot creep back.
+- **The ssh/email pattern flagged RFC 8375 `.internal` placeholders.** `deploy@prod.example.internal`
+  in `examples/promote.sh.example` is a deliberate fixture; `.internal` now joins `.test`,
+  `.invalid` and `.localhost` in the reserved-name exclusion. A guard that fires on its own
+  documentation is a guard people learn to bypass.
 - **`scripts/release.sh` printed the original author's release page from every fork.** `REPO_SLUG`
   was a hardcoded constant feeding `RELEASE_URL`, so a fork that ran the release driver was told
   its release lived in a repository it does not own — a functional genericization defect,
@@ -756,7 +770,7 @@ On the rc1 the Lab environment smoke (a most-capable-tier model), G0 and G1 fire
 - Test suite: 35 pytest cases across structure validation, content validation, and integration smoke.
 - Manual end-to-end smoke test verified on a tiny CLI project.
 - the Lab environment deployment of v0.1.0 (2026-05-24). Bundle cloned from GitHub into `<workspace>/skills/superhuman/` (bind-mounted into the lab container at `<workspace>/skills/superhuman/`). Existing 63-line wrapper archived to `<workspace>/skills/archive/superhuman-pre-v0.1.0-20260524-204706/`. All 35 pytest cases passed on the server; SessionStart hook emitted 4764 lines, exit 0.
-- that identity added as a `read` (pull-only) collaborator on `OrionAIDev/superhuman` so the the Lab environment server can `git pull` with its own PAT.
+- that identity added as a `read` (pull-only) collaborator on the skill's GitHub repository so the Lab environment server can `git pull` with its own PAT.
 
 ### Fixed
 - `hooks/session-start.cmd`: detects Git Bash at `C:\Program Files\Git\bin\bash.exe` directly instead of using `where bash`, which on Windows machines with WSL installed would resolve to WSL bash (which cannot handle Windows paths). PowerShell fallback retained.

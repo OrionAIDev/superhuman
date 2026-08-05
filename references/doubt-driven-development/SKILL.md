@@ -123,8 +123,8 @@ shell-out in this release. When it *is* built, it must honor this captured requi
 - **Non-interactive contexts** (CI, `/loop`, autonomous loop): cross-model is skipped and the skip
   is announced. Never invoke an external CLI without explicit user authorization.
 
-Until this is wired, doubt-driven runs single-model. Chris will decide whether to build the live
-handshake after the rest of v0.4.0 is proven.
+Until this is wired, doubt-driven runs single-model. The maintainer will decide whether to build the
+live handshake after the rest of v0.4.0 is proven.
 
 ## Common Rationalizations
 

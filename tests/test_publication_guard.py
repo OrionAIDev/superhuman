@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from publication_patterns import (  # noqa: E402
     LEAK_PATTERNS,
     PUBLICATION_EXEMPT,
-    SCANNED_SUFFIXES,
+    SKIPPED_SUFFIXES,
+    is_scanned,
 )
 
 
@@ -128,13 +129,54 @@ def test_guard_actually_scans_a_representative_sample(skill_root: Path) -> None:
     tracked = subprocess.run(
         ["git", "ls-files"], cwd=skill_root, capture_output=True, text=True, check=True
     ).stdout.split()
-    candidates = [
-        rel for rel in tracked
-        if not rel.startswith(PUBLICATION_EXEMPT) and rel.endswith(SCANNED_SUFFIXES)
-    ]
+    candidates = [rel for rel in tracked if is_scanned(rel)]
     assert len(candidates) > 100, (
-        f"only {len(candidates)} files would be scanned — the extension filter "
+        f"only {len(candidates)} files would be scanned — the suffix denylist "
         "or exemption list is probably wrong"
     )
     for required in ("SKILL.md", "README.md", "CHANGELOG.md"):
         assert required in candidates, f"{required} must be scanned"
+
+
+def test_guard_covers_every_tracked_file_but_binaries(skill_root: Path) -> None:
+    """Every tracked file is scanned unless it is binary or explicitly exempt.
+
+    The regression this pins: `SKIPPED_SUFFIXES` replaced an *allowlist* of
+    twelve extensions that left eleven tracked files unscanned, among them
+    `hooks/session-start` and `scripts/git-hooks/pre-commit` — shipped
+    executables, and precisely where an absolute server path would hide. An
+    allowlist decays every time a new file type lands; this asserts the
+    inverted default so it cannot silently decay again.
+
+    Args:
+        skill_root: Repository root.
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=skill_root, capture_output=True, text=True, check=True
+    ).stdout.split()
+
+    unscanned = [rel for rel in tracked if not is_scanned(rel)]
+    unexpected = [
+        rel for rel in unscanned
+        if not rel.startswith(PUBLICATION_EXEMPT) and not rel.endswith(SKIPPED_SUFFIXES)
+    ]
+    assert not unexpected, (
+        "tracked files are invisible to the publication guard for no stated "
+        f"reason: {unexpected}"
+    )
+
+    # The specific files the old allowlist missed must now be covered.
+    for previously_missed in (
+        "LICENSE",
+        "VERSION",
+        "hooks/session-start",
+        "scripts/git-hooks/pre-commit",
+        "examples/promote.sh.example",
+    ):
+        assert previously_missed in tracked, (
+            f"{previously_missed} is no longer tracked — update this test"
+        )
+        assert is_scanned(previously_missed), (
+            f"{previously_missed} is tracked but not scanned — the suffix "
+            "blind spot has regressed"
+        )

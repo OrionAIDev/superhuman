@@ -15,9 +15,8 @@ import yaml
 
 from publication_patterns import (  # noqa: E402
     LEAK_PATTERNS,
-    PUBLICATION_EXEMPT,
-    SCANNED_SUFFIXES,
     TOKENS_FILE,
+    is_scanned,
 )
 
 
@@ -680,11 +679,7 @@ def _publication_candidates(skill_root: Path) -> list[str]:
     tracked = subprocess.run(
         ["git", "ls-files"], cwd=skill_root, capture_output=True, text=True, check=True
     ).stdout.split()
-    return [
-        rel for rel in tracked
-        if not rel.startswith(PUBLICATION_EXEMPT)
-        and rel.endswith(SCANNED_SUFFIXES)
-    ]
+    return [rel for rel in tracked if is_scanned(rel)]
 
 
 def test_no_infrastructure_leaks(skill_root: Path) -> None:

@@ -41,13 +41,15 @@ LEAK_PATTERNS: tuple[tuple[str, str, str, str], ...] = (
         # RFC 2606 reserves example.com/org/net and the .test/.invalid/
         # .localhost TLDs precisely so they can be written down. Excluding them
         # keeps the guard from flagging every test fixture, which is how a guard
-        # trains people to ignore it.
+        # trains people to ignore it. `.internal` is here for the same reason:
+        # RFC 8375 reserves it for private use, and `examples/promote.sh.example`
+        # uses `deploy@prod.example.internal` as a deliberate placeholder.
         r"\b\w+@(?!example\.(?:com|org|net)\b)"
-        r"(?![a-z0-9.-]*\.(?:test|invalid|localhost)\b)"
+        r"(?![a-z0-9.-]*\.(?:test|invalid|localhost|internal)\b)"
         r"(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9-]+\.[a-z]{2,})",
         "ssh or email target",
         "ssh root@10.1.2.3",
-        "ssh <user>@<host>, or test@example.com in a fixture",
+        "ssh <user>@<host>, or deploy@prod.example.internal in a fixture",
     ),
     (
         r"\.github_pat\b|\bgh[po]_[A-Za-z0-9]{16,}",
@@ -76,10 +78,24 @@ LEAK_PATTERNS: tuple[tuple[str, str, str, str], ...] = (
 #: names into a shared test.
 TOKENS_FILE = ".publication-tokens"
 
-#: File extensions the guard reads — anything textual that ships.
-SCANNED_SUFFIXES = (
-    ".md", ".tpl", ".py", ".sh", ".yaml", ".yml",
-    ".json", ".cmd", ".cjs", ".js", ".ts", ".dot",
+#: Suffixes the guard SKIPS, because reading them as text is meaningless.
+#:
+#: A denylist, not an allowlist, and the direction is the entire point. This was
+#: an allowlist of twelve extensions until v1.1.0, which meant every file type
+#: nobody thought to add was invisible: eleven tracked files, including
+#: `hooks/session-start` and `scripts/git-hooks/pre-commit` — both shipped,
+#: executable, and exactly where an absolute server path would hide — plus
+#: `LICENSE`, `VERSION`, and `examples/promote.sh.example`. The suite's silence
+#: about them was suffix-blindness, not a clean read.
+#:
+#: Inverted, the default is "scanned", and a new file type is covered the day it
+#: lands rather than the day someone remembers. Note `.svg` is deliberately NOT
+#: here: it is XML, so it can carry a leak in text.
+SKIPPED_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp",
+    ".pdf", ".zip", ".gz", ".tar", ".whl",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe", ".bin",
 )
 
 #: Paths exempt from the leak scan, each for a stated reason. Keep this list as
@@ -90,3 +106,15 @@ PUBLICATION_EXEMPT = (
     # Asserts the patterns against those samples, so it contains them too.
     "tests/test_publication_guard.py",
 )
+
+
+def is_scanned(rel: str) -> bool:
+    """Whether a repo-relative path is subject to the publication scan.
+
+    Args:
+        rel: Repo-relative path, as emitted by ``git ls-files``.
+
+    Returns:
+        True when the file should be read and scanned.
+    """
+    return not rel.startswith(PUBLICATION_EXEMPT) and not rel.endswith(SKIPPED_SUFFIXES)
