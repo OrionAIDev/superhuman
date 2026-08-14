@@ -7,6 +7,14 @@ writing to a temp file in the same directory and then `os.replace`-ing it
 over the target, which is atomic on both POSIX and Windows. A corrupt or
 missing fragment is never fatal — `core/projection.py` rebuilds it from the
 log.
+
+**Not a write-boundary (HARDEN #3, GPT-5 review):** `write_fragment` has no
+`writer_role` to check anything against — a `Fragment` carries no attribution
+— so ownership enforcement can only happen one layer up, over the `Event`
+that produced a given `Fragment`. `core/events.append` is the sole enforced
+entry for events; `core/projection.project_event` re-checks ownership before
+calling this function with a caller-supplied `Event`, so this module never
+needs to (and structurally cannot).
 """
 
 from __future__ import annotations

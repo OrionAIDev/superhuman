@@ -117,3 +117,60 @@ class TestOwnershipIsEnforcedAtAppendCallSite:
         # A payload key with no FIELD_OWNERS entry is unrestricted, from any role.
         result = append(log_path, _event("key-3", "CEO", {"note": "not a status field"}))
         assert result is not None
+
+
+def _typed_event(idempotency_key: str, writer_role: str, event_type: str) -> dict:
+    return {
+        "schema_version": 1,
+        "event_id": f"eid-{idempotency_key}",
+        "idempotency_key": idempotency_key,
+        "ts": "2026-08-14T12:00:00Z",
+        "type": event_type,
+        "project_id": "proj-abc",
+        "node_id": "portable/ws/proj/local-1",
+        "writer_role": writer_role,
+        "payload": {},
+    }
+
+
+class TestEventTypeOwnershipIsEnforcedAtAppendCallSite:
+    """GPT-5 review finding #1 (MED): FIELD_OWNERS marks `observation` and
+    `recommendation` as ceo-owned, and schema.py's own comment says they are
+    "ownership-checked the same way" as payload fields — but `append()` only
+    ever iterated `ev.payload` keys, never `ev.type`. A superhuman-side role
+    could forge `type="observation"` and it would sail straight through.
+    """
+
+    def test_superhuman_role_forging_an_observation_event_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(OwnershipError):
+            append(log_path, _typed_event("key-obs-1", "Developer", "observation"))
+        assert read_all(log_path) == []
+
+    def test_ceo_role_writing_an_observation_event_is_accepted(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        result = append(log_path, _typed_event("key-obs-2", "CEO", "observation"))
+        assert result is not None
+        assert read_all(log_path)[0].type == "observation"
+
+    def test_superhuman_role_forging_a_recommendation_event_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(OwnershipError):
+            append(log_path, _typed_event("key-rec-1", "Project Manager", "recommendation"))
+        assert read_all(log_path) == []
+
+    def test_ceo_role_writing_a_recommendation_event_is_accepted(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        result = append(log_path, _typed_event("key-rec-2", "CEO", "recommendation"))
+        assert result is not None
+
+    def test_ordinary_event_types_are_unaffected(self, tmp_path: Path) -> None:
+        # session_registered has no FIELD_OWNERS entry as a *type* — must
+        # remain writable by any role, exactly as before this finding.
+        log_path = tmp_path / "events.jsonl"
+        result = append(log_path, _typed_event("key-ordinary", "Developer", "session_registered"))
+        assert result is not None

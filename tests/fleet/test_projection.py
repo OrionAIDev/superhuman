@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from scripts.fleet.core.errors import OwnershipError
 from scripts.fleet.core.events import append
 from scripts.fleet.core.projection import project_event, rebuild
 from scripts.fleet.core.schema import validate_event
@@ -111,3 +114,54 @@ class TestIncrementalProject:
 
         assert updated.lifecycle == "blocked"
         assert read_fragment(node_id, sessions_dir).lifecycle == "blocked"
+
+
+class TestProjectEventIsNotABackDoorAroundOwnership:
+    """HARDEN #3 (GPT-5 review): `append()` must be the SOLE enforced write
+    boundary. `project_event()` takes an arbitrary `Event`, not necessarily
+    one that came through `append()`'s ownership check — so a
+    directly-constructed, ownership-violating `Event` handed straight to
+    `project_event()` must not silently materialize a forged fragment. This
+    is defense in depth: the legitimate path (append -> project_event with
+    the SAME already-checked event) is unaffected, since an event that
+    already passed `append()`'s ownership check trivially passes this
+    re-check too.
+    """
+
+    def test_ownership_violating_event_is_rejected_not_written(self, tmp_path: Path) -> None:
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/back-door"
+        # "lifecycle" is superhuman-owned; a CEO-role writer forging this
+        # event directly (bypassing append()) must still be rejected.
+        forged = validate_event(
+            {
+                "schema_version": 1,
+                "event_id": "eid-forged",
+                "idempotency_key": f"register:{node_id}",
+                "ts": "2026-08-14T12:00:00Z",
+                "type": "session_registered",
+                "project_id": "proj-abc",
+                "node_id": node_id,
+                "writer_role": "CEO",
+                "payload": {"lifecycle": "active"},
+            }
+        )
+
+        with pytest.raises(OwnershipError):
+            project_event(forged, sessions_dir)
+
+        assert read_fragment(node_id, sessions_dir) is None, (
+            "an ownership-violating event materialized a fragment through "
+            "project_event() — the exact back door HARDEN #3 closes"
+        )
+
+    def test_legitimate_append_then_project_path_is_unaffected(self, tmp_path: Path) -> None:
+        sessions_dir = tmp_path / "sessions"
+        log_path = tmp_path / "events.jsonl"
+        node_id = "portable/ws/proj/legit"
+        ev = append(log_path, _registered_event(node_id))
+
+        fragment = project_event(ev, sessions_dir)
+
+        assert fragment.lifecycle == "active"
+        assert read_fragment(node_id, sessions_dir) == fragment

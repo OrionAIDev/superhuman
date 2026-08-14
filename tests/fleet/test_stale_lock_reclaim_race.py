@@ -154,3 +154,79 @@ def test_exactly_one_racer_wins_a_barrier_synchronized_stale_lock_reclaim(
     """
     tmp_dir = tmp_path_factory.mktemp(f"fleet-barrier-reclaim-{run_index}")
     _run_barrier_reclaim_scenario(tmp_dir, run_index)
+
+
+def _seed_orphaned_marker(lock_path: Path, *, dead_pid: int, age_seconds: float) -> None:
+    """Write an orphaned reclaim marker next to `lock_path`: old mtime, dead pid.
+
+    Simulates a process that won the marker's `O_CREAT|O_EXCL` create and
+    then crashed before its `finally` could remove it.
+    """
+    marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+    marker_path.write_text(
+        json.dumps({"pid": dead_pid, "ts": "2020-01-01T00:00:00Z"}), encoding="utf-8"
+    )
+    old_time = time.time() - age_seconds
+    os.utime(marker_path, (old_time, old_time))
+
+
+def _run_barrier_orphaned_marker_scenario(tmp_dir: Path, run_index: int) -> None:
+    lock_path = tmp_dir / ".lock"
+    results_dir = tmp_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    _seed_stale_lock(lock_path, dead_pid=_dead_pid(), age_seconds=120.0)
+    _seed_orphaned_marker(lock_path, dead_pid=_dead_pid(), age_seconds=60.0)
+
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(N_RACERS)
+    processes = [
+        ctx.Process(
+            target=_reclaim_race_worker,
+            args=(str(lock_path), str(results_dir), i, barrier),
+        )
+        for i in range(N_RACERS)
+    ]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join(timeout=60)
+        assert p.exitcode == 0, f"worker {p.name} exited with code {p.exitcode}"
+
+    results = [
+        (results_dir / f"{i}.result").read_text(encoding="utf-8") == "True"
+        for i in range(N_RACERS)
+    ]
+    winners = sum(results)
+
+    assert winners == 1, (
+        f"expected exactly 1 of {N_RACERS} barrier-synchronized racers to "
+        f"recover the orphaned marker and win the reclaim, got {winners} — "
+        f"double-reclaim is a regression of finding #1's fix; on unfixed "
+        f"finding-#4 code every racer instead gets FileExistsError on the "
+        f"marker create and backs off forever (a permanent deadlock this "
+        f"test would time out on, never reaching this assertion)"
+    )
+
+
+@pytest.mark.parametrize("run_index", range(N_REPEATS))
+def test_exactly_one_racer_recovers_an_orphaned_marker_and_wins(
+    tmp_path_factory: pytest.TempPathFactory, run_index: int
+) -> None:
+    """GPT-5 review finding #4 — deterministic proof under real contention.
+
+    Seeds BOTH a stale main lock AND an orphaned reclaim marker (simulating
+    a process that crashed mid-reclaim). N barrier-synchronized racers all
+    hit the orphaned marker at once: exactly one must recover it and win
+    the reclaim; every other racer must correctly report False — and,
+    critically, this must complete at all rather than deadlock (unfixed
+    code: every racer's marker create fails with FileExistsError against
+    the orphan forever, so `_reclaim_race_worker`'s own `barrier.wait`
+    still succeeds but every subsequent `_reclaim_if_stale` call returns
+    False for every racer — this test would show 0 winners, not a hang,
+    since `_reclaim_if_stale` itself has no retry loop; the permanent
+    deadlock lives one layer up, in `acquire_lock`'s caller — but 0 winners
+    here is exactly the observable symptom of that same unfixed defect).
+    """
+    tmp_dir = tmp_path_factory.mktemp(f"fleet-barrier-orphan-marker-{run_index}")
+    _run_barrier_orphaned_marker_scenario(tmp_dir, run_index)

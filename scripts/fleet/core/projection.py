@@ -13,6 +13,17 @@ to the fragment directly — projection does not hardcode a table of event
 types to fields, so new event types introduced by later chunks (handoff,
 edges, done_level) project correctly without changes here, as long as their
 payload uses the same field names.
+
+**Write-boundary invariant (HARDEN #3, GPT-5 review):** `core/events.append`
+is the *sole enforced write entry* for the log — schema validation and
+ownership enforcement both live there. `rebuild()` trusts that invariant: it
+sources only from `read_all(log_path)` (the log itself, which nothing can
+enter without having passed `append`'s check when written) and does not
+re-check ownership per replayed event. `project_event()` cannot make that
+same assumption — it accepts an arbitrary `Event`, not necessarily one that
+came through `append` — so it re-checks ownership itself before writing a
+fragment, closing what would otherwise be a back door around `append`'s
+enforcement.
 """
 
 from __future__ import annotations
@@ -21,6 +32,7 @@ from pathlib import Path
 
 from .errors import ValidationError
 from .events import read_all
+from .ownership import assert_writer_may
 from .schema import STATUS_FIELDS, Event, Fragment
 from .store import read_fragment, write_fragment
 
@@ -84,6 +96,23 @@ def project_event(event: Event, sessions_dir: Path | str) -> Fragment:
     only the one fragment being updated (or none, if this is the node's
     first event).
 
+    HARDEN #3 (GPT-5 review): `core/events.append` is the sole *enforced*
+    write entry — it is where `validate_event` and `assert_writer_may` run.
+    This function takes an arbitrary `Event`, not necessarily one that
+    passed through `append`, so it re-checks ownership before writing
+    anything. For the intended call pattern (an event just returned by
+    `append`, or one read back via `read_all` — which only ever returns
+    already-validated events), this re-check is a cheap no-op, since the
+    event already passed the same check once. It exists specifically so a
+    directly-constructed, ownership-violating `Event` handed to this
+    function cannot materialize a forged fragment as a back door around
+    `append`'s enforcement. `rebuild()` below intentionally does *not*
+    repeat this check on every replayed event — it sources exclusively from
+    `read_all(log_path)`, i.e. the log itself, and nothing can get into that
+    log without having passed `append`'s check when it was written; a
+    caller with direct filesystem write access to the log file bypasses
+    every in-process check by definition and is out of this scope.
+
     Args:
         event: the event to project. Must already be validated/appended.
         sessions_dir: the directory holding per-session fragment files.
@@ -93,7 +122,16 @@ def project_event(event: Event, sessions_dir: Path | str) -> Fragment:
         disk. A corrupt existing fragment is treated as absent rather than
         raised — the same non-fatal-corruption guarantee `rebuild()` gives,
         applied to the incremental path.
+
+    Raises:
+        OwnershipError: if `event.writer_role` may not write `event.type`
+            or one of the owned fields present in `event.payload` (FR-8).
+            Nothing is written.
     """
+    assert_writer_may(event.type, event.writer_role)
+    for field in event.payload:
+        assert_writer_may(field, event.writer_role)
+
     try:
         current = read_fragment(event.node_id, sessions_dir)
     except ValidationError:

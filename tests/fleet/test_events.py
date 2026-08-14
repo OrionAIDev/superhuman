@@ -17,16 +17,18 @@ from pathlib import Path
 
 import pytest
 
-from scripts.fleet.core.errors import LockTimeoutError
+from scripts.fleet.core.errors import LockTimeoutError, ValidationError
 from scripts.fleet.core.events import (
     _pid_is_alive,
     _reclaim_if_stale,
+    _reclaim_marker_if_orphaned,
     acquire_lock,
     append,
     lock_path_for,
     read_all,
     release_lock,
 )
+from scripts.fleet.core.schema import Event
 
 
 def _event(idempotency_key: str, event_id: str = "11111111-1111-1111-1111-111111111111") -> dict:
@@ -69,6 +71,65 @@ class TestIdempotencyDedupe:
         events = read_all(log_path)
         assert len(events) == 1
         assert events[0].event_id == "eid-first"
+
+
+class TestAppendValidatesUnconditionally:
+    """GPT-5 review finding #2 (MED): validation must run for EVERY append,
+    even when the caller already hands in a constructed `Event` — not just
+    for raw dicts.
+
+    `Event` is frozen, but its `payload` dict is mutable, and
+    `Event(...)` construction itself does not validate — the schema checks
+    only run inside `validate_event`. Before this fix,
+    `ev = event if isinstance(event, Event) else validate_event(event)`
+    let an already-constructed `Event` skip validation entirely, so
+    `append(Event(..., payload={"lifecycle": ""}))` wrote an invalid line
+    straight to the log; `read_all` would later silently skip it on replay
+    (NFR-7's whole point is that nothing bad is ever persisted in the first
+    place, not that it gets quietly dropped on the way back out).
+    """
+
+    def _invalid_event(self) -> Event:
+        return Event(
+            schema_version=1,
+            event_id="eid-invalid",
+            idempotency_key="key-invalid",
+            ts="2026-08-14T12:00:00Z",
+            type="session_registered",
+            project_id="proj-abc",
+            node_id="portable/ws/proj/local-1",
+            writer_role="Developer",
+            payload={"lifecycle": ""},  # invalid: blank status value
+        )
+
+    def test_append_of_a_preconstructed_invalid_event_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(ValidationError):
+            append(log_path, self._invalid_event())
+        assert read_all(log_path) == [], "an invalid Event instance was persisted"
+
+    def test_append_of_a_preconstructed_valid_event_still_works(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        good = Event(
+            schema_version=1,
+            event_id="eid-valid",
+            idempotency_key="key-valid",
+            ts="2026-08-14T12:00:00Z",
+            type="session_registered",
+            project_id="proj-abc",
+            node_id="portable/ws/proj/local-1",
+            writer_role="Developer",
+            payload={"lifecycle": "active"},
+        )
+        result = append(log_path, good)
+        assert result is not None
+        events = read_all(log_path)
+        assert len(events) == 1
+        assert events[0].payload == {"lifecycle": "active"}
 
 
 class TestLockContention:
@@ -137,9 +198,15 @@ class TestStaleLockReclaim:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path.write_text(json.dumps({"pid": pid, "ts": "2020-01-01T00:00:00Z"}), encoding="utf-8")
         old_time = time.time() - age_seconds
-        import os
-
         os.utime(lock_path, (old_time, old_time))
+
+    def _write_marker(self, marker_path: Path, pid: int, age_seconds: float) -> None:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps({"pid": pid, "ts": "2020-01-01T00:00:00Z"}), encoding="utf-8"
+        )
+        old_time = time.time() - age_seconds
+        os.utime(marker_path, (old_time, old_time))
 
     def _dead_pid(self) -> int:
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -154,8 +221,6 @@ class TestStaleLockReclaim:
         release_lock(lock_path)
 
     def test_live_pid_and_old_mtime_is_not_reclaimed(self, tmp_path: Path) -> None:
-        import os
-
         lock_path = tmp_path / ".lock"
         self._write_lock(lock_path, pid=os.getpid(), age_seconds=10.0)
         with pytest.raises(LockTimeoutError):
@@ -330,6 +395,200 @@ class TestStaleLockReclaim:
         assert reclaimed is False
         assert not marker_path.exists(), "the reclaim marker leaked"
 
+    def test_orphaned_marker_is_recovered_and_acquire_lock_succeeds(
+        self, tmp_path: Path
+    ) -> None:
+        """GPT-5 review finding #4 (HIGH, regression from the finding-#1 fix).
+
+        If a process crashes AFTER creating `<lock>.reclaiming` but BEFORE
+        its `finally` removes it, the marker orphans. Without its own
+        recovery, every future writer gets `FileExistsError` on the marker
+        create, backs off, and every acquisition times out forever — a
+        crash-during-reclaim would permanently wedge all writers. Seed
+        exactly that: a stale main lock (old mtime, dead pid) AND an
+        orphaned marker (old mtime, dead pid) sitting next to it. A fresh
+        `acquire_lock` call must recover — well within a short timeout, not
+        by luck — never raise `LockTimeoutError`.
+        """
+        lock_path = tmp_path / ".lock"
+        marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+        self._write_lock(lock_path, pid=self._dead_pid(), age_seconds=30.0)
+        self._write_marker(marker_path, pid=self._dead_pid(), age_seconds=30.0)
+
+        # A short timeout — this must succeed via recovery, not by waiting
+        # out a long default timeout.
+        acquire_lock(lock_path, timeout=2.0, retry_interval=0.01, stale_age=1.0)
+        release_lock(lock_path)
+        assert not marker_path.exists(), "the recovered marker was not cleaned up"
+
+    def test_retry_create_losing_after_orphan_recovery_backs_off_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After successfully recovering an orphaned marker, the bounded
+        retry create can still lose (a different racer wins the recreated
+        marker first) — this must back off cleanly (`False`), not raise or
+        loop, matching the "bounded, no nested retry" contract.
+        """
+        lock_path = tmp_path / ".lock"
+        marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+        self._write_lock(lock_path, pid=self._dead_pid(), age_seconds=30.0)
+        self._write_marker(marker_path, pid=self._dead_pid(), age_seconds=30.0)
+
+        import scripts.fleet.core.events as events_mod
+
+        real_reclaim_marker = events_mod._reclaim_marker_if_orphaned
+
+        def _recover_then_let_someone_else_win(marker_path_arg, marker_stale_age):
+            recovered = real_reclaim_marker(marker_path_arg, marker_stale_age)
+            if recovered:
+                # Simulate a different racer recreating the marker in the
+                # instant between our successful orphan-cleanup and our own
+                # retry create.
+                marker_path_arg.write_text(
+                    json.dumps({"pid": os.getpid(), "ts": "2026-08-14T12:00:00Z"}),
+                    encoding="utf-8",
+                )
+            return recovered
+
+        monkeypatch.setattr(
+            events_mod, "_reclaim_marker_if_orphaned", _recover_then_let_someone_else_win
+        )
+
+        reclaimed = _reclaim_if_stale(lock_path, stale_age=1.0)
+
+        assert reclaimed is False
+        # The "someone else's" marker must survive untouched — this racer
+        # backed off without disturbing it.
+        assert marker_path.is_file()
+
+    def test_fresh_marker_is_never_removed_by_a_racer(self, tmp_path: Path) -> None:
+        """A live reclaimer's marker (recent mtime, live pid) must survive a
+        contending racer untouched — the racer must back off (and,
+        eventually, time out — it must never proceed as if it had reclaimed
+        something it did not) rather than steal or clear it.
+        """
+        lock_path = tmp_path / ".lock"
+        marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+        self._write_lock(lock_path, pid=self._dead_pid(), age_seconds=30.0)
+        self._write_marker(marker_path, pid=os.getpid(), age_seconds=0.0)
+        original_marker_bytes = marker_path.read_bytes()
+
+        with pytest.raises(LockTimeoutError):
+            acquire_lock(lock_path, timeout=0.3, retry_interval=0.01, stale_age=1.0)
+
+        assert marker_path.is_file(), "a fresh, live marker must never be removed"
+        assert marker_path.read_bytes() == original_marker_bytes
+
+
+class TestReclaimMarkerIfOrphaned:
+    """Direct unit coverage of ``_reclaim_marker_if_orphaned`` — the recovery
+    helper GPT-5 review finding #4 added. Safety-critical (a bug here either
+    permanently wedges every writer, or lets an active reclaimer's marker be
+    stolen), so exercised branch-by-branch, not just through the higher-level
+    barrier/`acquire_lock` tests above.
+    """
+
+    def _write_marker(self, marker_path: Path, pid: int, age_seconds: float) -> None:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps({"pid": pid, "ts": "2020-01-01T00:00:00Z"}), encoding="utf-8"
+        )
+        old_time = time.time() - age_seconds
+        os.utime(marker_path, (old_time, old_time))
+
+    def _dead_pid(self) -> int:
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=10)
+        return proc.pid
+
+    def test_marker_that_never_existed_is_treated_as_already_gone(self, tmp_path: Path) -> None:
+        marker_path = tmp_path / "never-existed" / ".lock.reclaiming"
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is True
+
+    def test_old_marker_with_live_pid_is_not_orphaned(self, tmp_path: Path) -> None:
+        # Age alone is insufficient — mirrors the main lock's own
+        # "age AND pid liveness, both required" contract.
+        marker_path = tmp_path / ".lock.reclaiming"
+        self._write_marker(marker_path, pid=os.getpid(), age_seconds=30.0)
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is False
+        assert marker_path.is_file()
+
+    def test_old_marker_with_dead_pid_is_orphaned_and_removed(self, tmp_path: Path) -> None:
+        marker_path = tmp_path / ".lock.reclaiming"
+        self._write_marker(marker_path, pid=self._dead_pid(), age_seconds=30.0)
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is True
+        assert not marker_path.exists()
+
+    def test_malformed_marker_content_is_treated_as_dead_pid(self, tmp_path: Path) -> None:
+        marker_path = tmp_path / ".lock.reclaiming"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("not-json-at-all", encoding="utf-8")
+        old_time = time.time() - 30.0
+        os.utime(marker_path, (old_time, old_time))
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is True
+
+    def test_marker_removed_between_initial_and_fresh_stat_is_a_no_op_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker_path = tmp_path / ".lock.reclaiming"
+        self._write_marker(marker_path, pid=self._dead_pid(), age_seconds=30.0)
+
+        real_stat = Path.stat
+        call_count = {"n": 0}
+
+        def _stat_then_remove_on_second_call(self: Path, *a: object, **kw: object):
+            call_count["n"] += 1
+            if call_count["n"] == 2 and str(self) == str(marker_path):
+                # Simulate another process's cleanup landing exactly between
+                # our initial staleness read and our fresh pre-removal stat.
+                os.remove(marker_path)
+            return real_stat(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "stat", _stat_then_remove_on_second_call)
+
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is True
+
+    def test_marker_touched_between_stats_is_not_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the marker's mtime changed between the two internal stats (a
+        live reclaimer (re)touched it), the mismatch must be detected and
+        the marker left alone — not removed out from under it.
+        """
+        marker_path = tmp_path / ".lock.reclaiming"
+        self._write_marker(marker_path, pid=self._dead_pid(), age_seconds=30.0)
+
+        real_stat = Path.stat
+        call_count = {"n": 0}
+
+        def _touch_before_second_stat(self: Path, *a: object, **kw: object):
+            call_count["n"] += 1
+            if call_count["n"] == 2 and str(self) == str(marker_path):
+                fresh_time = time.time()
+                os.utime(marker_path, (fresh_time, fresh_time))
+            return real_stat(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "stat", _touch_before_second_stat)
+
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is False
+        assert marker_path.is_file(), "a marker touched mid-check must survive"
+
+    def test_remove_race_during_final_removal_is_tolerated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker_path = tmp_path / ".lock.reclaiming"
+        self._write_marker(marker_path, pid=self._dead_pid(), age_seconds=30.0)
+
+        real_remove = os.remove
+
+        def _remove_then_pretend_already_gone(path: object) -> None:
+            real_remove(path)
+            raise FileNotFoundError("simulated race: another process already removed it")
+
+        monkeypatch.setattr("os.remove", _remove_then_pretend_already_gone)
+
+        assert _reclaim_marker_if_orphaned(marker_path, marker_stale_age=1.0) is True
+
 
 class TestPidIsAlive:
     def test_pid_zero_or_negative_is_never_alive(self) -> None:
@@ -337,8 +596,6 @@ class TestPidIsAlive:
         assert _pid_is_alive(-1) is False
 
     def test_own_pid_is_alive(self) -> None:
-        import os
-
         assert _pid_is_alive(os.getpid()) is True
 
 

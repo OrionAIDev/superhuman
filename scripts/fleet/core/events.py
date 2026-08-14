@@ -7,6 +7,25 @@ writer-partitioned and need no lock (see `core/store.py`). A torn final line
 (crash mid-append) is skipped on read, never fatal; a stale lock (crashed
 holder) is reclaimed by age **and** pid liveness, both required — age alone,
 or liveness alone, is never sufficient (ARCHITECTURE "Lockfile protocol").
+
+**Known, accepted extreme-timing residuals (GPT-5 review findings #5/#6 —
+documented per user decision, not fixed this round; both require pathological
+OS scheduling, well beyond anything this module's own test suite has been
+able to trigger even under deliberately heavy contention):**
+
+5. A create-then-write gap in `acquire_lock`: the lock file is created via
+   `O_CREAT|O_EXCL` (empty) and its `{pid, ts}` content is written a moment
+   later. If the writing process is suspended by the OS in exactly that gap
+   for longer than `stale_age` (30s default), another process could see an
+   empty, apparently-ownerless, old-enough file and reclaim it out from under
+   a holder that is not actually dead — merely paused for an extraordinarily
+   long time between two adjacent syscalls.
+6. Inode reuse (ABA) on the `_reclaim_if_stale` identity re-check: the
+   `st_ino`/`st_dev` comparison that protects against a delayed reclaim
+   decision acting on a since-replaced lock assumes a reused path won't also
+   receive a coincidentally-reused inode number in the same window. Most
+   filesystems don't recycle inode numbers quickly, but it's not a
+   guarantee.
 """
 
 from __future__ import annotations
@@ -29,6 +48,12 @@ _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_RETRY_INTERVAL = 0.02
 _DEFAULT_STALE_AGE = 30.0
 
+#: How old the reclaim marker (`<lock>.reclaiming`) must be before it is even
+#: considered orphaned. Deliberately much shorter than `_DEFAULT_STALE_AGE`:
+#: a reclaim attempt is a handful of filesystem calls, not a held write lock,
+#: so it should complete in well under a second under any real contention.
+_MARKER_STALE_AGE = 5.0
+
 #: Errors that mean "lock is currently held by someone else, retry" rather
 #: than a real failure. `O_CREAT|O_EXCL` contention on an existing file is
 #: `FileExistsError` on POSIX; on Windows, `CreateFile` under concurrent
@@ -41,6 +66,20 @@ _DEFAULT_STALE_AGE = 30.0
 #: safe failure.
 _LOCK_CONTENDED_ERRORS: tuple[type[OSError], ...] = (
     (FileExistsError, PermissionError) if os.name == "nt" else (FileExistsError,)
+)
+
+#: Errors that mean "this file is already gone (or being deleted right now
+#: by someone else)" when the intent is `os.remove(path)`-as-cleanup — a
+#: no-op, not a failure. `FileNotFoundError` is the POSIX-universal case; on
+#: Windows, two processes racing to delete the same file can surface
+#: `PermissionError` (ERROR_SHARING_VIOLATION/ERROR_ACCESS_DENIED) for
+#: whichever one loses the race, instead of `FileNotFoundError` — the same
+#: family of quirk as `_LOCK_CONTENDED_ERRORS` above, verified directly
+#: (GPT-5 review finding #4's own test suite reproduced it while proving the
+#: marker-recovery fix: multiple racers' `os.remove` on the same orphaned
+#: marker occasionally raised `PermissionError`, not `FileNotFoundError`).
+_REMOVAL_RACE_ERRORS: tuple[type[OSError], ...] = (
+    (FileNotFoundError, PermissionError) if os.name == "nt" else (FileNotFoundError,)
 )
 
 
@@ -101,6 +140,98 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _reclaim_marker_if_orphaned(marker_path: Path, marker_stale_age: float) -> bool:
+    """Remove `marker_path` if it is an orphaned reclaim marker.
+
+    The reclaim marker itself needs the same crash-recovery story as the
+    main lock, for the same reason (GPT-5 review finding #4): if a process
+    crashes after winning the marker's `O_CREAT|O_EXCL` create but before
+    its `finally` removes it, the marker orphans, and — without this —
+    every future reclaim attempt gets `FileExistsError` on the marker create
+    forever, permanently wedging all writers behind one crashed process.
+
+    Orphaned requires **both** conditions, mirroring the main lock's own
+    "age and pid liveness, both required" contract: the marker must be older
+    than `marker_stale_age` (a reclaim attempt is a handful of filesystem
+    calls; a live one should never take seconds) *and* its recorded pid must
+    not be alive. A fresh stat is taken immediately before the actual
+    removal and compared against the stat this decision was based on, so a
+    marker a live reclaimer (re)creates in the gap between this function's
+    checks is never removed out from under it.
+
+    Args:
+        marker_path: the reclaim marker to inspect.
+        marker_stale_age: minimum age in seconds before the marker is even
+            considered for orphan recovery.
+
+    Returns:
+        bool: True if the marker was orphaned and has been removed (or was
+        already gone), meaning the caller may retry the marker's own
+        `O_CREAT|O_EXCL` create — that create re-serializes the recovery, so
+        multiple racers concurrently reaching this same conclusion is safe,
+        only one of them will win the retry. False if the marker is still
+        within its fresh window or genuinely live and must not be touched.
+    """
+    try:
+        stat_before = marker_path.stat()
+    except FileNotFoundError:
+        return True  # already gone — safe to retry the create immediately
+
+    age = time.time() - stat_before.st_mtime
+    if age <= marker_stale_age:
+        return False
+
+    try:
+        content = json.loads(marker_path.read_text(encoding="utf-8"))
+        pid = int(content.get("pid", -1))
+    except (OSError, ValueError, TypeError):
+        pid = -1
+
+    if _pid_is_alive(pid):
+        return False
+
+    try:
+        stat_now = marker_path.stat()
+    except FileNotFoundError:
+        return True  # already gone — someone else's cleanup beat us to it
+
+    if stat_now.st_mtime != stat_before.st_mtime:
+        # It changed since we started evaluating — do not touch it; treat
+        # this exactly like "still fresh" and let the caller back off.
+        return False
+
+    try:
+        os.remove(marker_path)
+    except _REMOVAL_RACE_ERRORS:
+        pass
+    return True
+
+
+def _try_create_marker(marker_path: Path) -> bool:
+    """Attempt to exclusively create the reclaim marker at `marker_path`.
+
+    Writes `{pid, ts}` — the same shape as the main lock — so an orphaned
+    marker can later be identified by `_reclaim_marker_if_orphaned` using
+    the same age/pid-liveness logic.
+
+    Args:
+        marker_path: the reclaim marker to create.
+
+    Returns:
+        bool: True if this process now exclusively holds the marker; False
+        if the create was contended (someone else already holds it).
+    """
+    try:
+        marker_fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(marker_fd, json.dumps({"pid": os.getpid(), "ts": _now_iso()}).encode("utf-8"))
+        finally:
+            os.close(marker_fd)
+        return True
+    except _LOCK_CONTENDED_ERRORS:
+        return False
+
+
 def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
     """Reclaim `lock_path` if it is both old enough and its holder is dead.
 
@@ -135,6 +266,14 @@ def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
     here is a create, not a rename, and the rename underneath it only ever
     runs for the one racer holding that gate.
 
+    The marker itself needs the same crash-recovery story as the main lock
+    (GPT-5 review finding #4): if this function's own process crashes after
+    winning the marker create but before the `finally` below removes it, a
+    contended marker create falls through to `_reclaim_marker_if_orphaned`
+    rather than unconditionally giving up — otherwise a single crash during
+    reclaim would permanently wedge every future writer behind an orphaned
+    marker no one can ever clear.
+
     Args:
         lock_path: the lockfile to inspect.
         stale_age: minimum age in seconds before a lock is even considered.
@@ -166,13 +305,18 @@ def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
         return False
 
     marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
-    try:
-        marker_fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(marker_fd)
-    except _LOCK_CONTENDED_ERRORS:
-        # A different racer already holds the exclusive right to attempt
-        # this reclaim right now. Do not touch lock_path at all.
-        return False
+    if not _try_create_marker(marker_path):
+        # Contended — either a live racer holds it, or it is orphaned from a
+        # process that crashed between winning the create and its own
+        # `finally` cleanup (GPT-5 review finding #4). Attempt orphan
+        # recovery and retry the create exactly once — bounded, no nested
+        # retry loop; the create itself re-serializes the recovery, so this
+        # stays safe even if several racers reach the same conclusion at
+        # once.
+        if not _reclaim_marker_if_orphaned(marker_path, _MARKER_STALE_AGE):
+            return False
+        if not _try_create_marker(marker_path):
+            return False
 
     try:
         # Re-verify identity now that this process exclusively holds the
@@ -193,13 +337,13 @@ def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
         os.replace(lock_path, claim_path)
         try:
             os.remove(claim_path)
-        except FileNotFoundError:
+        except _REMOVAL_RACE_ERRORS:
             pass
         return True
     finally:
         try:
             os.remove(marker_path)
-        except FileNotFoundError:
+        except _REMOVAL_RACE_ERRORS:
             pass
 
 
@@ -256,7 +400,7 @@ def release_lock(lock_path: Path | str) -> None:
     """
     try:
         os.remove(Path(lock_path))
-    except FileNotFoundError:
+    except _REMOVAL_RACE_ERRORS:
         pass
 
 
@@ -390,13 +534,33 @@ def append(
         error).
 
     Raises:
-        ValidationError: if `event` is a dict that fails schema validation.
-            Nothing is written in that case.
-        OwnershipError: if `event.writer_role` may not write one of the owned
-            fields present in `event.payload` (FR-8). Nothing is written.
+        ValidationError: if `event` (dict or `Event`) fails schema
+            validation. Nothing is written in that case.
+        OwnershipError: if `event.writer_role` may not write `event.type`
+            itself, or one of the owned fields present in `event.payload`
+            (FR-8). Nothing is written.
         LockTimeoutError: if the lock could not be acquired in time.
     """
-    ev = event if isinstance(event, Event) else validate_event(event)
+    # Validate unconditionally (GPT-5 review finding #2) — an already
+    # constructed `Event` is NOT exempt. `Event` is frozen, but its
+    # `payload` dict is mutable and `Event(...)` construction itself never
+    # validates; only `validate_event` does. Skipping it for pre-built
+    # `Event`s let an invalid one (e.g. `payload={"lifecycle": ""}`) reach
+    # the log untouched, defeating NFR-7's "nothing bad is ever persisted"
+    # guarantee for that one call path. This is the safety-critical write
+    # boundary (DP#5): it validates every time, with no shortcut.
+    raw = asdict(event) if isinstance(event, Event) else event
+    ev = validate_event(raw)
+
+    # Ownership applies to the event's TYPE as well as its payload fields
+    # (GPT-5 review finding #1): FIELD_OWNERS marks `observation` and
+    # `recommendation` ceo-owned, and schema.py documents them as
+    # "ownership-checked the same way" — but only checking `ev.payload` keys
+    # left `ev.type` itself unchecked, so a superhuman-side writer could
+    # forge `type="observation"` and it would sail through untouched.
+    # assert_writer_may() no-ops for any type with no FIELD_OWNERS entry
+    # (ordinary types like session_registered), so this is a pure addition.
+    assert_writer_may(ev.type, ev.writer_role)
     for field in ev.payload:
         # assert_writer_may() itself no-ops for a field with no FIELD_OWNERS
         # entry (unowned/free) — calling it for every payload key is simpler
