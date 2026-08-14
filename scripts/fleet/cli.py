@@ -28,6 +28,9 @@ from .core.events import append
 from .core.projection import project_event
 from .core.schema import Event, Fragment, validate_event
 from .core.store import read_fragment
+from .handoff import cancel as handoff_cancel
+from .handoff import emit as handoff_emit
+from .handoff import stale_report
 
 #: `fleet --version` output. Not tied to `VERSION` at the skill root — this
 #: is the manifest CLI's own schema-facing version, matching `schema_version`
@@ -321,6 +324,113 @@ def _cmd_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_handoff_emit(args: argparse.Namespace) -> int:
+    """Handle `fleet handoff emit`.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success; `1` if the write was rejected or the manifest
+        lock could not be acquired.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+    adapter = _build_adapter(args)
+    cwd = args.cwd or args.workspace
+    prompt_text = args.prompt_file.read_text(encoding="utf-8")
+
+    try:
+        result = handoff_emit(
+            adapter,
+            slug=args.slug,
+            project_id=args.project_id,
+            prompt_text=prompt_text,
+            cwd=cwd,
+            branch=args.branch,
+            writer_role=args.writer_role,
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            lock_retry_attempts=args.lock_retry_attempts,
+        )
+    except LockTimeoutError as exc:
+        print(f"fleet handoff emit: could not acquire the manifest lock: {exc}", file=sys.stderr)
+        return 1
+    except (ValidationError, OwnershipError) as exc:
+        print(f"fleet handoff emit: rejected: {exc}", file=sys.stderr)
+        return 1
+
+    if args.output_file is not None:
+        args.output_file.write_text(result.prompt_text, encoding="utf-8")
+        print(f"emitted handoff {result.handoff_id} ({result.node_id}) -> {args.output_file}")
+    else:
+        print(f"emitted handoff {result.handoff_id} ({result.node_id})")
+        print(result.prompt_text)
+    return 0
+
+
+def _cmd_handoff_cancel(args: argparse.Namespace) -> int:
+    """Handle `fleet handoff cancel`.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success; `1` if the write was rejected or the manifest
+        lock could not be acquired.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+
+    try:
+        fragment = handoff_cancel(
+            args.node_id,
+            project_id=args.project_id,
+            writer_role=args.writer_role,
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            lock_retry_attempts=args.lock_retry_attempts,
+        )
+    except LockTimeoutError as exc:
+        print(f"fleet handoff cancel: could not acquire the manifest lock: {exc}", file=sys.stderr)
+        return 1
+    except (ValidationError, OwnershipError) as exc:
+        print(f"fleet handoff cancel: rejected: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"cancelled {fragment.node_id} (lifecycle={fragment.lifecycle})")
+    return 0
+
+
+def _cmd_handoff_stale(args: argparse.Namespace) -> int:
+    """Handle `fleet handoff stale`.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — listing is read-only and has nothing to reject.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+
+    rows = stale_report(
+        log_path=log_path, sessions_dir=sessions_dir, expiry_seconds=args.expiry_seconds
+    )
+    if not rows:
+        print("no stale handoffs")
+        return 0
+    for row in rows:
+        print(
+            f"{row['node_id']}  handoff_id={row['handoff_id']}  "
+            f"age_seconds={row['age_seconds']:.0f}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `fleet` argument parser.
 
@@ -407,7 +517,123 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_parser.set_defaults(func=_cmd_register)
 
+    _add_handoff_subparsers(subparsers)
+
     return parser
+
+
+def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `handoff emit|cancel|stale` subcommands (PLAN.md Chunk 3).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    handoff_parser = subparsers.add_parser(
+        "handoff", help="Manual-handoff intent row: emit, cancel, stale report."
+    )
+    handoff_subparsers = handoff_parser.add_subparsers(dest="handoff_command", required=True)
+
+    emit_parser = handoff_subparsers.add_parser(
+        "emit", help="Write an awaiting-launch intent row and embed a durable handoff id."
+    )
+    emit_parser.add_argument("--project-id", required=True, help="the owning project's id")
+    emit_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    emit_parser.add_argument(
+        "--workspace", required=True, type=Path, help="the working tree to emit the handoff from"
+    )
+    emit_parser.add_argument(
+        "--cwd",
+        type=Path,
+        default=None,
+        help="the target working directory for the launched session "
+        "(defaults to --workspace) — the fuzzy-match anchor",
+    )
+    emit_parser.add_argument(
+        "--branch", default=None, help="the target git branch — the other fuzzy-match anchor"
+    )
+    emit_parser.add_argument(
+        "--prompt-file", required=True, type=Path, help="path to the prompt body to emit"
+    )
+    emit_parser.add_argument(
+        "--writer-role", required=True, help="a role name, never an AI/model/vendor string"
+    )
+    emit_parser.add_argument(
+        "--harness",
+        choices=("claude", "portable"),
+        default="portable",
+        help="which SessionAdapter implementation formats the emitted prompt "
+        "(default: portable; both adapters embed the id identically)",
+    )
+    emit_parser.add_argument(
+        "--session-id", default=None, help="--harness claude only: see `register`'s equivalent flag"
+    )
+    emit_parser.add_argument(
+        "--sessions-json", type=Path, default=None, help="--harness claude only"
+    )
+    emit_parser.add_argument(
+        "--session-relay-script", type=Path, default=None, help="--harness claude only"
+    )
+    emit_parser.add_argument("--local-id", default=None, help="--harness portable only")
+    emit_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    emit_parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=None,
+        help="write the emitted prompt here instead of stdout",
+    )
+    emit_parser.add_argument(
+        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+    )
+    emit_parser.set_defaults(func=_cmd_handoff_emit)
+
+    cancel_parser = handoff_subparsers.add_parser(
+        "cancel", help="Close an open awaiting-launch handoff row."
+    )
+    cancel_parser.add_argument("--node-id", required=True, help="the handoff row's node id")
+    cancel_parser.add_argument("--project-id", required=True, help="the owning project's id")
+    cancel_parser.add_argument(
+        "--writer-role", required=True, help="a role name, never an AI/model/vendor string"
+    )
+    cancel_parser.add_argument("--workspace", required=True, type=Path)
+    cancel_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    cancel_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    cancel_parser.add_argument(
+        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+    )
+    cancel_parser.set_defaults(func=_cmd_handoff_cancel)
+
+    stale_parser = handoff_subparsers.add_parser(
+        "stale", help="List awaiting-launch handoff rows past expiry."
+    )
+    stale_parser.add_argument("--workspace", required=True, type=Path)
+    stale_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    stale_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    stale_parser.add_argument(
+        "--expiry-seconds",
+        type=float,
+        default=None,
+        help="override the staleness threshold (defaults to the profile-driven "
+        "value from ~/.superhuman/profile.yaml, NFR-5)",
+    )
+    stale_parser.set_defaults(func=_cmd_handoff_stale)
 
 
 def main(argv: list[str] | None = None) -> int:
