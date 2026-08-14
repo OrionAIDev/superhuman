@@ -59,18 +59,26 @@ def write_fragment(fragment: Fragment, sessions_dir: Path | str) -> None:
     target = fragment_path(fragment.node_id, sessions_dir)
 
     fd, tmp_name = tempfile.mkstemp(dir=str(sessions_dir), prefix=".tmp-", suffix=".json")
+    replaced = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(asdict(fragment), f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, target)
-    except OSError:
-        try:
-            os.remove(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
+        replaced = True
+    finally:
+        # Clean up the temp file on ANY exception (not just OSError — a
+        # `json.dump` failure, for instance, is a ValueError/TypeError), so
+        # a non-OSError failure can never leak a `.tmp-*` file. Once
+        # `os.replace` has actually succeeded, `tmp_name` no longer exists
+        # under its original name (it *is* `target` now), so this is a
+        # harmless no-op on the success path.
+        if not replaced:
+            try:
+                os.remove(tmp_name)
+            except FileNotFoundError:
+                pass
 
 
 def read_fragment(node_id: str, sessions_dir: Path | str) -> Fragment | None:

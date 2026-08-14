@@ -18,8 +18,10 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .errors import LockTimeoutError, ValidationError
+from .ownership import assert_writer_may
 from .schema import Event, validate_event
 
 #: Default bounded-retry contract for lock acquisition.
@@ -105,21 +107,52 @@ def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
     Both conditions are required (age alone, or liveness alone, never
     triggers reclaim) — see ARCHITECTURE "Lockfile protocol".
 
+    Reclaim is gated by a **separate exclusive marker file**
+    (`<lock_path>.reclaiming`), created with the same `O_CREAT|O_EXCL`
+    primitive `acquire_lock` itself relies on. Only the racer that wins the
+    marker's creation may inspect-and-act on `lock_path`; every other racer
+    gets a real `OSError` from the marker create and backs off immediately,
+    never touching `lock_path` at all.
+
+    This exists because the more obvious design — rename the stale lock
+    straight to a unique per-attempt name via `os.replace`, on the theory
+    that "two processes can't both succeed renaming the same source" — does
+    **not** hold on this platform: empirically, when multiple processes call
+    `os.replace(same_source, different_unique_destinations)` at nearly the
+    same instant, Windows/NTFS routinely lets *several* of those renames
+    report success (verified directly, in isolation from any of this
+    module's own logic: 30/30 runs of 20 racers each produced multiple
+    "successful" renames of one source file). A first attempt at this fix
+    used exactly that rename-based design plus an `st_ino`/`st_dev` identity
+    check after the fact; it closed the specific TOCTOU the review finding
+    described but still occasionally let two racers both pass the identity
+    check, because NTFS's rename race can leave two *different* destination
+    paths reporting the *same* inode for the same source. `O_CREAT|O_EXCL`
+    create, by contrast, has been exercised at N=8..20 concurrent racers
+    (this module's own `acquire_lock`, `tests/fleet/test_concurrency.py`'s
+    flagship, and `tests/fleet/test_stale_lock_reclaim_race.py`) without a
+    single observed double-success — so the actual mutual-exclusion gate
+    here is a create, not a rename, and the rename underneath it only ever
+    runs for the one racer holding that gate.
+
     Args:
         lock_path: the lockfile to inspect.
         stale_age: minimum age in seconds before a lock is even considered.
 
     Returns:
-        bool: True if the lock was stale and has been removed (or was
-        already gone), meaning the caller should retry acquisition
-        immediately; False if the lock is still legitimately held.
+        bool: True only for the single racer that both won the marker gate
+        and confirmed (immediately before acting, while holding that gate)
+        that `lock_path` was still the exact stale instance it evaluated —
+        meaning the caller should retry acquisition immediately. False for
+        every other racer — the caller must not treat a False as "safe to
+        proceed."
     """
     try:
-        mtime = lock_path.stat().st_mtime
+        stat_before = lock_path.stat()
     except FileNotFoundError:
         return True  # already gone — safe to retry create immediately
 
-    age = time.time() - mtime
+    age = time.time() - stat_before.st_mtime
     if age < stale_age:
         return False
 
@@ -132,11 +165,42 @@ def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
     if _pid_is_alive(pid):
         return False
 
+    marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
     try:
-        os.remove(lock_path)
-    except FileNotFoundError:
-        pass
-    return True
+        marker_fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(marker_fd)
+    except _LOCK_CONTENDED_ERRORS:
+        # A different racer already holds the exclusive right to attempt
+        # this reclaim right now. Do not touch lock_path at all.
+        return False
+
+    try:
+        # Re-verify identity now that this process exclusively holds the
+        # marker — no other racer can be mutating lock_path while we hold
+        # it, so this check (and the rename below) are genuinely safe. This
+        # still matters even under the marker gate: the *decision* above
+        # (age/pid) may be based on a snapshot read a while ago, and the
+        # lock could have legitimately moved on to a new holder since.
+        try:
+            stat_now = lock_path.stat()
+        except FileNotFoundError:
+            return False  # already gone by the time we won the gate
+
+        if stat_now.st_ino != stat_before.st_ino or stat_now.st_dev != stat_before.st_dev:
+            return False  # a different (almost certainly live) lock is here now
+
+        claim_path = lock_path.with_name(f"{lock_path.name}.reclaim-{os.getpid()}-{uuid4().hex}")
+        os.replace(lock_path, claim_path)
+        try:
+            os.remove(claim_path)
+        except FileNotFoundError:
+            pass
+        return True
+    finally:
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            pass
 
 
 def acquire_lock(
@@ -297,7 +361,7 @@ def append(
     retry_interval: float = _DEFAULT_RETRY_INTERVAL,
     stale_age: float = _DEFAULT_STALE_AGE,
 ) -> Event | None:
-    """Append one validated event to the log, deduping on `idempotency_key`.
+    """Append one validated, ownership-checked event, deduping on `idempotency_key`.
 
     The whole read-check-write sequence runs under the exclusive lock, so
     concurrent appenders serialize cleanly (NFR-1). If the log's final byte
@@ -305,6 +369,13 @@ def append(
     written first so the new line parses as its own complete record — the
     torn line is left behind as a separate, harmlessly-skippable line rather
     than being glued onto the new one.
+
+    Every `payload` key that names an owned field (`core.schema.FIELD_OWNERS`)
+    is checked against `event.writer_role` via `core.ownership.assert_writer_may`
+    *before* the lock is even acquired — a non-owner write raises and nothing
+    is persisted (FR-8). This is the actual write interface DESIGN's data flow
+    describes ("validate_event -> ownership.assert_writer_may -> events.append");
+    it is enforced here, not left to each caller to remember.
 
     Args:
         log_path: path to the event log.
@@ -321,9 +392,17 @@ def append(
     Raises:
         ValidationError: if `event` is a dict that fails schema validation.
             Nothing is written in that case.
+        OwnershipError: if `event.writer_role` may not write one of the owned
+            fields present in `event.payload` (FR-8). Nothing is written.
         LockTimeoutError: if the lock could not be acquired in time.
     """
     ev = event if isinstance(event, Event) else validate_event(event)
+    for field in ev.payload:
+        # assert_writer_may() itself no-ops for a field with no FIELD_OWNERS
+        # entry (unowned/free) — calling it for every payload key is simpler
+        # and no less correct than pre-filtering to FIELD_OWNERS here.
+        assert_writer_may(field, ev.writer_role)
+
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 

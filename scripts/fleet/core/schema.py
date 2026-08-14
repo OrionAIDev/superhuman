@@ -230,6 +230,7 @@ def validate_event(data: dict[str, Any]) -> Event:
     payload = data.get("payload", {})
     if not isinstance(payload, dict):
         raise ValidationError("payload must be a dict")
+    _assert_payload_status_values_are_valid(payload)
 
     return Event(
         schema_version=data["schema_version"],
@@ -262,6 +263,38 @@ def _assert_role_only(writer_role: Any) -> None:
             raise ValidationError(
                 f"writer_role {writer_role!r} looks like a model/vendor name, "
                 f"not a role (matched {token!r}); NFR-6 requires a role string"
+            )
+
+
+def _assert_payload_status_values_are_valid(payload: dict[str, Any]) -> None:
+    """Raise ValidationError if a payload status field has an invalid value.
+
+    An event's `payload` may set any of the five decomposed status fields
+    (`STATUS_FIELDS`) directly (`core/projection.py` applies these on
+    replay). A blank or non-string value here would still pass the envelope
+    checks above, get appended to the log, and only fail later when
+    `validate_fragment` rejects the resulting fragment on read — silently
+    dropping the session from every query (`iter_fragments(skip_corrupt=True)`
+    skips it, and `projection.rebuild()` would just regenerate the same
+    broken fragment from the same bad event forever). Rejecting here means
+    nothing bad is ever persisted in the first place (NFR-7), matching how
+    every other malformed-write case in this function is handled.
+
+    Args:
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: if any key in `payload` that names one of
+            `STATUS_FIELDS` is not a non-empty (post-strip) string.
+    """
+    for field in STATUS_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValidationError(
+                f"payload status field {field!r} must be a non-empty string, "
+                f"got {value!r}"
             )
 
 

@@ -8,6 +8,7 @@ liveness, both required).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -176,10 +177,9 @@ class TestStaleLockReclaim:
         lock_path = tmp_path / ".lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path.write_text("not-json-at-all", encoding="utf-8")
-        import os as _os
 
         old = time.time() - 10.0
-        _os.utime(lock_path, (old, old))
+        os.utime(lock_path, (old, old))
         # Unparseable content -> treated as pid=-1 -> not alive -> reclaimed.
         assert _reclaim_if_stale(lock_path, stale_age=1.0) is True
 
@@ -197,6 +197,138 @@ class TestStaleLockReclaim:
 
         monkeypatch.setattr("os.remove", _remove_then_pretend_already_gone)
         assert _reclaim_if_stale(lock_path, stale_age=1.0) is True
+
+    def test_reclaim_does_not_steal_a_lock_that_changed_underneath_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 review finding #1, deeper case found while proving the fix live.
+
+        A racer's stale/dead-pid decision (stat + read) can be based on data
+        read *milliseconds* earlier — under real contention, a process can be
+        descheduled by the OS between two Python bytecode instructions for
+        long enough that several *other* processes fully cycle through the
+        lock (reclaim -> create -> release -> create again) in the gap. An
+        identity-blind reclaim action would then act on whichever *live,
+        legitimately held* lock happens to occupy the path at that later
+        moment, not the stale instance actually evaluated — silently
+        breaking mutual exclusion for whoever currently holds it.
+
+        Proven live: a real multiprocess stress test reproduced exactly this
+        (three worker processes with overlapping "I hold the lock" windows,
+        one lost event) before this fix. This test forces the same
+        interleaving deterministically by injecting the "concurrent cycle"
+        the instant this racer wins the exclusive reclaim marker — the exact
+        point after which `_reclaim_if_stale` re-verifies identity before
+        ever touching `lock_path`.
+        """
+        lock_path = tmp_path / ".lock"
+        dead_pid = self._dead_pid()
+        self._write_lock(lock_path, pid=dead_pid, age_seconds=10.0)
+
+        live_pid = 999999999  # a pid our own process did not observe as dead
+        live_content = json.dumps({"pid": live_pid, "ts": "2026-08-14T12:00:05Z"})
+        state = {"injected": False}
+        marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+
+        real_open = __import__("os").open
+
+        def _inject_after_marker_then_open(path: object, flags: int, *a: object, **kw: object):
+            fd = real_open(path, flags, *a, **kw)
+            if not state["injected"] and str(path) == str(marker_path):
+                state["injected"] = True
+                # Simulate: between this racer's stale read and the instant
+                # it wins the reclaim marker, a DIFFERENT process fully
+                # reclaimed the original stale lock and created its own
+                # fresh, live one at the same path. Must be a genuinely NEW
+                # file (new inode) — rewriting the existing file's content
+                # in place would keep the same inode and fail to reproduce
+                # the real race, where the other process's own
+                # `os.open(O_CREAT|O_EXCL)` creates a brand new filesystem
+                # object at this path.
+                os.remove(lock_path)
+                live_fd = real_open(str(lock_path), os.O_CREAT | os.O_WRONLY)
+                try:
+                    os.write(live_fd, live_content.encode("utf-8"))
+                finally:
+                    os.close(live_fd)
+            return fd
+
+        monkeypatch.setattr("os.open", _inject_after_marker_then_open)
+        monkeypatch.setattr(
+            "scripts.fleet.core.events._pid_is_alive",
+            lambda pid: pid == live_pid,
+        )
+
+        reclaimed = _reclaim_if_stale(lock_path, stale_age=1.0)
+
+        assert state["injected"], "test setup bug: the injection point was never reached"
+        assert reclaimed is False, (
+            "reclaim reported success after stealing a lock that had "
+            "changed underneath it — it must detect the mismatch and back "
+            "off, not keep a win it did not actually earn"
+        )
+        # The live lock must survive untouched — never renamed away at all,
+        # since the identity re-check happens before any action on it.
+        assert lock_path.is_file(), "the live lock did not survive"
+        assert lock_path.read_text(encoding="utf-8") == live_content
+        # The exclusive marker must be cleaned up so a later, legitimate
+        # reclaim attempt is never permanently blocked by this one.
+        assert not marker_path.exists(), "the reclaim marker leaked"
+
+    def test_an_already_held_reclaim_marker_blocks_a_second_racer(self, tmp_path: Path) -> None:
+        """The mutual-exclusion gate is the marker's `O_CREAT|O_EXCL` create,
+        not the later rename — `os.replace` to distinct destination names is
+        NOT reliably exclusive across processes on this platform (verified
+        directly, independent of this module's own logic). If another racer
+        already holds `<lock>.reclaiming`, this call must back off without
+        ever touching `lock_path`.
+        """
+        lock_path = tmp_path / ".lock"
+        dead_pid = self._dead_pid()
+        self._write_lock(lock_path, pid=dead_pid, age_seconds=10.0)
+        marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+        marker_path.write_text("held by another racer", encoding="utf-8")
+
+        reclaimed = _reclaim_if_stale(lock_path, stale_age=1.0)
+
+        assert reclaimed is False
+        # lock_path must be completely untouched — still exactly the
+        # original stale content, not renamed, not modified.
+        assert lock_path.is_file()
+        content = json.loads(lock_path.read_text(encoding="utf-8"))
+        assert content["pid"] == dead_pid
+        # The pre-existing marker (simulating another racer's in-flight
+        # reclaim) must not be disturbed by this losing attempt either.
+        assert marker_path.read_text(encoding="utf-8") == "held by another racer"
+
+    def test_lock_gone_by_the_time_the_marker_is_won_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If `lock_path` vanishes in the gap between the initial staleness
+        decision and winning the exclusive marker (e.g. its legitimate
+        holder released it right then), the re-check must return `False`
+        cleanly — not raise, and not treat "gone" as a win here (unlike the
+        very first check at the top of this function, which does treat
+        "never existed" as safe-to-retry; this is a *different* branch).
+        """
+        lock_path = tmp_path / ".lock"
+        self._write_lock(lock_path, pid=self._dead_pid(), age_seconds=10.0)
+        marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
+
+        real_open = __import__("os").open
+
+        def _remove_lock_after_marker_win(path: object, flags: int, *a: object, **kw: object):
+            fd = real_open(path, flags, *a, **kw)
+            if str(path) == str(marker_path):
+                os.remove(lock_path)
+            return fd
+
+        monkeypatch.setattr("os.open", _remove_lock_after_marker_win)
+
+        reclaimed = _reclaim_if_stale(lock_path, stale_age=1.0)
+
+        assert reclaimed is False
+        assert not marker_path.exists(), "the reclaim marker leaked"
 
 
 class TestPidIsAlive:

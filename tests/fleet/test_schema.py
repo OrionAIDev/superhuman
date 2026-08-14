@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from scripts.fleet.core.errors import ValidationError
-from scripts.fleet.core.events import append
+from scripts.fleet.core.events import append, read_all
 from scripts.fleet.core.projection import rebuild
 from scripts.fleet.core.query import list_sessions
 from scripts.fleet.core.schema import (
@@ -233,3 +233,74 @@ class TestProjectIdGroupingIsByEqualityNotSlugSubstring:
             )
         rebuild(log_path, sessions_dir)
         assert len(list_sessions(sessions_dir)) == 2
+
+
+class TestPayloadStatusValuesAreValidatedAtWriteTime:
+    """G5 review finding #3: an invalid payload status value (e.g. an empty
+    string) used to pass validate_event() untouched, get written to the log,
+    then fail validate_fragment() on projection/read and get silently
+    skipped by iter_fragments(skip_corrupt=True) — the session would vanish
+    from list_sessions() forever (rebuild() just regenerates the same broken
+    fragment from the same bad event on every replay). Rejecting at
+    validate_event() time means nothing bad is ever persisted in the first
+    place (NFR-7's own principle, applied to payload contents too).
+    """
+
+    @pytest.mark.parametrize("status_field", ["lifecycle", "block_state", "review_state",
+                                               "adoption_state", "done_level"])
+    def test_empty_status_value_in_payload_is_rejected(self, status_field: str) -> None:
+        data = _valid_event()
+        data["payload"] = {status_field: ""}
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize("bad_value", ["", "   ", 123, None, [], {}])
+    def test_non_string_or_blank_status_value_is_rejected(self, bad_value: object) -> None:
+        data = _valid_event()
+        data["payload"] = {"lifecycle": bad_value}
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_valid_status_value_in_payload_is_accepted(self) -> None:
+        data = _valid_event()
+        data["payload"] = {"lifecycle": "active"}
+        event = validate_event(data)
+        assert event.payload == {"lifecycle": "active"}
+
+    def test_non_status_payload_keys_are_unrestricted(self) -> None:
+        # A payload key that isn't one of the five status fields carries no
+        # such requirement — this validation is specifically about the
+        # decomposed status vocabulary, not payload contents in general.
+        data = _valid_event()
+        data["payload"] = {"note": "", "commit_sha": "abc123"}
+        event = validate_event(data)
+        assert event.payload == {"note": "", "commit_sha": "abc123"}
+
+
+class TestInvalidPayloadStatusIsRejectedAtAppendAndNeverStrandsASession:
+    """The end-to-end version of the same finding: append() rejects it
+    outright (nothing persisted), and a *valid* status written afterward is
+    readable via list_sessions() — proving the session never silently
+    vanishes.
+    """
+
+    def test_append_with_invalid_status_persists_nothing(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        bad = _valid_event()
+        bad["payload"] = {"lifecycle": ""}
+        with pytest.raises(ValidationError):
+            append(log_path, bad)
+        assert read_all(log_path) == []
+
+    def test_append_with_valid_status_is_readable_via_list_sessions(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+        good = _valid_event()
+        good["payload"] = {"lifecycle": "active"}
+        append(log_path, good)
+        rebuild(log_path, sessions_dir)
+        sessions = list_sessions(sessions_dir, project_id=good["project_id"])
+        assert len(sessions) == 1
+        assert sessions[0].lifecycle == "active"

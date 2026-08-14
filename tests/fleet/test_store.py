@@ -106,6 +106,28 @@ class TestAtomicWrite:
         leftovers = [p for p in sessions_dir.glob("*") if p.name.startswith(".tmp-")]
         assert leftovers == []
 
+    def test_non_oserror_failure_still_cleans_up_the_temp_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 review nit: `except OSError` was narrower than the try body, so
+        a non-`OSError` (e.g. a `json.dump` failure) leaked the `.tmp-*`
+        file. The cleanup must run on *any* exception, not just `OSError`.
+        """
+        sessions_dir = tmp_path / "sessions"
+        fragment = _fragment("portable/ws/proj/non-oserror-failure")
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise ValueError("simulated non-OSError failure inside the write")
+
+        monkeypatch.setattr("json.dump", _boom)
+        with pytest.raises(ValueError):
+            write_fragment(fragment, sessions_dir)
+        monkeypatch.undo()
+
+        assert read_fragment(fragment.node_id, sessions_dir) is None
+        leftovers = [p for p in sessions_dir.glob("*") if p.name.startswith(".tmp-")]
+        assert leftovers == [], f"temp file leaked on a non-OSError failure: {leftovers}"
+
 
 class TestIterFragments:
     def test_missing_sessions_dir_returns_empty_list(self, tmp_path: Path) -> None:
