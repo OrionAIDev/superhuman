@@ -1,0 +1,235 @@
+"""Tests for ``scripts.fleet.core.schema`` — TC-1, TC-2, TC-3, TC-4(a).
+
+Covers NFR-7 (malformed writes rejected), FR-5 (five orthogonal status fields,
+no collapsing enum), NFR-6 (writer_role is role-only), and the schema-side half
+of G3-1 (project_id required on every event).
+"""
+
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+
+import pytest
+
+from scripts.fleet.core.errors import ValidationError
+from scripts.fleet.core.events import append
+from scripts.fleet.core.projection import rebuild
+from scripts.fleet.core.query import list_sessions
+from scripts.fleet.core.schema import (
+    REQUIRED_EVENT_FIELDS,
+    Event,
+    Fragment,
+    validate_event,
+    validate_fragment,
+)
+
+
+def _valid_event() -> dict:
+    return {
+        "schema_version": 1,
+        "event_id": "11111111-1111-1111-1111-111111111111",
+        "idempotency_key": "register:portable/ws/proj/local-1",
+        "ts": "2026-08-14T12:00:00Z",
+        "type": "session_registered",
+        "project_id": "proj-abc123",
+        "node_id": "portable/ws/proj/local-1",
+        "writer_role": "Developer",
+        "payload": {},
+    }
+
+
+def _valid_fragment_kwargs() -> dict:
+    return {
+        "node_id": "portable/ws/proj/local-1",
+        "project_id": "proj-abc123",
+        "lifecycle": "active",
+        "block_state": "unblocked",
+        "review_state": "none",
+        "adoption_state": "normal",
+        "done_level": "D0-code",
+    }
+
+
+class TestValidateEventAcceptsWellFormed:
+    def test_well_formed_event_round_trips(self) -> None:
+        data = _valid_event()
+        event = validate_event(data)
+        assert isinstance(event, Event)
+        assert event.schema_version == data["schema_version"]
+        assert event.event_id == data["event_id"]
+        assert event.idempotency_key == data["idempotency_key"]
+        assert event.ts == data["ts"]
+        assert event.type == data["type"]
+        assert event.project_id == data["project_id"]
+        assert event.node_id == data["node_id"]
+        assert event.writer_role == data["writer_role"]
+        assert event.payload == data["payload"]
+
+
+class TestValidateEventRejectsMalformed:
+    """TC-1: every malformed fixture raises and touches no file."""
+
+    @pytest.mark.parametrize("missing_field", sorted(REQUIRED_EVENT_FIELDS))
+    def test_missing_required_field_is_rejected(self, missing_field: str, tmp_path) -> None:
+        data = _valid_event()
+        del data[missing_field]
+        with pytest.raises(ValidationError):
+            validate_event(data)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_unknown_event_type_is_rejected(self, tmp_path) -> None:
+        data = _valid_event()
+        data["type"] = "not_a_real_event_type"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_non_iso8601_ts_is_rejected(self, tmp_path) -> None:
+        data = _valid_event()
+        data["ts"] = "not-a-timestamp"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestFiveDecomposedStatusFields:
+    """TC-2 (FR-5): the five fields are orthogonal; collapsing them is rejected."""
+
+    def test_active_and_blocked_simultaneously_is_legal(self) -> None:
+        kwargs = _valid_fragment_kwargs()
+        kwargs["lifecycle"] = "active"
+        kwargs["block_state"] = "blocked"
+        fragment = validate_fragment(kwargs)
+        assert fragment.lifecycle == "active"
+        assert fragment.block_state == "blocked"
+
+    def test_collapsing_into_single_status_field_is_rejected(self) -> None:
+        kwargs = _valid_fragment_kwargs()
+        del kwargs["lifecycle"]
+        del kwargs["block_state"]
+        kwargs["status"] = "active_blocked"
+        with pytest.raises(ValidationError):
+            validate_fragment(kwargs)
+
+    def test_dataclass_constructor_itself_rejects_a_status_kwarg(self) -> None:
+        # Belt-and-suspenders: even bypassing validate_fragment(), the dataclass
+        # has no `status` slot, so a caller cannot smuggle one in directly.
+        kwargs = _valid_fragment_kwargs()
+        del kwargs["lifecycle"]
+        kwargs["status"] = "active"
+        with pytest.raises(TypeError):
+            Fragment(**kwargs)
+
+
+class TestWriterRoleIsRoleOnly:
+    """TC-3 (NFR-6): writer_role rejects model/vendor strings."""
+
+    @pytest.mark.parametrize(
+        "role",
+        ["Project Manager", "Developer", "Architect", "QA", "Tester", "CEO"],
+    )
+    def test_role_names_are_accepted(self, role: str) -> None:
+        data = _valid_event()
+        data["writer_role"] = role
+        event = validate_event(data)
+        assert event.writer_role == role
+
+    @pytest.mark.parametrize(
+        "role",
+        ["Claude", "Claude Sonnet 5", "claude-3", "gpt-4", "anthropic", "opus", "ChatGPT"],
+    )
+    def test_model_or_vendor_strings_are_rejected(self, role: str) -> None:
+        data = _valid_event()
+        data["writer_role"] = role
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+
+class TestProjectIdRequired:
+    """TC-4(a): project_id is required, not optional (G3-1)."""
+
+    def test_omitted_project_id_is_rejected(self) -> None:
+        data = _valid_event()
+        del data["project_id"]
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_project_id_is_carried_through_unmodified(self) -> None:
+        data = _valid_event()
+        data["project_id"] = "proj-xyz789"
+        event = validate_event(data)
+        assert event.project_id == "proj-xyz789"
+
+
+class TestValidateEventDoesNotMutateInput:
+    def test_input_dict_is_not_mutated(self) -> None:
+        data = _valid_event()
+        original = copy.deepcopy(data)
+        validate_event(data)
+        assert data == original
+
+
+class TestProjectIdGroupingIsByEqualityNotSlugSubstring:
+    """TC-4(b): query grouping is project_id equality, never a slug substring.
+
+    Two projects mint distinct project_ids but use slug-adjacent node ids
+    (one slug is literally a substring of the other's node id) to prove the
+    grouping isn't accidentally done via string containment.
+    """
+
+    def test_list_sessions_filters_by_project_id_equality(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+
+        def register(node_id: str, project_id: str) -> dict:
+            return {
+                "schema_version": 1,
+                "event_id": f"eid-{node_id}",
+                "idempotency_key": f"register:{node_id}",
+                "ts": "2026-08-14T12:00:00Z",
+                "type": "session_registered",
+                "project_id": project_id,
+                "node_id": node_id,
+                "writer_role": "Developer",
+                "payload": {},
+            }
+
+        # project "proj" and project "proj-extended" — the second project_id
+        # string literally contains the first as a substring, and both use
+        # slug-adjacent node ids, to prove grouping never falls back to that.
+        append(log_path, register("portable/ws/proj/local-1", "proj"))
+        append(log_path, register("portable/ws/proj/local-2", "proj"))
+        append(log_path, register("portable/ws/proj-extended/local-1", "proj-extended"))
+
+        rebuild(log_path, sessions_dir)
+
+        proj_sessions = list_sessions(sessions_dir, project_id="proj")
+        assert {f.node_id for f in proj_sessions} == {
+            "portable/ws/proj/local-1",
+            "portable/ws/proj/local-2",
+        }
+
+        extended_sessions = list_sessions(sessions_dir, project_id="proj-extended")
+        assert {f.node_id for f in extended_sessions} == {"portable/ws/proj-extended/local-1"}
+
+    def test_list_sessions_without_filter_returns_everything(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+        for i, project_id in enumerate(["proj-a", "proj-b"]):
+            append(
+                log_path,
+                {
+                    "schema_version": 1,
+                    "event_id": f"eid-{i}",
+                    "idempotency_key": f"register:node-{i}",
+                    "ts": "2026-08-14T12:00:00Z",
+                    "type": "session_registered",
+                    "project_id": project_id,
+                    "node_id": f"portable/ws/{project_id}/local-{i}",
+                    "writer_role": "Developer",
+                    "payload": {},
+                },
+            )
+        rebuild(log_path, sessions_dir)
+        assert len(list_sessions(sessions_dir)) == 2
