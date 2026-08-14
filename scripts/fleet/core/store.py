@@ -15,10 +15,20 @@ that produced a given `Fragment`. `core/events.append` is the sole enforced
 entry for events; `core/projection.project_event` re-checks ownership before
 calling this function with a caller-supplied `Event`, so this module never
 needs to (and structurally cannot).
+
+**`fragment_path` is length-bounded (Chunk-2 review follow-up):** the
+filename is capped and falls back to a digest name for pathological
+`node_id`s — see `fragment_path`'s own docstring. The `sessions_dir`
+*directory* prefix itself is not similarly capped: on an unusually deep
+workspace it could itself push a real path toward Windows' historical
+MAX_PATH, but that is a property of where the caller chose to root the
+project's fleet directory, not of anything this module controls per-call —
+assessed as low priority per the reviewer's own note, not fixed here.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -29,20 +39,57 @@ from urllib.parse import quote
 from .errors import ValidationError
 from .schema import Fragment, validate_fragment
 
+#: Above this length, the readable percent-encoded filename risks the
+#: Windows MAX_PATH-adjacent limits and the NTFS 255-char single-component
+#: cap once ".json" and a real sessions_dir prefix are added — `node_id` is
+#: already percent-encoded once per component by `core.nodes.make_node_id`,
+#: so re-encoding the whole (already-encoded) string here can grow a single
+#: special character by ~5x (`:` -> `%3A` -> `%253A`), with no cap otherwise.
+#: 150 is well under 255 and leaves headroom for ".json" (+5) and a
+#: reasonably deep sessions_dir path.
+_MAX_READABLE_ENCODED_LEN = 150
+
+#: Marker prefixing every digest-fallback filename. Provably disjoint from
+#: any `quote(node_id, safe="")` output: `urllib.parse.quote` only ever
+#: emits a literal `%` as the start of a `%XX` escape, and XX is always two
+#: UPPERCASE hex digits (`quote` never lowercases them) — it never emits `%`
+#: followed by a lowercase letter. `%zz-` (lowercase z) can therefore never
+#: be a prefix of any percent-encoded readable name, for any node_id, at any
+#: length — see `tests/fleet/test_store.py` for a direct proof of this claim.
+_DIGEST_PREFIX = "%zz-"
+
 
 def fragment_path(node_id: str, sessions_dir: Path | str) -> Path:
     """Return the fragment file path for `node_id` under `sessions_dir`.
+
+    A pure, collision-free function of `node_id` in either branch:
+
+    - **Short node_id (the common case):** the readable percent-encoded name
+      (unchanged from before this fix) — `quote(node_id, safe="")`, unique by
+      construction since `quote` is an injective encoding.
+    - **Pathologically long/special node_id:** falls back to a
+      `_DIGEST_PREFIX`-marked SHA-256 hex digest of the *full* `node_id`.
+      256 bits of digest makes an accidental collision negligible, and the
+      prefix guarantees this filename can never collide with a readable one
+      (see `_DIGEST_PREFIX`). The digest is not required to be decodable —
+      `node_id` is always recovered from the fragment's own content
+      (`Fragment.node_id`), never from the filename.
 
     Args:
         node_id: the namespaced node id (may contain `/`, per `core/nodes.py`).
         sessions_dir: the directory holding per-session fragment files.
 
     Returns:
-        Path: `sessions_dir / "<percent-encoded node_id>.json"` — encoding the
-        whole node id (not just escaping `/`) keeps the mapping a pure
-        function of `node_id`, distinct for every distinct node id.
+        Path: the fragment file path — readable or digest-named per the
+        length check above, distinct for every distinct `node_id` either way.
     """
-    return Path(sessions_dir) / f"{quote(node_id, safe='')}.json"
+    encoded = quote(node_id, safe="")
+    if len(encoded) <= _MAX_READABLE_ENCODED_LEN:
+        name = f"{encoded}.json"
+    else:
+        digest = hashlib.sha256(node_id.encode("utf-8")).hexdigest()
+        name = f"{_DIGEST_PREFIX}{digest}.json"
+    return Path(sessions_dir) / name
 
 
 def write_fragment(fragment: Fragment, sessions_dir: Path | str) -> None:
@@ -128,6 +175,14 @@ def iter_fragments(sessions_dir: Path | str, *, skip_corrupt: bool = True) -> li
 
     Returns:
         list[Fragment]: every readable fragment, in filename order.
+
+    Raises:
+        json.JSONDecodeError: if `skip_corrupt` is False and a fragment file
+            is not valid JSON.
+        ValidationError: if `skip_corrupt` is False and a fragment file's
+            content fails schema validation.
+        OSError: if `skip_corrupt` is False and a fragment file cannot be
+            read.
     """
     sessions_dir = Path(sessions_dir)
     if not sessions_dir.is_dir():
