@@ -33,13 +33,14 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .errors import LockTimeoutError, ValidationError
+from .errors import LockTimeoutError, PreconditionUnmet, ValidationError
 from .ownership import assert_writer_may
 from .schema import Event, validate_event
 
@@ -504,6 +505,7 @@ def append(
     timeout: float = _DEFAULT_TIMEOUT,
     retry_interval: float = _DEFAULT_RETRY_INTERVAL,
     stale_age: float = _DEFAULT_STALE_AGE,
+    precondition: Callable[[list[Event]], bool] | None = None,
 ) -> Event | None:
     """Append one validated, ownership-checked event, deduping on `idempotency_key`.
 
@@ -521,12 +523,32 @@ def append(
     describes ("validate_event -> ownership.assert_writer_may -> events.append");
     it is enforced here, not left to each caller to remember.
 
+    `precondition`, if given, is evaluated **inside the lock**, against the
+    exact `existing` event list this call's idempotency check just read —
+    the same atomicity the idempotency dedupe itself relies on. This is what
+    makes it useful for a caller-side terminal-state check (e.g.
+    `handoff.self_register` refusing to flip a handoff that a racing
+    `cancel()` already closed): a check performed *before* acquiring the
+    lock (reading a fragment, say) can always be stale by the time the lock
+    is actually held, because time passes between reading and acquiring —
+    `precondition` closes exactly that window by running only once the lock
+    (and therefore a guaranteed-fresh view of the log) is held, immediately
+    before the write it would gate. It only runs for a genuinely new event —
+    if `idempotency_key` already exists, that dedupe is unconditional and
+    `precondition` never runs at all (review FIX #2's own scope: "the
+    precondition must not break the existing double-launch dedupe").
+
     Args:
         log_path: path to the event log.
         event: an `Event`, or a raw dict to validate first (NFR-7).
         timeout: seconds to keep retrying lock acquisition.
         retry_interval: seconds to sleep between lock-acquisition retries.
         stale_age: seconds before a held lock is even considered stale.
+        precondition: optional callable taking the event list already
+            persisted in the log (as read fresh, under the lock, for this
+            call's own idempotency check) and returning whether the write
+            may proceed. `None` (the default) means "no additional
+            precondition" — every existing caller is unaffected.
 
     Returns:
         Event | None: the appended `Event`, or `None` if an event with the
@@ -539,6 +561,11 @@ def append(
         OwnershipError: if `event.writer_role` may not write `event.type`
             itself, or one of the owned fields present in `event.payload`
             (FR-8). Nothing is written.
+        PreconditionUnmet: if `precondition` is given and returns falsy for
+            the fresh, under-the-lock event list. Nothing is written. Kept
+            distinct from the idempotency dedupe's `None` return — `None`
+            means "already recorded, no-op is correct"; this means "must
+            not be recorded, something the caller depends on has changed."
         LockTimeoutError: if the lock could not be acquired in time.
     """
     # Validate unconditionally (GPT-5 review finding #2) — an already
@@ -574,6 +601,13 @@ def append(
         existing = read_all(log_path)
         if any(e.idempotency_key == ev.idempotency_key for e in existing):
             return None
+
+        if precondition is not None and not precondition(existing):
+            raise PreconditionUnmet(
+                f"precondition rejected append of idempotency_key="
+                f"{ev.idempotency_key!r} (type={ev.type!r}, node_id={ev.node_id!r}); "
+                "nothing was written"
+            )
 
         needs_leading_newline = not _ends_with_newline(log_path)
         with open(log_path, "a", encoding="utf-8", newline="\n") as f:

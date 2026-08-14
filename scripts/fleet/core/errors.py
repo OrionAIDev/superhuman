@@ -36,3 +36,18 @@ class LockTimeoutError(FleetError):
     Raised by ``core.events.acquire_lock`` after bounded retry. The caller
     should retry the whole operation later; the log is never written unlocked.
     """
+
+
+class PreconditionUnmet(FleetError):
+    """An ``append()`` caller's ``precondition`` rejected the write.
+
+    Raised by ``core.events.append`` when a ``precondition`` callable is
+    given and returns falsy for the event list read under the lock — after
+    the idempotency-key dedupe check, so a genuine duplicate append still
+    returns ``None`` as before; this is reserved for the distinct case of "a
+    fresh, non-duplicate event, refused by caller-supplied policy." Nothing
+    is written on this error, same guarantee as every other ``append()``
+    rejection. Distinguishing this from the dedupe ``None`` return matters:
+    ``None`` means "already recorded, no-op is correct"; this exception
+    means "must not be recorded, something changed underneath the caller."
+    """

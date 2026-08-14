@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.fleet.core.errors import LockTimeoutError, ValidationError
+from scripts.fleet.core.errors import LockTimeoutError, PreconditionUnmet, ValidationError
 from scripts.fleet.core.events import (
     _pid_is_alive,
     _reclaim_if_stale,
@@ -622,3 +622,64 @@ class TestReadAllSkipsBlankAndSchemaInvalidLines:
 
         events = read_all(log_path)
         assert [e.idempotency_key for e in events] == ["key-1", "key-2"]
+
+
+class TestAppendPrecondition:
+    """Review FIX #2: an optional `precondition` evaluated ATOMICALLY with
+    the write, under the same lock acquisition that reads the fresh event
+    list — closing the TOCTOU window an outside-the-lock fragment/state read
+    cannot close (e.g. `handoff.self_register`'s cancel-vs-launch race).
+    """
+
+    def test_precondition_true_allows_the_write(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        result = append(log_path, _event("key-ok"), precondition=lambda existing: True)
+        assert result is not None
+        assert len(read_all(log_path)) == 1
+
+    def test_precondition_false_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(PreconditionUnmet):
+            append(log_path, _event("key-blocked"), precondition=lambda existing: False)
+        assert read_all(log_path) == []
+
+    def test_precondition_receives_the_fresh_existing_events_under_the_lock(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _event("key-1", event_id="eid-1"))
+        append(log_path, _event("key-2", event_id="eid-2"))
+
+        seen: list[list[str]] = []
+
+        def _record(existing: list[Event]) -> bool:
+            seen.append([e.idempotency_key for e in existing])
+            return True
+
+        append(log_path, _event("key-3", event_id="eid-3"), precondition=_record)
+        assert seen == [["key-1", "key-2"]]
+
+    def test_precondition_is_not_evaluated_for_an_idempotent_dedupe(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _event("dup-key", event_id="eid-first"))
+
+        calls = {"n": 0}
+
+        def _never_should_run(existing: list[Event]) -> bool:
+            calls["n"] += 1
+            return True
+
+        result = append(
+            log_path, _event("dup-key", event_id="eid-second"), precondition=_never_should_run
+        )
+        assert result is None  # existing dedupe behavior, unchanged
+        assert calls["n"] == 0
+        assert len(read_all(log_path)) == 1
+
+    def test_no_precondition_given_behaves_exactly_as_before(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        result = append(log_path, _event("key-no-precondition"))
+        assert result is not None
+        assert len(read_all(log_path)) == 1

@@ -30,6 +30,8 @@ from .core.schema import Event, Fragment, validate_event
 from .core.store import read_fragment
 from .handoff import cancel as handoff_cancel
 from .handoff import emit as handoff_emit
+from .handoff import extract_handoff_id
+from .handoff import self_register as handoff_self_register
 from .handoff import stale_report
 
 #: `fleet --version` output. Not tied to `VERSION` at the skill root — this
@@ -431,6 +433,96 @@ def _cmd_handoff_stale(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_handoff_self_register(args: argparse.Namespace) -> int:
+    """Handle `fleet handoff self-register` (review FIX #1).
+
+    This is the launched session's actual first-action invocation surface
+    for FR-2's launch flip — `handoff.self_register()` was Python-only
+    before this fix, so "launching flips awaiting-launch to active" had no
+    real shell/CLI path a spawned session could call.
+
+    `--handoff-id` is the primary anchor (Decision E). If it is not given
+    directly, `--prompt-file` is grepped for the embedded
+    `FLEET-HANDOFF-ID:` line (`handoff.extract_handoff_id`) — the literal
+    "first action greps its own prompt for the token" DESIGN describes. If
+    an id still cannot be recovered, this falls back to the fuzzy
+    `(cwd, branch)` path: `--cwd`/`--branch` if given explicitly, else
+    derived from the adapter's own `git_facts()` (the launched session's
+    actual checkout) — never fabricated, matching every other adapter fact
+    in this package.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` if the row is now `active` (freshly launched, or already
+        was — idempotent repeat); `1` if no candidate matched, the match was
+        closed (cancelled/expired), or the lock/id could not be resolved;
+        `2` if the fuzzy match was ambiguous — refused, never auto-picked,
+        with every candidate printed for human/PM disambiguation.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+
+    handoff_id = args.handoff_id
+    if handoff_id is None and args.prompt_file is not None:
+        handoff_id = extract_handoff_id(args.prompt_file.read_text(encoding="utf-8"))
+
+    cwd = args.cwd
+    branch = args.branch
+    if handoff_id is None and (cwd is None or branch is None):
+        # Only the fuzzy path needs cwd/branch at all — never touch the
+        # adapter (or its git subprocess calls) when an id was recovered.
+        adapter = _build_adapter(args)
+        facts = adapter.git_facts()
+        if cwd is None:
+            cwd = facts.toplevel or args.workspace
+        if branch is None:
+            branch = facts.branch
+
+    try:
+        result = handoff_self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role=args.writer_role,
+            handoff_id=handoff_id,
+            cwd=cwd,
+            branch=branch,
+            lock_retry_attempts=args.lock_retry_attempts,
+        )
+    except LockTimeoutError as exc:
+        print(
+            f"fleet handoff self-register: could not acquire the manifest lock: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    except ValueError as exc:
+        print(f"fleet handoff self-register: rejected: {exc}", file=sys.stderr)
+        return 1
+
+    if result.status in ("launched", "already_launched"):
+        print(f"{result.status}: {result.node_id} (match={result.match_method})")
+        return 0
+
+    if result.status == "ambiguous":
+        print(
+            "fleet handoff self-register: ambiguous fuzzy match — refusing to "
+            "auto-flip; candidates for human/PM disambiguation:",
+            file=sys.stderr,
+        )
+        for candidate in result.candidates:
+            print(f"  - {candidate}", file=sys.stderr)
+        return 2
+
+    print(
+        f"fleet handoff self-register: {result.status}"
+        + (f": {result.node_id}" if result.node_id else ""),
+        file=sys.stderr,
+    )
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `fleet` argument parser.
 
@@ -634,6 +726,71 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "value from ~/.superhuman/profile.yaml, NFR-5)",
     )
     stale_parser.set_defaults(func=_cmd_handoff_stale)
+
+    self_register_parser = handoff_subparsers.add_parser(
+        "self-register",
+        help="Flip an awaiting-launch handoff row to active "
+        "(the launched session's own first action).",
+    )
+    self_register_parser.add_argument("--workspace", required=True, type=Path)
+    self_register_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    self_register_parser.add_argument(
+        "--handoff-id",
+        default=None,
+        help="the id recovered from this session's own prompt (primary anchor, "
+        "Decision E); omit to use --prompt-file or the fuzzy (cwd, branch) fallback",
+    )
+    self_register_parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="grep this file's FLEET-HANDOFF-ID line for the id, when --handoff-id "
+        "is not given directly",
+    )
+    self_register_parser.add_argument(
+        "--cwd",
+        type=Path,
+        default=None,
+        help="override the fuzzy-match cwd anchor "
+        "(defaults to the adapter's git toplevel, or --workspace)",
+    )
+    self_register_parser.add_argument(
+        "--branch",
+        default=None,
+        help="override the fuzzy-match branch anchor (defaults to the adapter's "
+        "current branch)",
+    )
+    self_register_parser.add_argument(
+        "--writer-role", required=True, help="a role name, never an AI/model/vendor string"
+    )
+    self_register_parser.add_argument(
+        "--harness",
+        choices=("claude", "portable"),
+        default="portable",
+        help="which SessionAdapter implementation derives cwd/branch for the "
+        "fuzzy fallback (default: portable; ignored when --handoff-id resolves)",
+    )
+    self_register_parser.add_argument(
+        "--session-id", default=None, help="--harness claude only: see `register`'s equivalent flag"
+    )
+    self_register_parser.add_argument(
+        "--sessions-json", type=Path, default=None, help="--harness claude only"
+    )
+    self_register_parser.add_argument(
+        "--session-relay-script", type=Path, default=None, help="--harness claude only"
+    )
+    self_register_parser.add_argument("--local-id", default=None, help="--harness portable only")
+    self_register_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    self_register_parser.add_argument(
+        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+    )
+    self_register_parser.set_defaults(func=_cmd_handoff_self_register)
 
 
 def main(argv: list[str] | None = None) -> int:

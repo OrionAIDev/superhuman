@@ -70,6 +70,26 @@ class TestStaleHandoffsFromManifestAlone:
         assert rows[0]["handoff_id"] == "hid-stale"
         assert rows[0]["age_seconds"] > 3600
 
+    def test_a_row_exactly_at_expiry_is_not_yet_stale(self, tmp_path: Path) -> None:
+        # Review FIX #4: documents the `age_seconds > expiry_seconds`
+        # boundary is strict-greater-than — a row exactly at the threshold
+        # has not yet exceeded it.
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+        now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        exact_ts = (now - timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        append(log_path, _emitted_event("node-exact", "hid-exact", exact_ts))
+        write_fragment(_fragment("node-exact", "awaiting-launch"), sessions_dir)
+
+        rows = stale_handoffs(log_path, sessions_dir, now=now, expiry_seconds=3600)
+        assert rows == []
+
+        # One second past the boundary, it IS stale — proving the assertion
+        # above isn't vacuously true from a timestamp-parsing bug.
+        rows_past = stale_handoffs(log_path, sessions_dir, now=now, expiry_seconds=3599)
+        assert [r["node_id"] for r in rows_past] == ["node-exact"]
+
     def test_no_open_rows_yields_empty_report(self, tmp_path: Path) -> None:
         log_path = tmp_path / "events.jsonl"
         sessions_dir = tmp_path / "sessions"

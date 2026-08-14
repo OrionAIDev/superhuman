@@ -29,15 +29,17 @@ allows ("Reuse cli.py's `_append_with_bounded_retry` (or the same pattern)").
 
 from __future__ import annotations
 
+import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .adapter.base import SessionAdapter, workspace_component
-from .core.errors import LockTimeoutError
+from .adapter.base import HANDOFF_ID_LINE_PREFIX, SessionAdapter, workspace_component
+from .core.errors import LockTimeoutError, PreconditionUnmet
 from .core.events import append, read_all
 from .core.nodes import make_node_id
 from .core.projection import project_event
@@ -48,6 +50,15 @@ from .core.store import iter_fragments, read_fragment
 #: Registrar-level bounded retry defaults, matching `cli.py`'s.
 _DEFAULT_LOCK_RETRY_ATTEMPTS = 3
 _DEFAULT_LOCK_RETRY_BACKOFF = 0.1
+
+#: Matches the literal `FLEET-HANDOFF-ID: <token>` line `adapter.emit_prompt`
+#: embeds (Decision E), capturing everything after the prefix up to the end
+#: of that line, trimmed. `re.MULTILINE` so `^` anchors to any line, not just
+#: the start of the whole text — the marker line can appear anywhere in an
+#: edited prompt.
+_HANDOFF_ID_LINE_RE = re.compile(
+    rf"^{re.escape(HANDOFF_ID_LINE_PREFIX)}\s*(\S+)", re.MULTILINE
+)
 
 #: Generic, non-operator-specific fallback (NFR-5: expiry is config/profile
 #: driven — this is the default used only when no profile overrides it, not
@@ -103,36 +114,67 @@ def _normalize_branch(branch: str) -> str:
     return stripped
 
 
+def extract_handoff_id(prompt_text: str) -> str | None:
+    """Recover a `handoff_id` from its own emitted prompt text (Decision E).
+
+    The launched session's first action is meant to "grep its own prompt for
+    the token" — this is that grep, exposed as a public, directly-testable
+    function (review FIX #1) rather than left as an inline detail of a CLI
+    command. Public so any caller (the `fleet handoff self-register` CLI
+    subcommand, or a future harness-native first-action hook) can reuse it
+    without re-implementing the marker format.
+
+    Args:
+        prompt_text: the (possibly edited) prompt text to search.
+
+    Returns:
+        str | None: the token from the first `FLEET-HANDOFF-ID:` line found,
+        or `None` if no such line is present (the edited-prompt case FR-2's
+        fuzzy fallback exists for).
+    """
+    match = _HANDOFF_ID_LINE_RE.search(prompt_text)
+    return match.group(1) if match else None
+
+
 def _append_with_bounded_retry(
     log_path: Path | str,
     event_dict: dict[str, Any],
     *,
     attempts: int,
     backoff: float,
+    precondition: Callable[[list[Event]], bool] | None = None,
 ) -> Event | None:
     """Call `core.events.append`, retrying a bounded number of times on lock contention.
 
     Identical in behavior to `cli.py`'s helper of the same name (see this
-    module's docstring for why it is duplicated rather than imported). Never
-    proceeds as if the event were written — either `append` succeeds within
-    the attempt budget, or `LockTimeoutError` propagates to the caller.
+    module's docstring for why it is duplicated rather than imported), plus
+    an optional `precondition` pass-through (review FIX #2) — `cli.py`'s own
+    copy has no equivalent parameter since `register`/`emit` never need one.
+    Never proceeds as if the event were written — either `append` succeeds
+    within the attempt budget, or an exception propagates to the caller.
+    `PreconditionUnmet` is never retried (retrying a precondition failure
+    that depends on committed, not transient, state cannot succeed by
+    trying again) — only `LockTimeoutError` triggers a retry.
 
     Args:
         log_path: path to the event log.
         event_dict: the raw event dict to append.
         attempts: total attempts, including the first (must be >= 1).
         backoff: seconds to sleep between attempts.
+        precondition: passed through to `core.events.append` unchanged.
 
     Returns:
         Event | None: as `core.events.append`.
 
     Raises:
         LockTimeoutError: if every attempt timed out.
+        PreconditionUnmet: if `precondition` is given and rejects the write
+            (propagates immediately, not retried).
     """
     last_exc: LockTimeoutError | None = None
     for attempt in range(attempts):
         try:
-            return append(log_path, event_dict)
+            return append(log_path, event_dict, precondition=precondition)
         except LockTimeoutError as exc:
             last_exc = exc
             if attempt < attempts - 1 and backoff > 0:
@@ -322,6 +364,35 @@ def _open_awaiting_launch_rows(
     return rows
 
 
+#: Event types that permanently close a handoff row. Checked atomically,
+#: under the lock, by `_not_terminated` — the pre-lock `current.lifecycle`
+#: read in `self_register` cannot make this guarantee on its own, since a
+#: racing `cancel()` can commit in the window between that read and the
+#: lock actually being acquired for the launch write (review FIX #2).
+_TERMINAL_HANDOFF_EVENT_TYPES = frozenset({"handoff_cancelled", "handoff_expired"})
+
+
+def _not_terminated(node_id: str) -> Callable[[list[Event]], bool]:
+    """Build an `append()` precondition refusing a launch for a closed handoff.
+
+    Args:
+        node_id: the handoff row's node id.
+
+    Returns:
+        Callable[[list[Event]], bool]: a predicate over the fresh event list
+        `core.events.append` reads under the lock (review FIX #2) — `False`
+        (refuse the write) iff a `handoff_cancelled`/`handoff_expired` event
+        already exists for `node_id`.
+    """
+
+    def _check(existing: list[Event]) -> bool:
+        return not any(
+            e.node_id == node_id and e.type in _TERMINAL_HANDOFF_EVENT_TYPES for e in existing
+        )
+
+    return _check
+
+
 def _find_by_handoff_id(log_path: Path | str, handoff_id: str) -> str | None:
     """Return the node id emitted for `handoff_id`, or `None` if not found.
 
@@ -398,6 +469,21 @@ def self_register(
     true concurrent racing (see `tests/fleet/test_concurrency.py`'s
     double-launch worker, which exercises the underlying `core.events.append`
     path directly).
+
+    **Cancel is terminal, even against a racing self_register (review FIX
+    #2).** The `current.lifecycle` check above reads the fragment *before*
+    the log lock is acquired, so on its own it can only see a snapshot that
+    may already be stale by the time the write actually happens — a
+    genuinely concurrent `cancel()` can commit in that exact window. The
+    write itself is therefore additionally guarded by an `append()`
+    `precondition` (`_not_terminated`) that re-checks, under the lock and
+    against the fresh log, that no `handoff_cancelled`/`handoff_expired`
+    event exists for this node — closing the race the pre-lock read cannot.
+    When that precondition fires, this returns `"not_launchable"` exactly as
+    the pre-lock check would have, rather than propagating the underlying
+    `PreconditionUnmet`; the caller sees one consistent outcome for "this
+    handoff is closed" regardless of which of the two checks actually caught
+    it.
 
     Args:
         log_path: path to the project's event log.
@@ -483,9 +569,23 @@ def self_register(
         "payload": {"lifecycle": "active", "match_method": match_method, "handoff_id": handoff_id},
     }
 
-    appended = _append_with_bounded_retry(
-        log_path, event_dict, attempts=lock_retry_attempts, backoff=lock_retry_backoff
-    )
+    try:
+        appended = _append_with_bounded_retry(
+            log_path,
+            event_dict,
+            attempts=lock_retry_attempts,
+            backoff=lock_retry_backoff,
+            precondition=_not_terminated(node_id),
+        )
+    except PreconditionUnmet:
+        # A cancel (or expiry) committed between the pre-lock fragment read
+        # above and the lock actually being acquired for this write — the
+        # atomic guard caught what the pre-lock check could not (review
+        # FIX #2). No event was written.
+        return SelfRegisterResult(
+            status="not_launchable", node_id=node_id, match_method=match_method
+        )
+
     if appended is None:
         # Idempotency-key dedupe under true concurrency (TC-12's
         # double-launch worker) — the flip already happened on the racing
@@ -603,7 +703,11 @@ def _resolve_handoff_expiry_seconds(profile_path: Path | None = None) -> float:
 
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
+        # `ValueError` covers `UnicodeDecodeError` (raised by `read_text` on
+        # invalid UTF-8 bytes) — a non-UTF-8 profile must degrade to the
+        # default like every other malformed-profile case, not crash
+        # `stale_report()` (review finding #3).
         return _DEFAULT_HANDOFF_EXPIRY_SECONDS
 
     if not isinstance(raw, dict):
