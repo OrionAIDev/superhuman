@@ -691,6 +691,17 @@ def event_for(node_id: str, target_level: str, log_path: Path | str) -> Event | 
     Works identically whether `advance()`'s own call just wrote the event or
     deduped against one written earlier/by another writer.
 
+    **G5 fix #R3-3 (round 3, cheap hardening):** also requires
+    `event.node_id == node_id`, not just a `type` + `idempotency_key` match.
+    The idempotency key already embeds `node_id`
+    (`done:<node_id>:<target_level>`), so a genuine collision needs a
+    forged event whose key text names one node but whose own `node_id`
+    field names another — a narrow scenario, not the primary threat model —
+    but this function backs the N1 poisoned-idempotency-key check
+    (`advance()`'s docstring), so matching the field explicitly, not just
+    substrings of the key, is a one-line belt-and-suspenders that costs
+    nothing.
+
     Args:
         node_id: the node the transition targeted.
         target_level: the `done_level` that was advanced to.
@@ -703,6 +714,10 @@ def event_for(node_id: str, target_level: str, log_path: Path | str) -> Event | 
     """
     key = f"done:{node_id}:{target_level}"
     for event in read_all(log_path):
-        if event.type == "done_level_advanced" and event.idempotency_key == key:
+        if (
+            event.type == "done_level_advanced"
+            and event.idempotency_key == key
+            and event.node_id == node_id
+        ):
             return event
     return None

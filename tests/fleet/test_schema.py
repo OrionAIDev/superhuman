@@ -123,6 +123,38 @@ class TestFiveDecomposedStatusFields:
             Fragment(**kwargs)
 
 
+class TestValidateFragmentRejectsUnrecognizedDoneLevel:
+    """G5 round-3 fix #R3-1(a): a fragment whose `done_level` is a
+    non-empty string but not one of `DONE_LEVELS` (e.g. a stale legacy
+    value, or a bogus one from a torn write) must be rejected by
+    `validate_fragment`, not merely accepted as "any non-empty string."
+
+    No legitimate fragment can carry such a value — `core.projection` only
+    ever writes a `done_level` derived from `fold_done_level`, which itself
+    only ever returns a recognized `DONE_LEVELS` member (or, before fix
+    #R3-1(b), the unchanged input) — so this closes the gap at the read
+    boundary: a cached fragment corrupted to a bogus `done_level` now hits
+    `project_event`'s existing "treated as absent" `ValidationError` path
+    (the same path a schema-invalid fragment already takes), rather than
+    being accepted and the garbage value retained.
+    """
+
+    def test_unrecognized_done_level_is_rejected(self) -> None:
+        kwargs = _valid_fragment_kwargs()
+        kwargs["done_level"] = "D9-bogus"
+        with pytest.raises(ValidationError):
+            validate_fragment(kwargs)
+
+    def test_every_recognized_done_level_is_still_accepted(self) -> None:
+        from scripts.fleet.core.schema import DONE_LEVELS
+
+        for level in DONE_LEVELS:
+            kwargs = _valid_fragment_kwargs()
+            kwargs["done_level"] = level
+            fragment = validate_fragment(kwargs)
+            assert fragment.done_level == level
+
+
 class TestWriterRoleIsRoleOnly:
     """TC-3 (NFR-6): writer_role rejects model/vendor strings."""
 
@@ -337,13 +369,20 @@ def _done_level_advanced_event(done_level: str) -> Event:
 
 
 class TestFoldDoneLevelNeverRaisesOnUnrecognizedCurrent:
-    """G5 fix #N2: an unrecognized `current_level` (e.g. a corrupt cached
-    fragment's stale `done_level` value) must never raise `KeyError` — it is
-    treated as the `D0-code` floor for adjacency purposes, so a subsequent
-    legitimate adjacent event still applies from a known base.
+    """G5 fix #N2 (round 2) + #R3-1(b) (round 3): an unrecognized
+    `current_level` (e.g. a corrupt cached fragment's stale `done_level`
+    value) must never raise `KeyError`, AND must never be echoed back
+    verbatim as the fold's result either — round 2's fix floored only the
+    ladder-position lookup used for the adjacency check, but still returned
+    the unchanged garbage `current_level` string when the event was not
+    adjacent, so a corrupt cached fragment retained its bogus value
+    indefinitely (until a full `rebuild()`). Round 3 floors the RESULT too:
+    an unrecognized `current_level` is now treated as the `D0-code` floor
+    for the returned value as well as the adjacency check, so this helper
+    alone can never emit a value outside `DONE_LEVELS`.
     """
 
-    def test_unrecognized_current_with_no_advancing_event_is_unchanged(self) -> None:
+    def test_unrecognized_current_with_no_advancing_event_floors_to_d0(self) -> None:
         event = Event(
             schema_version=1,
             event_id="eid-other",
@@ -355,9 +394,9 @@ class TestFoldDoneLevelNeverRaisesOnUnrecognizedCurrent:
             writer_role="Developer",
             payload={"lifecycle": "active"},
         )
-        # Must not raise KeyError, and a non-advance event leaves the
-        # (corrupt) current_level untouched, same as any recognized value.
-        assert fold_done_level("D9-bogus", event) == "D9-bogus"
+        # Must not raise KeyError, and must not echo back the garbage
+        # current_level either (R3-1b) — floors to the D0-code base.
+        assert fold_done_level("D9-bogus", event) == "D0-code"
 
     def test_unrecognized_current_with_an_adjacent_to_floor_event_advances(self) -> None:
         # D1-merged is adjacent to the D0-code FLOOR (index 0 + 1) — an
@@ -366,17 +405,28 @@ class TestFoldDoneLevelNeverRaisesOnUnrecognizedCurrent:
         event = _done_level_advanced_event("D1-merged")
         assert fold_done_level("D9-bogus", event) == "D1-merged"
 
-    def test_unrecognized_current_with_a_non_floor_adjacent_event_is_unchanged(self) -> None:
-        # D2-test is NOT adjacent to the D0-code floor (it's two rungs up),
-        # so this must not raise and must leave current_level untouched —
-        # never silently reset to D0-code either.
-        event = _done_level_advanced_event("D2-test")
-        assert fold_done_level("D9-bogus", event) == "D9-bogus"
+    def test_unrecognized_current_with_a_non_floor_adjacent_event_floors_to_d0(self) -> None:
+        # D3-uat is NOT adjacent to the D0-code floor (it's three rungs up),
+        # so this must not raise, and (R3-1b) must never return the garbage
+        # "D9-bogus" current_level — it floors to the recognized D0-code
+        # base instead, never silently advancing past what the event
+        # actually justifies.
+        event = _done_level_advanced_event("D3-uat")
+        assert fold_done_level("D9-bogus", event) == "D0-code"
 
     def test_recognized_current_still_folds_normally(self) -> None:
         # No regression: the ordinary, recognized-current path is unaffected.
         event = _done_level_advanced_event("D2-test")
         assert fold_done_level("D1-merged", event) == "D2-test"
+
+    def test_recognized_current_non_adjacent_event_still_returns_current_unchanged(
+        self,
+    ) -> None:
+        # No regression: when current_level IS recognized, a non-adjacent
+        # event still leaves it unchanged (not floored to D0-code) — the
+        # R3-1(b) flooring applies only to an unrecognized current_level.
+        event = _done_level_advanced_event("D3-uat")
+        assert fold_done_level("D1-merged", event) == "D1-merged"
 
 
 class TestInvalidPayloadStatusIsRejectedAtAppendAndNeverStrandsASession:

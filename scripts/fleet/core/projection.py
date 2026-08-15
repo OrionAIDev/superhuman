@@ -41,6 +41,7 @@ enforcement.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .errors import ValidationError
@@ -170,7 +171,16 @@ def project_event(event: Event, sessions_dir: Path | str) -> Fragment:
 
     try:
         current = read_fragment(event.node_id, sessions_dir)
-    except ValidationError:
+    except (ValidationError, json.JSONDecodeError):
+        # G5 fix #R3-2: `read_fragment` does `json.loads` before
+        # `validate_fragment` ever runs, so a truncated/non-JSON cached
+        # fragment file (a crash mid-write, disk corruption) raises
+        # `json.JSONDecodeError`, not `ValidationError` — a case this
+        # `except` did not used to cover, crashing this function despite
+        # its own documented "a corrupt existing fragment is treated as
+        # absent" guarantee (see this function's docstring). Treated
+        # identically to a schema-invalid fragment: `current = None` ->
+        # `_fresh_fragment(event)` below.
         current = None
     fragment = _fresh_fragment(event) if current is None else _apply(current, event)
     write_fragment(fragment, sessions_dir)

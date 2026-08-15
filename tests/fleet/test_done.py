@@ -1106,6 +1106,38 @@ class TestEventFor:
     def test_returns_none_against_a_log_that_does_not_exist_yet(self, tmp_path: Path) -> None:
         assert event_for(_NODE, "D1-merged", tmp_path / "nonexistent.jsonl") is None
 
+    def test_does_not_match_an_event_for_a_different_node_with_the_same_key(
+        self, tmp_path: Path
+    ) -> None:
+        """R3-3 (G5 round 3, LOW/cheap hardening): `event_for` matched only
+        `type` + `idempotency_key`, not `node_id`. The key already embeds
+        `node_id` (`done:<node_id>:<target_level>`), so a real collision
+        needs a forged event with a mismatched node_id inside an otherwise
+        matching key — but matching `node_id` explicitly is a one-line
+        belt-and-suspenders hardening, and `event_for` backs the N1
+        poisoning check, so a false-positive match here would defeat that
+        check's guarantee too."""
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+        other_node = "claude/repo/proj/session-OTHER"
+        forged = {
+            "schema_version": 1,
+            "event_id": "aaaaaaaa-0002-0002-0002-aaaaaaaaaaaa",
+            # Same idempotency key text as a `_NODE` D1-merged transition
+            # would use, but the event's own `node_id` field is different.
+            "idempotency_key": f"done:{_NODE}:D1-merged",
+            "ts": "2026-08-15T00:00:00.000000Z",
+            "type": "done_level_advanced",
+            "project_id": _PROJECT_ID,
+            "node_id": other_node,
+            "writer_role": _WRITER_ROLE,
+            "payload": {"done_level": "D1-merged", "evidence": {}, "approver": None},
+        }
+        append(log_path, forged)
+
+        assert event_for(_NODE, "D1-merged", log_path) is None
+
 
 class TestProjectionRoundTrip:
     """`advance()` -> `core.projection.project_event` round-trips `done_level`.

@@ -340,3 +340,66 @@ class TestCorruptCachedFragmentDoneLevelNeverCrashesProjection:
         fragments = rebuild(log_path, sessions_dir, project_id="proj-abc")
 
         assert fragments[node_id].done_level == "D1-merged"
+
+
+class TestCorruptCachedFragmentJSONNeverCrashesProjection:
+    """G5 round-3 fix #R3-2: `project_event` must never crash on a cached
+    fragment file that is not even well-formed JSON (truncated by a crash
+    mid-write, disk corruption, etc.) — `read_fragment` does `json.loads`
+    before it ever reaches `validate_fragment`, and `project_event` only
+    caught `ValidationError`, not `json.JSONDecodeError`, leaving this case
+    to traceback. Worse in `fleet done advance`: `project_event` runs AFTER
+    the event is durably appended to the log, so a legitimate transition
+    would be recorded and the CLI would still crash. The fix treats this
+    exactly like a `ValidationError`-corrupt fragment — "treated as absent"
+    (the module docstring's documented guarantee), landing on
+    `_fresh_fragment(event)`.
+    """
+
+    def _write_truncated_json_fragment(self, node_id: str, sessions_dir: Path) -> None:
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = fragment_path(node_id, sessions_dir)
+        # Not valid JSON at all (as opposed to the other test class's
+        # schema-valid-but-unrecognized-value scenario) — a torn/truncated
+        # write, or plain garbage.
+        path.write_text('{"node_id": "portable/ws/proj/x", "lifecy', encoding="utf-8")
+
+    def test_project_event_does_not_raise_on_non_json_cached_fragment(
+        self, tmp_path: Path
+    ) -> None:
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/truncated-json"
+        self._write_truncated_json_fragment(node_id, sessions_dir)
+
+        event = validate_event(_registered_event(node_id))
+
+        # Must not raise json.JSONDecodeError (or anything else) despite the
+        # unparseable cached fragment file.
+        fragment = project_event(event, sessions_dir)
+
+        assert fragment.node_id == node_id
+        assert fragment.lifecycle == "active"
+        # A valid fragment is now written, overwriting the corrupt one.
+        assert read_fragment(node_id, sessions_dir) == fragment
+
+    def test_project_event_does_not_raise_on_non_json_cached_fragment_for_a_later_event(
+        self, tmp_path: Path
+    ) -> None:
+        """Same scenario, but the corrupt cache is hit on a non-first event
+        for the node (the more realistic `fleet done advance` shape, where
+        the node was already registered and only its cached fragment got
+        corrupted later)."""
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/truncated-json-later"
+        self._write_truncated_json_fragment(node_id, sessions_dir)
+
+        event = validate_event(_lifecycle_changed_event(node_id, "blocked"))
+
+        fragment = project_event(event, sessions_dir)
+
+        # Treated as absent -> _fresh_fragment(event), same as the
+        # ValidationError-corrupt case; the new event's own payload still
+        # folds in on top of the defaults.
+        assert fragment.node_id == node_id
+        assert fragment.lifecycle == "blocked"
+        assert read_fragment(node_id, sessions_dir) == fragment

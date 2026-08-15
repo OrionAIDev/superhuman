@@ -461,21 +461,38 @@ def fold_done_level(current_level: str, event: Event) -> str:
     **G5 fix #N2 — an unrecognized `current_level` never raises.** A cached
     fragment (or a legacy/corrupt one, read back from disk outside this
     process's own writes) could carry a `done_level` value that is not one
-    of `DONE_LEVELS` — `validate_fragment` checks only that it is a
-    non-empty string, not that it is a recognized ladder rung (see
-    `schema.validate_fragment`). Looking that value up in `_LEVEL_INDEX`
-    directly used to raise `KeyError`, crashing `core.projection.project_event`
-    and violating this module's own "a corrupt fragment is never fatal"
+    of `DONE_LEVELS`. Looking that value up in `_LEVEL_INDEX` directly used
+    to raise `KeyError`, crashing `core.projection.project_event` and
+    violating this module's own "a corrupt fragment is never fatal"
     contract (mirrored from `core.projection`'s module docstring). An
     unrecognized `current_level` is now treated as the `"D0-code"` floor for
-    the purpose of this one fold: a subsequent legitimate event that is
-    adjacent to `"D0-code"` (i.e. `"D1-merged"`) still applies from that
-    known base, and `current_level` is returned unchanged (not silently
-    reset to `"D0-code"`) for any event that is not. `rebuild()` — which
-    ignores cached fragments entirely and replays only the log — remains the
-    full-recovery path back to a fully correct value; this fix's guarantee
-    is narrower and cheaper: never crash, never propagate the corrupt value
-    any further than it already was.
+    the purpose of this fold's adjacency check: a subsequent legitimate
+    event that is adjacent to `"D0-code"` (i.e. `"D1-merged"`) still applies
+    from that known base.
+
+    **G5 round-3 fix #R3-1(b) — an unrecognized `current_level` is also
+    floored for the RESULT, not just the adjacency check.** Round 2's fix
+    above floored only the ladder-position lookup used to decide
+    adjacency, but still RETURNED the unchanged garbage `current_level`
+    string whenever the folded-in event was not adjacent (or was not even a
+    `done_level_advanced` event at all) — so a cached fragment with a bogus
+    `done_level` retained that exact bogus value across every subsequent
+    non-advancing fold, indefinitely, until a full `rebuild()`. Since
+    `validate_fragment` now rejects a non-`DONE_LEVELS` `done_level`
+    outright (G5 fix #R3-1(a) — no legitimate fragment can carry one), the
+    only way this function ever sees an unrecognized `current_level` at all
+    is a fragment that bypassed schema validation on write (never happens
+    through `core.projection`) or was corrupted on disk after the fact —
+    either way, never a value this fold should perpetuate. This function is
+    now belt-and-suspenders on its own: an unrecognized `current_level` is
+    floored to `"D0-code"` for BOTH the adjacency check AND the value
+    returned when no adjacent advance applies — the result is always a
+    recognized `DONE_LEVELS` member, never garbage in, garbage out.
+    `rebuild()` — which ignores cached fragments entirely and replays only
+    the log — remains the full-recovery path back to a fully correct
+    (possibly higher) value; this fold's guarantee is narrower and cheaper:
+    never crash, never emit anything but a valid ladder rung, possibly
+    conservative (stale-low) relative to the log's true history.
 
     Args:
         current_level: the node's `done_level` before folding `event`
@@ -487,20 +504,23 @@ def fold_done_level(current_level: str, event: Event) -> str:
     Returns:
         str: `event.payload["done_level"]` if it is a legal single-rung
         forward advance from `current_level` (or, if `current_level` is
-        unrecognized, from the `"D0-code"` floor); `current_level` unchanged
-        otherwise.
+        unrecognized, from the `"D0-code"` floor); otherwise `current_level`
+        unchanged if it is a recognized `DONE_LEVELS` member, or
+        `"D0-code"` if it is not (G5 fix #R3-1(b)) — the return value is
+        always one of `DONE_LEVELS`.
     """
+    # G5 fix #R3-1(b): an unrecognized `current_level` is floored to
+    # "D0-code" up front — used as the base for BOTH the adjacency check
+    # below AND the fallback return value, so this function can never echo
+    # back a value outside DONE_LEVELS.
+    base = current_level if current_level in _LEVEL_INDEX else "D0-code"
     if event.type != "done_level_advanced":
-        return current_level
+        return base
     candidate = event.payload.get("done_level")
     if candidate not in _LEVEL_INDEX:
-        return current_level
-    # G5 fix #N2: `.get(..., 0)` instead of `[...]` — an unrecognized
-    # `current_level` (e.g. a corrupt cached fragment's stale value) is
-    # treated as the D0-code floor (index 0) rather than raising KeyError.
-    base_index = _LEVEL_INDEX.get(current_level, 0)
-    if _LEVEL_INDEX[candidate] != base_index + 1:
-        return current_level
+        return base
+    if _LEVEL_INDEX[candidate] != _LEVEL_INDEX[base] + 1:
+        return base
     return candidate
 
 
@@ -518,7 +538,9 @@ def validate_fragment(data: dict[str, Any]) -> Fragment:
         Fragment: the validated, typed fragment.
 
     Raises:
-        ValidationError: on a missing required field or an unrecognized key.
+        ValidationError: on a missing required field, an unrecognized key,
+            or a `done_level` that is not one of `DONE_LEVELS` (G5 round-3
+            fix #R3-1(a)).
     """
     _require_dict(data, "fragment")
 
@@ -537,5 +559,22 @@ def validate_fragment(data: dict[str, Any]) -> Fragment:
     for key in _REQUIRED_FRAGMENT_FIELDS:
         if not isinstance(data[key], str) or not data[key]:
             raise ValidationError(f"fragment field {key!r} must be a non-empty string")
+
+    # G5 round-3 fix #R3-1(a): a schema-valid-but-unrecognized `done_level`
+    # (a non-empty string, so it already passed the loop above, but not a
+    # member of DONE_LEVELS — e.g. "D9-bogus") used to be accepted outright.
+    # No legitimate fragment can carry such a value — `core.projection`
+    # only ever writes a `done_level` derived from `fold_done_level`, which
+    # itself only ever returns a recognized `DONE_LEVELS` member (G5 fix
+    # #R3-1(b), below) — so rejecting here makes a cached fragment
+    # corrupted to a bogus `done_level` hit `core.projection.project_event`'s
+    # existing "treated as absent" `ValidationError` path (the same path a
+    # schema-invalid fragment already takes), rather than being accepted
+    # and the garbage value retained indefinitely.
+    if data["done_level"] not in DONE_LEVELS:
+        raise ValidationError(
+            f"fragment field 'done_level' {data['done_level']!r} is not a "
+            f"recognized done_level (expected one of {DONE_LEVELS})"
+        )
 
     return Fragment(**{f.name: data[f.name] for f in fields(Fragment)})
