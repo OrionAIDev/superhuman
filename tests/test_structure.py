@@ -55,7 +55,10 @@ EXPECTED_PHASES = {
     "4-acceptance.md",
 }
 
-EXPECTED_CONVENTIONS = {"python.md", "testing.md", "git.md", "autonomous.md", "source-cited.md"}
+EXPECTED_CONVENTIONS = {
+    "python.md", "testing.md", "git.md", "autonomous.md", "source-cited.md",
+    "subagent-return-schema.md",
+}
 
 EXPECTED_REFERENCES = {
     "brainstorming",

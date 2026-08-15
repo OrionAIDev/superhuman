@@ -736,6 +736,46 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
     )
 
 
+RETURN_SCHEMA_FIELDS = ["conclusion", "evidence", "commands", "assumptions", "risks", "next-action"]
+
+
+def test_return_schema_doc_defines_six_fields_once(skill_root: Path) -> None:
+    """conventions/subagent-return-schema.md is the sole full six-field definition (C-RS/FR-3).
+
+    The doc names conclusion -> evidence -> commands -> assumptions -> risks -> next-action,
+    in that order, exactly once. Every other shipped markdown file may point at the doc but
+    must not redefine the full ordered set itself — a light heuristic (all six labels present
+    as a defined list) is enough to catch a second competing definition.
+    """
+    conv = skill_root / "conventions" / "subagent-return-schema.md"
+    assert conv.is_file(), "conventions/subagent-return-schema.md missing"
+    text = conv.read_text(encoding="utf-8")
+
+    positions = [text.find(f"**{field}**") for field in RETURN_SCHEMA_FIELDS]
+    assert all(p != -1 for p in positions), (
+        f"subagent-return-schema.md must define all six fields as bold labels: {RETURN_SCHEMA_FIELDS}"
+    )
+    assert positions == sorted(positions), (
+        "the six fields must appear in canonical order: "
+        + " -> ".join(RETURN_SCHEMA_FIELDS)
+    )
+
+    offenders: list[str] = []
+    for path in skill_root.rglob("*.md"):
+        if path == conv:
+            continue
+        rel = path.relative_to(skill_root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        other_text = path.read_text(encoding="utf-8", errors="replace")
+        if all(f"**{field}**" in other_text for field in RETURN_SCHEMA_FIELDS):
+            offenders.append(str(rel))
+    assert not offenders, (
+        "these files redefine the full six-field schema instead of pointing at "
+        "conventions/subagent-return-schema.md:\n  " + "\n  ".join(offenders)
+    )
+
+
 def test_license_and_notice_present(skill_root: Path) -> None:
     """A publishable repo must carry both a LICENSE and upstream attribution."""
     licence = skill_root / "LICENSE"
