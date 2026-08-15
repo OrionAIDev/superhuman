@@ -1,31 +1,47 @@
 """Append-only JSONL event log — the manifest's source of truth (NFR-1).
 
 Every write is one self-contained, schema-validated event line, appended
-under a short-lived exclusive lockfile (`O_CREAT|O_EXCL` create, then release
-by delete). The lock guards only the shared log; per-session fragments are
-writer-partitioned and need no lock (see `core/store.py`). A torn final line
-(crash mid-append) is skipped on read, never fatal; a stale lock (crashed
-holder) is reclaimed by age **and** pid liveness, both required — age alone,
-or liveness alone, is never sufficient (ARCHITECTURE "Lockfile protocol").
+under an OS-native advisory lock: `fcntl.flock(fd, LOCK_EX | LOCK_NB)` on
+POSIX, `msvcrt.locking(fd, LK_NBLCK, 1)` on Windows. The lock guards only the
+shared log; per-session fragments are writer-partitioned and need no lock
+(see `core/store.py`). A torn final line (crash mid-append) is skipped on
+read, never fatal.
 
-**Known, accepted extreme-timing residuals (GPT-5 review findings #5/#6 —
-documented per user decision, not fixed this round; both require pathological
-OS scheduling, well beyond anything this module's own test suite has been
-able to trigger even under deliberately heavy contention):**
+**Lock protocol (G6 redesign — replaces the former `O_CREAT|O_EXCL` +
+manual stale-lock reclaim):**
 
-5. A create-then-write gap in `acquire_lock`: the lock file is created via
-   `O_CREAT|O_EXCL` (empty) and its `{pid, ts}` content is written a moment
-   later. If the writing process is suspended by the OS in exactly that gap
-   for longer than `stale_age` (30s default), another process could see an
-   empty, apparently-ownerless, old-enough file and reclaim it out from under
-   a holder that is not actually dead — merely paused for an extraordinarily
-   long time between two adjacent syscalls.
-6. Inode reuse (ABA) on the `_reclaim_if_stale` identity re-check: the
-   `st_ino`/`st_dev` comparison that protects against a delayed reclaim
-   decision acting on a since-replaced lock assumes a reused path won't also
-   receive a coincidentally-reused inode number in the same window. Most
-   filesystems don't recycle inode numbers quickly, but it's not a
-   guarantee.
+The `.lock` file beside `events.jsonl` is a **persistent anchor**: it is
+opened once (`O_CREAT | O_RDWR`, kept open for the critical section's whole
+lifetime) and an OS-level advisory lock is taken on it — never deleted on
+release, only unlocked. `acquire_lock` loops a bounded, non-blocking
+acquire attempt (`LOCK_NB` / `LK_NBLCK`); a contended attempt raises an
+`OSError`-family exception, which is treated as "held, retry" and bounded by
+the same `timeout`/`retry_interval` contract as before, raising
+`LockTimeoutError` on expiry — the caller must never proceed unlocked.
+
+This is a structural fix, not a tuned one: the **kernel itself releases an
+advisory lock the instant its holding process dies** (process exit, crash,
+or `SIGKILL` all close every fd the process held, and closing the last fd on
+a `flock`'d file — or terminating the process holding a `msvcrt.locking`
+byte-range lock — releases the lock automatically). There is therefore no
+such thing as a "stale" lock under this design: nothing is ever reclaimed,
+because nothing crash-held is ever left locked. The entire former stale-lock
+machinery — age/pid-liveness reclaim, a separate `.reclaiming` marker file,
+`O_CREAT|O_EXCL` as the mutual-exclusion primitive, `_pid_is_alive` — is
+deleted along with it, and with it every TOCTOU/ABA hazard that machinery
+was prone to (including the load-dependent double-reclaim race that
+motivated this redesign: two racers both winning a reclaim's check→remove
+gap on a reused lock path, defeating mutual exclusion).
+
+**Local-filesystem constraint:** OS advisory locks (`flock`/`msvcrt.locking`)
+are a promise the *local* filesystem driver enforces between processes on
+the *same* machine; they are well known to be unreliable — silently
+non-exclusive, or simply unsupported — over some network filesystems (NFS
+without `lockd`, older SMB/CIFS mounts, some FUSE backends). The fleet's
+`events.jsonl` + `.lock` pair is a local working-copy artifact (never a
+shared network path across separate machines/nodes), so this constraint
+does not currently bind — documented here so it stays true if the storage
+location ever changes.
 """
 
 from __future__ import annotations
@@ -34,54 +50,48 @@ import json
 import os
 import time
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from .errors import LockTimeoutError, PreconditionUnmet, ValidationError
 from .ownership import assert_writer_may
 from .schema import Event, validate_event
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 #: Default bounded-retry contract for lock acquisition.
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_RETRY_INTERVAL = 0.02
-_DEFAULT_STALE_AGE = 30.0
 
-#: How old the reclaim marker (`<lock>.reclaiming`) must be before it is even
-#: considered orphaned. Deliberately much shorter than `_DEFAULT_STALE_AGE`:
-#: a reclaim attempt is a handful of filesystem calls, not a held write lock,
-#: so it should complete in well under a second under any real contention.
-_MARKER_STALE_AGE = 5.0
-
-#: Errors that mean "lock is currently held by someone else, retry" rather
-#: than a real failure. `O_CREAT|O_EXCL` contention on an existing file is
-#: `FileExistsError` on POSIX; on Windows, `CreateFile` under concurrent
-#: `O_EXCL` contention can surface as `PermissionError` (ERROR_ACCESS_DENIED)
-#: instead of `FileExistsError` (ERROR_FILE_EXISTS) — a documented Windows
-#: quirk, not a real permission problem. Both are bounded by the same
-#: retry/timeout below, so treating them alike never risks proceeding
-#: unlocked; worst case a genuine permission problem surfaces as a
-#: `LockTimeoutError` instead of a `PermissionError`, which is still a loud,
-#: safe failure.
-_LOCK_CONTENDED_ERRORS: tuple[type[OSError], ...] = (
-    (FileExistsError, PermissionError) if os.name == "nt" else (FileExistsError,)
-)
-
-#: Errors that mean "this file is already gone (or being deleted right now
-#: by someone else)" when the intent is `os.remove(path)`-as-cleanup — a
-#: no-op, not a failure. `FileNotFoundError` is the POSIX-universal case; on
-#: Windows, two processes racing to delete the same file can surface
-#: `PermissionError` (ERROR_SHARING_VIOLATION/ERROR_ACCESS_DENIED) for
-#: whichever one loses the race, instead of `FileNotFoundError` — the same
-#: family of quirk as `_LOCK_CONTENDED_ERRORS` above, verified directly
-#: (GPT-5 review finding #4's own test suite reproduced it while proving the
-#: marker-recovery fix: multiple racers' `os.remove` on the same orphaned
-#: marker occasionally raised `PermissionError`, not `FileNotFoundError`).
-_REMOVAL_RACE_ERRORS: tuple[type[OSError], ...] = (
-    (FileNotFoundError, PermissionError) if os.name == "nt" else (FileNotFoundError,)
-)
+#: Errors that mean "the OS lock is currently held by someone else, retry"
+#: rather than a real failure.
+#:
+#: POSIX (`fcntl.flock` with `LOCK_NB`): "If LOCK_NB is used and the lock
+#: cannot be acquired, an OSError will be raised and the exception will have
+#: an errno attribute set to EACCES or EAGAIN (depending on the operating
+#: system; for portability, check for both values)."
+#: https://docs.python.org/3.14/library/fcntl.html#fcntl.flock
+#:
+#: Windows (`msvcrt.locking` with `LK_NBLCK`): "If the file cannot be locked,
+#: the exception OSError is raised." No specific errno is documented, so the
+#: contended case is any `OSError` from that call.
+#: https://docs.python.org/3.14/library/msvcrt.html#msvcrt.locking
+#:
+#: Both platforms are simply "any OSError from this specific, narrowly
+#: scoped lock call" — `BlockingIOError`/`PermissionError` (the concrete
+#: subclasses Python raises for EAGAIN/EACCES per PEP 3151) are themselves
+#: `OSError` subclasses, so catching `OSError` here already covers them. If
+#: some other, genuinely unrelated `OSError` were ever raised by this call,
+#: bounded retry+timeout still fails loud (`LockTimeoutError`) rather than
+#: proceeding unlocked — the same "worse case is a loud, safe failure, never
+#: silent corruption" precedent this module has always used for platform
+#: lock-error quirks.
+_LOCK_CONTENDED_ERRORS: tuple[type[OSError], ...] = (OSError,)
 
 
 def lock_path_for(log_path: Path | str) -> Path:
@@ -106,246 +116,80 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _pid_is_alive(pid: int) -> bool:
-    """Return whether `pid` identifies a currently-running process.
+def _lock_fd(fd: int) -> None:
+    """Attempt a non-blocking, exclusive OS advisory lock on `fd`.
+
+    POSIX: `fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)` — "LOCK_EX:
+    acquire an exclusive lock. ... LOCK_NB: bitwise OR with any of the other
+    three [LOCK_*] to make the request non-blocking."
+    https://docs.python.org/3.14/library/fcntl.html#fcntl.flock
+
+    Windows: `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` locks a single byte at
+    the file's *current* position — "LK_NBLCK: Locks the specified bytes. If
+    the bytes cannot be locked, the program immediately raises OSError." The
+    locked region is relative to the current file position, so the position
+    is reset to the start of the file first.
+    https://docs.python.org/3.14/library/msvcrt.html#msvcrt.locking
 
     Args:
-        pid: the process id to check.
+        fd: an open, writable OS file descriptor for the lock anchor file.
 
-    Returns:
-        bool: True if a process with that pid is alive; False otherwise
-        (including for `pid <= 0`, which is never a real process here).
+    Raises:
+        OSError: (see `_LOCK_CONTENDED_ERRORS`) if the lock is currently
+            held by another process. Callers must treat this as "held,
+            retry" — never as "safe to proceed unlocked."
     """
-    if pid is None or pid <= 0:
-        return False
     if os.name == "nt":
-        import ctypes
-
-        process_query_limited_information = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
-            process_query_limited_information, False, pid
-        )
-        if not handle:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Exists, but we're not allowed to signal it — still alive.
-        return True
-    except OSError:
-        return False
-    return True
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def _reclaim_marker_if_orphaned(marker_path: Path, marker_stale_age: float) -> bool:
-    """Remove `marker_path` if it is an orphaned reclaim marker.
+def _unlock_fd(fd: int) -> None:
+    """Release the OS advisory lock held on `fd` by a prior `_lock_fd` call.
 
-    The reclaim marker itself needs the same crash-recovery story as the
-    main lock, for the same reason (GPT-5 review finding #4): if a process
-    crashes after winning the marker's `O_CREAT|O_EXCL` create but before
-    its `finally` removes it, the marker orphans, and — without this —
-    every future reclaim attempt gets `FileExistsError` on the marker create
-    forever, permanently wedging all writers behind one crashed process.
+    POSIX: `fcntl.flock(fd, fcntl.LOCK_UN)` — "LOCK_UN: release an existing
+    lock." https://docs.python.org/3.14/library/fcntl.html#fcntl.flock
 
-    Orphaned requires **both** conditions, mirroring the main lock's own
-    "age and pid liveness, both required" contract: the marker must be older
-    than `marker_stale_age` (a reclaim attempt is a handful of filesystem
-    calls; a live one should never take seconds) *and* its recorded pid must
-    not be alive. A fresh stat is taken immediately before the actual
-    removal and compared against the stat this decision was based on, so a
-    marker a live reclaimer (re)creates in the gap between this function's
-    checks is never removed out from under it.
+    Windows: `msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)` unlocks the same
+    single byte `_lock_fd` locked, at the same file position.
+    https://docs.python.org/3.14/library/msvcrt.html#msvcrt.locking
 
     Args:
-        marker_path: the reclaim marker to inspect.
-        marker_stale_age: minimum age in seconds before the marker is even
-            considered for orphan recovery.
+        fd: the file descriptor previously locked by `_lock_fd`.
 
-    Returns:
-        bool: True if the marker was orphaned and has been removed (or was
-        already gone), meaning the caller may retry the marker's own
-        `O_CREAT|O_EXCL` create — that create re-serializes the recovery, so
-        multiple racers concurrently reaching this same conclusion is safe,
-        only one of them will win the retry. False if the marker is still
-        within its fresh window or genuinely live and must not be touched.
+    Raises:
+        OSError: if the underlying unlock call fails. Callers in this
+            module never propagate this — closing `fd` immediately after
+            releases the OS-level lock regardless (the kernel tears down
+            every lock a file descriptor holds when it is closed), so an
+            unlock-call failure here is not a correctness problem, only a
+            missed optimization of doing it explicitly first.
     """
-    try:
-        stat_before = marker_path.stat()
-    except FileNotFoundError:
-        return True  # already gone — safe to retry the create immediately
-
-    age = time.time() - stat_before.st_mtime
-    if age <= marker_stale_age:
-        return False
-
-    try:
-        content = json.loads(marker_path.read_text(encoding="utf-8"))
-        pid = int(content.get("pid", -1))
-    except (OSError, ValueError, TypeError):
-        pid = -1
-
-    if _pid_is_alive(pid):
-        return False
-
-    try:
-        stat_now = marker_path.stat()
-    except FileNotFoundError:
-        return True  # already gone — someone else's cleanup beat us to it
-
-    if stat_now.st_mtime != stat_before.st_mtime:
-        # It changed since we started evaluating — do not touch it; treat
-        # this exactly like "still fresh" and let the caller back off.
-        return False
-
-    try:
-        os.remove(marker_path)
-    except _REMOVAL_RACE_ERRORS:
-        pass
-    return True
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def _try_create_marker(marker_path: Path) -> bool:
-    """Attempt to exclusively create the reclaim marker at `marker_path`.
+@dataclass(frozen=True, slots=True)
+class LockHandle:
+    """An acquired OS advisory lock, returned by `acquire_lock`.
 
-    Writes `{pid, ts}` — the same shape as the main lock — so an orphaned
-    marker can later be identified by `_reclaim_marker_if_orphaned` using
-    the same age/pid-liveness logic.
+    Opaque to callers beyond passing it straight to `release_lock` (or
+    letting `LockedLog` do that for you) — the fields exist for diagnostics
+    and testing, not for callers to act on directly.
 
-    Args:
-        marker_path: the reclaim marker to create.
-
-    Returns:
-        bool: True if this process now exclusively holds the marker; False
-        if the create was contended (someone else already holds it).
+    Attributes:
+        path: the lock anchor file this handle's lock guards.
+        fd: the open OS file descriptor the lock is held on. Must stay open
+            for as long as the lock is held; closed by `release_lock`.
     """
-    try:
-        marker_fd = os.open(str(marker_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        try:
-            os.write(marker_fd, json.dumps({"pid": os.getpid(), "ts": _now_iso()}).encode("utf-8"))
-        finally:
-            os.close(marker_fd)
-        return True
-    except _LOCK_CONTENDED_ERRORS:
-        return False
 
-
-def _reclaim_if_stale(lock_path: Path, stale_age: float) -> bool:
-    """Reclaim `lock_path` if it is both old enough and its holder is dead.
-
-    Both conditions are required (age alone, or liveness alone, never
-    triggers reclaim) — see ARCHITECTURE "Lockfile protocol".
-
-    Reclaim is gated by a **separate exclusive marker file**
-    (`<lock_path>.reclaiming`), created with the same `O_CREAT|O_EXCL`
-    primitive `acquire_lock` itself relies on. Only the racer that wins the
-    marker's creation may inspect-and-act on `lock_path`; every other racer
-    gets a real `OSError` from the marker create and backs off immediately,
-    never touching `lock_path` at all.
-
-    This exists because the more obvious design — rename the stale lock
-    straight to a unique per-attempt name via `os.replace`, on the theory
-    that "two processes can't both succeed renaming the same source" — does
-    **not** hold on this platform: empirically, when multiple processes call
-    `os.replace(same_source, different_unique_destinations)` at nearly the
-    same instant, Windows/NTFS routinely lets *several* of those renames
-    report success (verified directly, in isolation from any of this
-    module's own logic: 30/30 runs of 20 racers each produced multiple
-    "successful" renames of one source file). A first attempt at this fix
-    used exactly that rename-based design plus an `st_ino`/`st_dev` identity
-    check after the fact; it closed the specific TOCTOU the review finding
-    described but still occasionally let two racers both pass the identity
-    check, because NTFS's rename race can leave two *different* destination
-    paths reporting the *same* inode for the same source. `O_CREAT|O_EXCL`
-    create, by contrast, has been exercised at N=8..20 concurrent racers
-    (this module's own `acquire_lock`, `tests/fleet/test_concurrency.py`'s
-    flagship, and `tests/fleet/test_stale_lock_reclaim_race.py`) without a
-    single observed double-success — so the actual mutual-exclusion gate
-    here is a create, not a rename, and the rename underneath it only ever
-    runs for the one racer holding that gate.
-
-    The marker itself needs the same crash-recovery story as the main lock
-    (GPT-5 review finding #4): if this function's own process crashes after
-    winning the marker create but before the `finally` below removes it, a
-    contended marker create falls through to `_reclaim_marker_if_orphaned`
-    rather than unconditionally giving up — otherwise a single crash during
-    reclaim would permanently wedge every future writer behind an orphaned
-    marker no one can ever clear.
-
-    Args:
-        lock_path: the lockfile to inspect.
-        stale_age: minimum age in seconds before a lock is even considered.
-
-    Returns:
-        bool: True only for the single racer that both won the marker gate
-        and confirmed (immediately before acting, while holding that gate)
-        that `lock_path` was still the exact stale instance it evaluated —
-        meaning the caller should retry acquisition immediately. False for
-        every other racer — the caller must not treat a False as "safe to
-        proceed."
-    """
-    try:
-        stat_before = lock_path.stat()
-    except FileNotFoundError:
-        return True  # already gone — safe to retry create immediately
-
-    age = time.time() - stat_before.st_mtime
-    if age < stale_age:
-        return False
-
-    try:
-        content = json.loads(lock_path.read_text(encoding="utf-8"))
-        pid = int(content.get("pid", -1))
-    except (OSError, ValueError, TypeError):
-        pid = -1
-
-    if _pid_is_alive(pid):
-        return False
-
-    marker_path = lock_path.with_name(f"{lock_path.name}.reclaiming")
-    if not _try_create_marker(marker_path):
-        # Contended — either a live racer holds it, or it is orphaned from a
-        # process that crashed between winning the create and its own
-        # `finally` cleanup (GPT-5 review finding #4). Attempt orphan
-        # recovery and retry the create exactly once — bounded, no nested
-        # retry loop; the create itself re-serializes the recovery, so this
-        # stays safe even if several racers reach the same conclusion at
-        # once.
-        if not _reclaim_marker_if_orphaned(marker_path, _MARKER_STALE_AGE):
-            return False
-        if not _try_create_marker(marker_path):
-            return False
-
-    try:
-        # Re-verify identity now that this process exclusively holds the
-        # marker — no other racer can be mutating lock_path while we hold
-        # it, so this check (and the rename below) are genuinely safe. This
-        # still matters even under the marker gate: the *decision* above
-        # (age/pid) may be based on a snapshot read a while ago, and the
-        # lock could have legitimately moved on to a new holder since.
-        try:
-            stat_now = lock_path.stat()
-        except FileNotFoundError:
-            return False  # already gone by the time we won the gate
-
-        if stat_now.st_ino != stat_before.st_ino or stat_now.st_dev != stat_before.st_dev:
-            return False  # a different (almost certainly live) lock is here now
-
-        claim_path = lock_path.with_name(f"{lock_path.name}.reclaim-{os.getpid()}-{uuid4().hex}")
-        os.replace(lock_path, claim_path)
-        try:
-            os.remove(claim_path)
-        except _REMOVAL_RACE_ERRORS:
-            pass
-        return True
-    finally:
-        try:
-            os.remove(marker_path)
-        except _REMOVAL_RACE_ERRORS:
-            pass
+    path: Path
+    fd: int
 
 
 def acquire_lock(
@@ -353,56 +197,82 @@ def acquire_lock(
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     retry_interval: float = _DEFAULT_RETRY_INTERVAL,
-    stale_age: float = _DEFAULT_STALE_AGE,
-) -> None:
-    """Acquire the exclusive lockfile at `lock_path`.
+) -> LockHandle:
+    """Acquire the exclusive OS advisory lock anchored at `lock_path`.
 
-    Uses `O_CREAT|O_EXCL` so the create itself is the atomic exclusivity
-    check (portable across POSIX and Windows). Bounded retry with a stale-lock
-    reclaim check on every contended attempt.
+    Opens `lock_path` once (creating it if absent) and keeps that file
+    descriptor open for the lock's whole lifetime — the anchor file is
+    never deleted or recreated by this protocol, only ever locked and
+    unlocked, which is what makes the file-path-reuse TOCTOU/ABA class of
+    bug (the double-reclaim race this redesign replaces) structurally
+    impossible: there is no create/delete cycle on the path to race on.
 
     Args:
-        lock_path: the lockfile to acquire.
+        lock_path: the lock anchor file to acquire (see `lock_path_for`).
         timeout: seconds to keep retrying before giving up.
-        retry_interval: seconds to sleep between retries.
-        stale_age: seconds a lock must be untouched before it is even
-            considered for reclaim.
+        retry_interval: seconds to sleep between contended retries.
+
+    Returns:
+        LockHandle: pass this to `release_lock` (or use `LockedLog`, which
+        does so automatically) once the critical section is done.
 
     Raises:
         LockTimeoutError: if the lock is not acquired within `timeout`. The
-            caller must treat this as "did not acquire" — never proceed as if
-            unlocked.
+            caller must treat this as "did not acquire" — never proceed as
+            if unlocked. The anchor's fd is closed before this is raised, so
+            a timed-out attempt leaks nothing.
     """
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
 
+    open_flags = os.O_CREAT | os.O_RDWR
+    if os.name == "nt":
+        open_flags |= os.O_BINARY
+    fd = os.open(str(lock_path), open_flags)
+
     while True:
         try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, json.dumps({"pid": os.getpid(), "ts": _now_iso()}).encode("utf-8"))
-            finally:
-                os.close(fd)
-            return
+            _lock_fd(fd)
         except _LOCK_CONTENDED_ERRORS:
-            if _reclaim_if_stale(lock_path, stale_age):
-                continue
             if time.monotonic() >= deadline:
+                os.close(fd)
                 raise LockTimeoutError(f"timed out acquiring lock {lock_path}")
             time.sleep(retry_interval)
+            continue
+
+        # Diagnostics only (`{pid, ts}`, same shape the old lock content
+        # used) — nothing in this module or its callers reads this back for
+        # correctness; a human inspecting a held `.lock` file mid-incident
+        # is the only consumer. Written under the lock we just won, so it
+        # can never race with another holder's own diagnostic write.
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps({"pid": os.getpid(), "ts": _now_iso()}).encode("utf-8"))
+        except OSError:
+            pass  # purely diagnostic; never fail acquisition over this
+        return LockHandle(path=lock_path, fd=fd)
 
 
-def release_lock(lock_path: Path | str) -> None:
-    """Release the lockfile at `lock_path`.
+def release_lock(handle: LockHandle) -> None:
+    """Release the OS advisory lock held by `handle`.
+
+    Unconditionally closes `handle.fd` — this both releases the OS lock (if
+    the explicit unlock below did not already) and frees the descriptor.
+    The anchor file at `handle.path` is deliberately left on disk: deleting
+    a lock-path anchor is exactly the reuse hazard this redesign removes,
+    so leaving it behind (empty or holding the last holder's diagnostic
+    `{pid, ts}`) is correct, not a leak.
 
     Args:
-        lock_path: the lockfile to release.
+        handle: the handle returned by the matching `acquire_lock` call.
     """
     try:
-        os.remove(Path(lock_path))
-    except _REMOVAL_RACE_ERRORS:
-        pass
+        _unlock_fd(handle.fd)
+    except OSError:
+        pass  # closing fd below releases the OS-level lock regardless
+    finally:
+        os.close(handle.fd)
 
 
 class LockedLog:
@@ -418,7 +288,6 @@ class LockedLog:
         *,
         timeout: float = _DEFAULT_TIMEOUT,
         retry_interval: float = _DEFAULT_RETRY_INTERVAL,
-        stale_age: float = _DEFAULT_STALE_AGE,
     ) -> None:
         """Initialize a LockedLog for `log_path`.
 
@@ -426,13 +295,12 @@ class LockedLog:
             log_path: the event log this lock guards.
             timeout: seconds to keep retrying acquisition before giving up.
             retry_interval: seconds to sleep between retries.
-            stale_age: seconds before a held lock is even considered stale.
         """
         self.log_path = Path(log_path)
         self._lock_path = lock_path_for(self.log_path)
         self._timeout = timeout
         self._retry_interval = retry_interval
-        self._stale_age = stale_age
+        self._handle: LockHandle | None = None
 
     def __enter__(self) -> "LockedLog":
         """Acquire the lock and return this context manager.
@@ -443,11 +311,10 @@ class LockedLog:
         Raises:
             LockTimeoutError: if the lock could not be acquired in time.
         """
-        acquire_lock(
+        self._handle = acquire_lock(
             self._lock_path,
             timeout=self._timeout,
             retry_interval=self._retry_interval,
-            stale_age=self._stale_age,
         )
         return self
 
@@ -463,7 +330,9 @@ class LockedLog:
             bool: always `False` — any exception from the `with` block
             propagates normally; this only releases the lock as a side effect.
         """
-        release_lock(self._lock_path)
+        if self._handle is not None:
+            release_lock(self._handle)
+            self._handle = None
         return False
 
 
@@ -504,7 +373,6 @@ def append(
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     retry_interval: float = _DEFAULT_RETRY_INTERVAL,
-    stale_age: float = _DEFAULT_STALE_AGE,
     precondition: Callable[[list[Event]], bool] | None = None,
 ) -> Event | None:
     """Append one validated, ownership-checked event, deduping on `idempotency_key`.
@@ -543,7 +411,6 @@ def append(
         event: an `Event`, or a raw dict to validate first (NFR-7).
         timeout: seconds to keep retrying lock acquisition.
         retry_interval: seconds to sleep between lock-acquisition retries.
-        stale_age: seconds before a held lock is even considered stale.
         precondition: optional callable taking the event list already
             persisted in the log (as read fresh, under the lock, for this
             call's own idempotency check) and returning whether the write
@@ -597,7 +464,7 @@ def append(
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with LockedLog(log_path, timeout=timeout, retry_interval=retry_interval, stale_age=stale_age):
+    with LockedLog(log_path, timeout=timeout, retry_interval=retry_interval):
         existing = read_all(log_path)
         if any(e.idempotency_key == ev.idempotency_key for e in existing):
             return None
