@@ -919,6 +919,158 @@ class TestOwnershipAndDedupe:
         assert result == AdvanceResult(status="deduped", node_id=_NODE, level="D1-merged")
 
 
+class TestN1PoisonedIdempotencyKeyLoudFail:
+    """G5 fix #N1: a poisoned/corrupt idempotency key must never dedupe silently.
+
+    A forged direct-append `done_level_advanced` event carrying idempotency
+    key `done:<node>:D1-merged` but a payload naming a DIFFERENT
+    `done_level` (e.g. `D4-prod`) is the poisoning scenario: a legitimate,
+    fully-evidenced later call to `advance(node, "D1-merged", ...)` builds
+    the exact same idempotency key, so `core.events.append`'s own dedupe
+    (a plain key match, agnostic to payload content) reports it as "already
+    recorded" and returns `None` — before this fix, `advance()` trusted that
+    at face value and returned `status="deduped"`, a silent success, while
+    the node's real current level never moved past D0-code (a silent
+    denial-of-advancement). `advance()` must now look the persisted event up
+    and confirm its `done_level` actually matches before reporting deduped.
+    """
+
+    def _forged_poisoned_event(self) -> dict:
+        return {
+            "schema_version": 1,
+            "event_id": "aaaaaaaa-0001-0001-0001-aaaaaaaaaaaa",
+            "idempotency_key": f"done:{_NODE}:D1-merged",
+            "ts": "2026-08-15T00:00:00.000000Z",
+            "type": "done_level_advanced",
+            "project_id": _PROJECT_ID,
+            "node_id": _NODE,
+            "writer_role": _WRITER_ROLE,
+            # Poisoned: the KEY names D1-merged, the PAYLOAD claims D4-prod.
+            "payload": {"done_level": "D4-prod", "evidence": {}, "approver": "Jordan Rivera"},
+        }
+
+    def test_forged_poisoned_key_raises_instead_of_silently_deduping(
+        self, tmp_path: Path
+    ) -> None:
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+        append(log_path, self._forged_poisoned_event())
+
+        # A legitimate, fully-evidenced call — real evidence, real target,
+        # the node genuinely at D0-code — must NOT report a silent
+        # "deduped" success just because its idempotency key collides with
+        # the poisoned entry.
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        # Nothing new was written — the poisoned event is the only one on
+        # the log, and the node's real current level never moved.
+        events = read_all(log_path)
+        assert len(events) == 1
+        from scripts.fleet.core.done import _current_level
+
+        assert _current_level(events, _NODE) == "D0-code"
+
+    def test_normal_concurrent_dedupe_for_a_matching_persisted_event_still_deduped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Contrast case: a genuinely matching persisted event (the real
+        concurrent-race no-op, not poisoning) must still return
+        `status="deduped"` without raising. `append()` is monkeypatched to
+        return `None` (simulating the race-loser branch, same technique as
+        `TestOwnershipAndDedupe`'s existing dedupe test) on a call whose
+        idempotency key already has a REAL, matching persisted event behind
+        it — the honest counterpart to the poisoned-key test above."""
+        import scripts.fleet.core.done as done_module
+
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        monkeypatch.setattr(done_module, "_current_level", lambda events, node_id: "D0-code")
+        monkeypatch.setattr(done_module, "append", lambda *args, **kwargs: None)
+
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result == AdvanceResult(status="deduped", node_id=_NODE, level="D1-merged")
+
+    def test_dedupe_with_no_persisted_event_at_all_is_trusted_defensively(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Preserves `TestOwnershipAndDedupe`'s existing scenario: `append()`
+        mocked to return `None` against an EMPTY log (nothing persisted at
+        all — not the realistic case, but shouldn't crash). `event_for`
+        finds nothing (`persisted is None`), which is treated defensively as
+        "trust the dedupe," not raised — there is nothing to contradict."""
+        import scripts.fleet.core.done as done_module
+
+        log_path = _log(tmp_path)
+        monkeypatch.setattr(done_module, "append", lambda *args, **kwargs: None)
+
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result == AdvanceResult(status="deduped", node_id=_NODE, level="D1-merged")
+
+
+class TestN4PreconditionUnmetReachable:
+    """G5 fix #N4: `PreconditionUnmet` IS reachable via a forged direct-append
+    adjacent event filed under a DIFFERENT idempotency key than the call
+    under test — it does not collide with that call's own dedupe key, so
+    `precondition` actually runs against the fresh, under-the-lock log
+    state and can legitimately reject. Simulated here by forging the
+    adjacent event for real (so the precondition's own fresh read sees it)
+    and monkeypatching `_current_level` to return a stale `"D0-code"` on
+    only the pre-lock call, matching the race window the comment describes.
+    """
+
+    def test_precondition_unmet_is_reached_and_fails_safe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import scripts.fleet.core.done as done_module
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+
+        # A forged direct-append event, adjacent from D0-code, filed under a
+        # DIFFERENT idempotency key than this test's own D1-merged call —
+        # so it does not collide with append()'s dedupe check.
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "bbbbbbbb-0002-0002-0002-bbbbbbbbbbbb",
+                "idempotency_key": "forged-adjacent-key-not-the-real-one",
+                "ts": "2026-08-15T00:00:00.000000Z",
+                "type": "done_level_advanced",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"done_level": "D1-merged", "evidence": {}, "approver": None},
+            },
+        )
+
+        real_current_level = done_module._current_level
+        call_count = {"n": 0}
+
+        def _stale_then_real(events, node_id):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # The pre-lock read: stale, as if it ran before the forged
+                # event above was visible.
+                return "D0-code"
+            return real_current_level(events, node_id)
+
+        monkeypatch.setattr(done_module, "_current_level", _stale_then_real)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        # Fails safe: nothing new was written by the rejected call.
+        events = read_all(log_path)
+        assert len(events) == 1
+        assert events[0].idempotency_key == "forged-adjacent-key-not-the-real-one"
+
+
 class TestEventFor:
     """`event_for()` — the lookup helper `cli.py` uses to project a fragment."""
 
@@ -1237,3 +1389,83 @@ class TestCliDoneAdvanceSubcommand:
         exit_code = args.func(args)
 
         assert exit_code == 0  # D4-prod default ceiling never blocks D1-merged
+
+    def test_corrupt_profile_fails_closed_not_silently_unrestricted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 fix #N3: a profile that EXISTS but fails to load/parse (bad
+        YAML, here) must fail CLOSED with a clean nonzero exit — not
+        silently fall back to the unrestricted D4-prod default. Contrast
+        with `test_no_matching_profile_defaults_to_unrestricted_ceiling`
+        just above, where NO profile exists at all — that genuinely absent
+        case still legitimately defaults to D4-prod (unchanged)."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        # Malformed YAML — `load_profile` raises ProfileError on this.
+        profile_path.write_text("version: 1\nladder: [this is not valid: yaml:::\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_present_profile_with_unknown_top_level_key_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A second corrupt-input shape for the same G5 fix #N3: valid YAML,
+        but a schema violation `load_profile` also raises `ProfileError`
+        for (an unknown top-level key) — must fail closed the same way as
+        malformed YAML, not just the parse-error case."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text("version: 1\nbogus_key: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_resolve_d_ceiling_absent_profile_still_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct unit-level confirmation that the genuinely ABSENT case
+        (no profile file at all) is unaffected by G5 fix #N3 — it still
+        resolves the documented D4-prod default, not a raise."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        assert _resolve_d_ceiling(workspace) == "D4-prod"
+
+    def test_resolve_d_ceiling_raises_value_error_for_a_present_corrupt_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct unit-level confirmation of the G5 fix #N3 fail-closed path."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text("version: 1\nladder: [this is not valid: yaml:::\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+
+        with pytest.raises(ValueError):
+            _resolve_d_ceiling(workspace)

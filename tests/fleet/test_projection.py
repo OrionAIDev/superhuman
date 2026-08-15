@@ -15,8 +15,8 @@ from scripts.fleet.core.done import _current_level as done_current_level
 from scripts.fleet.core.errors import OwnershipError
 from scripts.fleet.core.events import append, read_all
 from scripts.fleet.core.projection import project_event, rebuild
-from scripts.fleet.core.schema import Event, validate_event
-from scripts.fleet.core.store import fragment_path, read_fragment
+from scripts.fleet.core.schema import Event, Fragment, validate_event
+from scripts.fleet.core.store import fragment_path, read_fragment, write_fragment
 
 
 def _registered_event(node_id: str, project_id: str = "proj-abc") -> dict:
@@ -258,3 +258,85 @@ class TestDoneLevelOnlyFoldsFromAdvanceEvents:
         assert fragments[node_id].done_level == done_current_level(
             read_all(log_path), node_id
         )
+
+
+class TestCorruptCachedFragmentDoneLevelNeverCrashesProjection:
+    """G5 fix #N2: `project_event` must never crash on a corrupt cached
+    fragment whose `done_level` is not one of `DONE_LEVELS` (e.g. a stale
+    legacy value) — `validate_fragment` only checks that `done_level` is a
+    non-empty string, not that it is a recognized ladder rung, so this is a
+    real read-time state, not merely a hypothetical.
+    """
+
+    def _write_corrupt_fragment(self, node_id: str, sessions_dir: Path) -> None:
+        write_fragment(
+            Fragment(
+                node_id=node_id,
+                project_id="proj-abc",
+                lifecycle="active",
+                block_state="unblocked",
+                review_state="none",
+                adoption_state="normal",
+                done_level="D9-bogus",  # not one of DONE_LEVELS
+            ),
+            sessions_dir,
+        )
+
+    def test_project_event_does_not_raise_and_lands_on_the_correct_level(
+        self, tmp_path: Path
+    ) -> None:
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/corrupt-cached"
+        self._write_corrupt_fragment(node_id, sessions_dir)
+
+        # A legitimate D1-merged advance (adjacent to the D0-code floor the
+        # corrupt "D9-bogus" value folds from, per G5 #N2) — must not raise
+        # KeyError, and must land the fragment on D1-merged.
+        event = validate_event(
+            {
+                "schema_version": 1,
+                "event_id": "eid-legit-advance",
+                "idempotency_key": f"done:{node_id}:D1-merged",
+                "ts": "2026-08-15T00:00:00Z",
+                "type": "done_level_advanced",
+                "project_id": "proj-abc",
+                "node_id": node_id,
+                "writer_role": "Developer",
+                "payload": {"done_level": "D1-merged", "evidence": {}, "approver": None},
+            }
+        )
+
+        fragment = project_event(event, sessions_dir)
+
+        assert fragment.done_level == "D1-merged"
+        assert read_fragment(node_id, sessions_dir).done_level == "D1-merged"
+
+    def test_rebuild_still_fully_recovers_regardless_of_the_corrupt_cached_fragment(
+        self, tmp_path: Path
+    ) -> None:
+        """`rebuild()` ignores cached fragments and replays only the log —
+        confirms it still recovers correctly even with a corrupt fragment
+        sitting on disk (the full-recovery path this fix's narrower
+        never-crash guarantee complements, not replaces)."""
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/corrupt-cached-rebuild"
+
+        append(log_path, _registered_event(node_id))
+        done_advance(
+            node_id,
+            "D1-merged",
+            evidence={"commit": "abc123"},
+            approver=None,
+            ceiling="D4-prod",
+            project_id="proj-abc",
+            writer_role="Developer",
+            log_path=log_path,
+        )
+
+        # A corrupt fragment on disk must not affect rebuild()'s outcome.
+        self._write_corrupt_fragment(node_id, sessions_dir)
+
+        fragments = rebuild(log_path, sessions_dir, project_id="proj-abc")
+
+        assert fragments[node_id].done_level == "D1-merged"

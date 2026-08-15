@@ -580,26 +580,58 @@ def _resolve_d_ceiling(workspace: Path) -> str:
     Only the genuinely-absent case (no label, no matching rung, no profile,
     or an unreadable profile) still defaults to `_DEFAULT_D_CEILING`.
 
+    **G5 fix #N3 — distinguish ABSENT from PRESENT-BUT-CORRUPT.**
+    `superhuman_profile.find_profile(workspace)` returns `None` when no
+    profile file exists at all ("zero-config" — a legitimate case for a
+    developer with no deployment ladder configured, per
+    `superhuman_profile.load_profile`'s own `path=None` -> built-in-default
+    contract, which never raises `ProfileError`) versus a `Path` when one
+    was found. Before this fix, ANY `ProfileError` — whether from "no
+    profile" or from a genuinely present-but-unreadable/malformed profile
+    file — fell through to the same permissive `_DEFAULT_D_CEILING`
+    (`D4-prod`, unrestricted). That meant a corrupt profile (bad YAML, an
+    unknown top-level key, a schema violation) failed OPEN to the top of the
+    done-ladder instead of failing closed — exactly backwards for a
+    ceiling-enforcement mechanism, and inconsistent with this same
+    function's own #F5 fix below (present-but-invalid `d_ceiling` *label*
+    already failed closed; only the "profile itself won't load" case still
+    failed open). Now: `find_profile` is called first and its result
+    inspected directly. A `ProfileError` while loading a genuinely absent
+    profile (`path is None`) is not actually reachable — see
+    `superhuman_profile.load_profile`'s docstring — so this is defensive,
+    not the primary branch; a `ProfileError` while loading a profile that
+    DOES exist (`path is not None`) now raises instead of defaulting.
+
     Returns:
         str: the resolved D-ceiling, one of `core.done.DONE_LEVELS`.
-        `_DEFAULT_D_CEILING` if no profile is found, no rung matches the
-        workspace, the matched rung declares no `d_ceiling` label at all, or
-        the profile itself fails to load (a malformed profile should not by
-        itself block every `done advance` call — it already fails loudly
-        for the deployment-rung concerns `superhuman_profile`'s own CLI
-        commands cover).
+        `_DEFAULT_D_CEILING` if no profile is found at all, no rung matches
+        the workspace, or the matched rung declares no `d_ceiling` label.
 
     Raises:
         ValueError: if the matched rung DOES declare a `d_ceiling` label,
-            but its value is not one of `DONE_LEVELS`. `_cmd_done_advance`
-            catches this the same way it catches every other rejection —
-            a clean nonzero exit, never an uncaught traceback.
+            but its value is not one of `DONE_LEVELS` (G5 fix #F5); or if a
+            profile file WAS found but failed to load/parse (G5 fix #N3) —
+            failing closed rather than silently granting the unrestricted
+            `D4-prod` default for a profile an operator configured but that
+            is now corrupt. `_cmd_done_advance` catches this the same way it
+            catches every other rejection — a clean nonzero exit, never an
+            uncaught traceback.
     """
+    path = superhuman_profile.find_profile(workspace)
     try:
-        profile = superhuman_profile.load_profile(superhuman_profile.find_profile(workspace))
+        profile = superhuman_profile.load_profile(path)
         resolution = superhuman_profile.resolve(workspace, profile)
-    except superhuman_profile.ProfileError:
-        return _DEFAULT_D_CEILING
+    except superhuman_profile.ProfileError as exc:
+        if path is None:
+            # Defensive only (see docstring): `load_profile(None)` builds
+            # the built-in default and does not raise. Kept as a fallback
+            # rather than an assertion, in case that contract ever changes.
+            return _DEFAULT_D_CEILING
+        raise ValueError(
+            f"profile at {path} was found but failed to load — failing "
+            "closed rather than silently granting the unrestricted D4-prod "
+            f"default (G5 fix #N3): {exc}"
+        ) from exc
     if resolution.stage is None:
         return _DEFAULT_D_CEILING
     if _D_CEILING_LABEL_KEY not in resolution.stage.labels:

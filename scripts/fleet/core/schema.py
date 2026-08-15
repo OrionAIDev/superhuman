@@ -458,15 +458,36 @@ def fold_done_level(current_level: str, event: Event) -> str:
     re-check) — a determined caller with direct log-file write access is out
     of this scope, not a gap this fold could plausibly close.
 
+    **G5 fix #N2 — an unrecognized `current_level` never raises.** A cached
+    fragment (or a legacy/corrupt one, read back from disk outside this
+    process's own writes) could carry a `done_level` value that is not one
+    of `DONE_LEVELS` — `validate_fragment` checks only that it is a
+    non-empty string, not that it is a recognized ladder rung (see
+    `schema.validate_fragment`). Looking that value up in `_LEVEL_INDEX`
+    directly used to raise `KeyError`, crashing `core.projection.project_event`
+    and violating this module's own "a corrupt fragment is never fatal"
+    contract (mirrored from `core.projection`'s module docstring). An
+    unrecognized `current_level` is now treated as the `"D0-code"` floor for
+    the purpose of this one fold: a subsequent legitimate event that is
+    adjacent to `"D0-code"` (i.e. `"D1-merged"`) still applies from that
+    known base, and `current_level` is returned unchanged (not silently
+    reset to `"D0-code"`) for any event that is not. `rebuild()` — which
+    ignores cached fragments entirely and replays only the log — remains the
+    full-recovery path back to a fully correct value; this fix's guarantee
+    is narrower and cheaper: never crash, never propagate the corrupt value
+    any further than it already was.
+
     Args:
         current_level: the node's `done_level` before folding `event`
             (`"D0-code"` for a fresh/unseen node — every caller's own
-            documented default).
+            documented default). May be any string, including one not in
+            `DONE_LEVELS` (G5 fix #N2) — never raises for that.
         event: the event to fold in.
 
     Returns:
         str: `event.payload["done_level"]` if it is a legal single-rung
-        forward advance from `current_level`; `current_level` unchanged
+        forward advance from `current_level` (or, if `current_level` is
+        unrecognized, from the `"D0-code"` floor); `current_level` unchanged
         otherwise.
     """
     if event.type != "done_level_advanced":
@@ -474,7 +495,11 @@ def fold_done_level(current_level: str, event: Event) -> str:
     candidate = event.payload.get("done_level")
     if candidate not in _LEVEL_INDEX:
         return current_level
-    if _LEVEL_INDEX[candidate] != _LEVEL_INDEX[current_level] + 1:
+    # G5 fix #N2: `.get(..., 0)` instead of `[...]` — an unrecognized
+    # `current_level` (e.g. a corrupt cached fragment's stale value) is
+    # treated as the D0-code floor (index 0) rather than raising KeyError.
+    base_index = _LEVEL_INDEX.get(current_level, 0)
+    if _LEVEL_INDEX[candidate] != base_index + 1:
         return current_level
     return candidate
 

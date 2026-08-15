@@ -184,7 +184,12 @@ class AdvanceResult:
             observe either this `"deduped"` result or a same-level
             `DonePolicyError`, depending on timing — both are safe, and a
             caller should treat either as "already advanced by another
-            writer."
+            writer." **G5 fix #N1:** a `"deduped"` result is only ever
+            returned after confirming the persisted event behind that
+            idempotency key actually recorded `target_level` — a *poisoned*
+            key (e.g. `done:<node>:D1-merged` forged onto a payload naming
+            `D4-prod`) never reaches this status; `advance()` raises instead
+            (see its own docstring).
         node_id: the node this call targeted.
         level: the target level this call attempted to record.
     """
@@ -529,7 +534,13 @@ def advance(
         DonePolicyError: for a past-ceiling attempt, an insufficient
             evidence gate, a missing/non-human approver where required, or
             a non-single-rung-forward transition (skip-level, backward, or
-            same-level). Nothing is written on any of these.
+            same-level). Also raised (G5 fix #N1) when `append()` reports a
+            dedupe (an event already exists for this call's idempotency key,
+            `done:<node_id>:<target_level>`) but the persisted event's own
+            `payload["done_level"]` does NOT equal `target_level` — a
+            poisoned/corrupt idempotency key, never a genuine same-target
+            race. A silent `"deduped"` success is never returned for that
+            case; see `event_for`. Nothing is written on any of these.
         ValidationError: if the built event fails schema validation.
         OwnershipError: if `writer_role` may not write `done_level`.
         LockTimeoutError: if the shared log lock could not be acquired in
@@ -594,33 +605,73 @@ def advance(
 
     try:
         appended = append(log_path, event_dict, precondition=_precondition)
-    except PreconditionUnmet:  # pragma: no cover
-        # Provably unreachable given this module's own invariants, not
-        # merely untested: every level on this ladder can only ever be
-        # reached by writing exactly one rung at a time, so *any* history
-        # that moved `node_id` past this call's pre-lock-checked `current`
-        # necessarily already wrote the event with idempotency key
-        # `done:<node_id>:<target_level>` (the intermediate rung this exact
-        # call is trying to write) as part of getting there. That means a
-        # racing writer that changes `current` between this call's pre-lock
-        # check (above) and its `append()` always collides with this call's
-        # own idempotency key first — `append()`'s dedupe short-circuits
-        # before `precondition` ever runs, returning `None`, not raising
-        # `PreconditionUnmet` (see the `appended is None` branch below).
-        # This handler exists anyway, matching `core.edges.add_edge` /
-        # `handoff.self_register`'s own under-lock `precondition` pattern
-        # (mirrored per this chunk's brief) as defense-in-depth against a
-        # *future* change that relaxes the single-rung-forward invariant —
-        # kept intentionally excluded from the 100%-branch-coverage target
-        # rather than exercised by a contrived monkeypatch of dead code.
+    except PreconditionUnmet:
+        # G5 fix #N4: the prior claim here ("provably unreachable") was
+        # stale. It is unreachable via a racing *legitimate* `advance()`
+        # call — as documented, two legitimate racers for the SAME target
+        # always collide on the shared idempotency key first, so
+        # `append()`'s dedupe short-circuits before `precondition` ever
+        # runs. But that argument assumes every writer goes through
+        # `advance()`. A forged direct-append `done_level_advanced` event —
+        # bypassing `advance()` entirely, so none of its gates ever ran —
+        # can land between this call's pre-lock `current` read and its
+        # `append()` under a DIFFERENT idempotency key than this call's own
+        # (`done:<node_id>:<target_level>`), e.g. an adjacent-looking
+        # advance filed under a fabricated key. That does not collide with
+        # this call's idempotency dedupe, so `precondition` DOES run, and
+        # can legitimately reject against the fresh, under-the-lock log
+        # state — reachable via forged direct-append events (and certain
+        # concurrency interleavings with them), not merely a dead
+        # defense-in-depth branch. `TestN4PreconditionUnmetReachable`
+        # exercises exactly this and confirms the handler fails safe:
+        # nothing is written on this path.
+        #
+        # The trailing `raise DonePolicyError` below THIS call remains
+        # genuinely unreachable, though — not "provably", now literally, by
+        # construction: `_precondition` always records the exact same
+        # `fresh_current` it just used to compute its own False/reject
+        # verdict into `result_holder["current"]` before returning, so
+        # `_reject_unless_single_rung_forward(result_holder["current"],
+        # target_level, ...)` re-evaluates the identical adjacency
+        # inequality `precondition` just failed on — it always raises
+        # `DonePolicyError` itself, on every path that reaches this `except`
+        # block at all. The line below is defense-in-depth for a
+        # hypothetical future change that decouples `precondition`'s reject
+        # condition from `_reject_unless_single_rung_forward`'s, not
+        # currently exercisable code.
         _reject_unless_single_rung_forward(
             result_holder.get("current", current), target_level, node_id
         )
-        raise DonePolicyError(
+        raise DonePolicyError(  # pragma: no cover
             f"{node_id}: precondition rejected advancing to {target_level!r}"
         )
 
     if appended is None:
+        # G5 fix #N1: `append()`'s dedupe means "an event already exists for
+        # this idempotency key" — it says nothing about whether that event
+        # actually recorded `target_level`. A forged/corrupt key (written
+        # directly via `core.events.append`, bypassing `advance()` and every
+        # one of its gates — e.g. idempotency_key `done:<node>:D1-merged`
+        # attached to a payload naming `D4-prod`) would otherwise let a
+        # fully-evidenced, legitimate call silently report success while the
+        # node's real current level never moves — a silent denial-of-
+        # advancement. Look the persisted event up (by the same key) and
+        # confirm it agrees with `target_level` before trusting the dedupe.
+        # `persisted is None` is defensive only — `append()` just told us
+        # this key exists, so `event_for` should always find it; treated as
+        # "trust the dedupe" rather than raised, since there is nothing here
+        # to contradict.
+        persisted = event_for(node_id, target_level, log_path)
+        if persisted is not None and persisted.payload.get("done_level") != target_level:
+            raise DonePolicyError(
+                f"{node_id}: idempotency key 'done:{node_id}:{target_level}' "
+                "is already recorded, but its persisted event's done_level "
+                f"{persisted.payload.get('done_level')!r} does not match the "
+                f"requested target_level {target_level!r} — refusing to "
+                "report a silent 'deduped' success for what appears to be a "
+                "poisoned or corrupt idempotency key (G5 fix #N1); this is a "
+                "policy violation, not a genuine concurrent-race no-op"
+            )
         return AdvanceResult(status="deduped", node_id=node_id, level=target_level)
 
     return AdvanceResult(status="advanced", node_id=node_id, level=target_level)
