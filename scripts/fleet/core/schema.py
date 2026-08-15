@@ -245,6 +245,28 @@ def validate_event(data: dict[str, Any]) -> Event:
     )
 
 
+def is_model_vendor_name(value: str) -> bool:
+    """Return whether `value` looks like a model/vendor name, not a role/human (NFR-6).
+
+    Case-insensitive substring match against `_MODEL_VENDOR_DENYLIST` — the
+    same judgment `validate_event` applies to `writer_role`. Exposed
+    publicly so other modules needing an identical "is this a model, not a
+    human/role" check (e.g. `core/done.py`'s human-approver gate, FR-6)
+    reuse this one source of truth rather than re-deriving the denylist.
+
+    Args:
+        value: the candidate string to classify.
+
+    Returns:
+        bool: True if `value` is not a non-empty string, or matches the
+        denylist (looks like a model/vendor name); False otherwise.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return True
+    lowered = value.lower()
+    return any(token in lowered for token in _MODEL_VENDOR_DENYLIST)
+
+
 def _assert_role_only(writer_role: Any) -> None:
     """Raise ValidationError if `writer_role` names a model/vendor (NFR-6).
 

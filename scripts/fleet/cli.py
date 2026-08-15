@@ -20,11 +20,15 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .. import superhuman_profile
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
+from .core.done import DONE_LEVELS
+from .core.done import advance as done_advance
+from .core.done import event_for as done_event_for
 from .core.edges import resolve_graph
-from .core.errors import LockTimeoutError, OwnershipError, ValidationError
+from .core.errors import DonePolicyError, LockTimeoutError, OwnershipError, ValidationError
 from .core.events import append
 from .core.projection import project_event
 from .core.query import edges_of
@@ -525,6 +529,115 @@ def _cmd_handoff_self_register(args: argparse.Namespace) -> int:
     return 1
 
 
+#: Default D-ceiling when nothing resolves one (the top of the ladder — no
+#: ceiling in practice). See `_resolve_d_ceiling`.
+_DEFAULT_D_CEILING = "D4-prod"
+
+#: The rung `labels` key `_resolve_d_ceiling` looks for. See its docstring
+#: for why this piggybacks on `labels` rather than a dedicated schema field.
+_D_CEILING_LABEL_KEY = "d_ceiling"
+
+
+def _resolve_d_ceiling(workspace: Path) -> str:
+    """Resolve the project's D-ceiling from the operator's deployment profile.
+
+    `core/done.py` treats the D-ceiling as a plain caller-supplied parameter
+    (DP#5 — it never reads a profile itself, per this chunk's brief); this
+    is the one place that bridges the two, matching DESIGN's `advance(node,
+    level, evidence, approver, ceiling)` signature intent (`ceiling` comes
+    from the CLI, not from `core/done.py`).
+
+    **Flagged as a design call, not a settled contract (see this chunk's
+    report to PM/Architect).** `scripts/superhuman_profile.py`'s schema —
+    the general Lab/Test/UAT/Prod deployment-rung ladder read from
+    `.superhuman/profile.yaml` — has no dedicated field for a *done-ladder*
+    ceiling; adding one would mean extending that already-shipped module's
+    schema, which is out of this chunk's scope (`core/done.py` +
+    `cli.py`'s `done advance` wiring only, per PLAN.md). This resolver
+    instead reuses each matched rung's existing free-form `labels` mapping
+    (`superhuman_profile.Rung.labels`, documented there as "Free-form
+    metadata carried into resolver output") and looks for a `d_ceiling`
+    label naming one of `core.done.DONE_LEVELS` — the minimal wiring that
+    satisfies PLAN.md's "D-ceiling from profile" step without inventing a
+    new top-level profile schema key unilaterally. An operator opts in by
+    adding e.g. `labels: {d_ceiling: "D2-test"}` to a rung in their
+    `profile.yaml`; absent that, every project is unrestricted (`D4-prod`).
+
+    Args:
+        workspace: the project's working tree root — the profile search
+            starts here (`superhuman_profile.find_profile`).
+
+    Returns:
+        str: the resolved D-ceiling, one of `core.done.DONE_LEVELS`.
+        `_DEFAULT_D_CEILING` if no profile is found, no rung matches the
+        workspace, the matched rung declares no `d_ceiling` label, or the
+        profile itself fails to load (a malformed profile should not by
+        itself block every `done advance` call — it already fails loudly
+        for the deployment-rung concerns `superhuman_profile`'s own CLI
+        commands cover).
+    """
+    try:
+        profile = superhuman_profile.load_profile(superhuman_profile.find_profile(workspace))
+        resolution = superhuman_profile.resolve(workspace, profile)
+    except superhuman_profile.ProfileError:
+        return _DEFAULT_D_CEILING
+    if resolution.stage is None:
+        return _DEFAULT_D_CEILING
+    ceiling = resolution.stage.labels.get(_D_CEILING_LABEL_KEY)
+    return ceiling if ceiling in DONE_LEVELS else _DEFAULT_D_CEILING
+
+
+def _cmd_done_advance(args: argparse.Namespace) -> int:
+    """Handle `fleet done advance` (PLAN.md Chunk 5, FR-6).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success (including a deduped repeat of an already-
+        recorded transition); `1` if the advance was rejected (policy,
+        validation, ownership, or an unrecognized level) or the manifest
+        lock could not be acquired.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+
+    evidence: dict[str, Any] = {}
+    if args.evidence_json is not None:
+        evidence = json.loads(args.evidence_json.read_text(encoding="utf-8"))
+
+    ceiling = args.ceiling or _resolve_d_ceiling(args.workspace)
+
+    try:
+        result = done_advance(
+            args.node_id,
+            args.target_level,
+            evidence=evidence,
+            approver=args.approver,
+            ceiling=ceiling,
+            project_id=args.project_id,
+            writer_role=args.writer_role,
+            log_path=log_path,
+        )
+    except LockTimeoutError as exc:
+        print(f"fleet done advance: could not acquire the manifest lock: {exc}", file=sys.stderr)
+        return 1
+    except (ValidationError, OwnershipError, ValueError, DonePolicyError) as exc:
+        print(f"fleet done advance: rejected: {exc}", file=sys.stderr)
+        return 1
+
+    # `core/done.py` may not import `core/projection` (NFR-2 — see
+    # done.py's module docstring), so projecting the fragment happens here,
+    # the same boundary `register_session` and `handoff.py` already draw.
+    event = done_event_for(args.node_id, args.target_level, log_path)
+    if event is not None:
+        project_event(event, sessions_dir)
+
+    print(f"{result.status}: {result.node_id} -> {result.level} (ceiling={ceiling})")
+    return 0
+
+
 def _cmd_query_edges(args: argparse.Namespace) -> int:
     """Handle `fleet query edges` (PLAN.md Chunk 4).
 
@@ -650,6 +763,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser.set_defaults(func=_cmd_register)
 
     _add_handoff_subparsers(subparsers)
+    _add_done_subparsers(subparsers)
     _add_query_subparsers(subparsers)
 
     return parser
@@ -832,6 +946,66 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     self_register_parser.set_defaults(func=_cmd_handoff_self_register)
+
+
+def _add_done_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `done advance` subcommand (PLAN.md Chunk 5, FR-6).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    done_parser = subparsers.add_parser(
+        "done", help="Evidence-backed done_level state machine (D0-code..D4-prod)."
+    )
+    done_subparsers = done_parser.add_subparsers(dest="done_command", required=True)
+
+    advance_parser = done_subparsers.add_parser(
+        "advance", help="Advance a node's done_level by exactly one rung (FR-6)."
+    )
+    advance_parser.add_argument("--node-id", required=True, help="the node id to advance")
+    advance_parser.add_argument(
+        "--target-level",
+        required=True,
+        choices=DONE_LEVELS,
+        help="the done_level to advance to (must be exactly one rung above current)",
+    )
+    advance_parser.add_argument("--project-id", required=True, help="the owning project's id")
+    advance_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    advance_parser.add_argument(
+        "--workspace", required=True, type=Path, help="the working tree to advance from"
+    )
+    advance_parser.add_argument(
+        "--writer-role", required=True, help="a role name, never an AI/model/vendor string"
+    )
+    advance_parser.add_argument(
+        "--evidence-json",
+        type=Path,
+        default=None,
+        help="path to a JSON file of evidence fields (commit, pr, deploy_id, ci_run, env, ...); "
+        "omit for no evidence",
+    )
+    advance_parser.add_argument(
+        "--approver",
+        default=None,
+        help="the recorded approver's identity — required (and must not be "
+        "model/vendor-shaped) for --target-level D3-uat or D4-prod",
+    )
+    advance_parser.add_argument(
+        "--ceiling",
+        default=None,
+        choices=DONE_LEVELS,
+        help="override the project's D-ceiling instead of resolving it from the "
+        "operator's deployment profile (see _resolve_d_ceiling / "
+        "scripts/superhuman_profile.py)",
+    )
+    advance_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    advance_parser.set_defaults(func=_cmd_done_advance)
 
 
 def _add_query_subparsers(subparsers: argparse._SubParsersAction) -> None:

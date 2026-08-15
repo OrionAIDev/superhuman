@@ -51,3 +51,18 @@ class PreconditionUnmet(FleetError):
     ``None`` means "already recorded, no-op is correct"; this exception
     means "must not be recorded, something changed underneath the caller."
     """
+
+
+class DonePolicyError(FleetError):
+    """A ``done_level`` advance was rejected by policy, not malformed input.
+
+    Raised by ``core.done.advance()`` for a skip-level, backward, or
+    same-level transition attempt; a missing/insufficient evidence gate (FR-6:
+    merge evidence for D1-merged, deploy+test evidence for D2-test); a
+    missing or non-human approver for D3-uat/D4-prod; or an attempt past the
+    project's D-ceiling. Every rejection is deterministic and code-only
+    (DP#5) — never inferred. Kept distinct from ``ValidationError``
+    (malformed event shape) and ``OwnershipError`` (wrong writer role) so a
+    caller can tell "this is a policy rejection" apart from those other
+    rejection classes. Nothing is written on this error.
+    """
