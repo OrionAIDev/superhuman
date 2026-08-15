@@ -20,18 +20,42 @@ the same `timeout`/`retry_interval` contract as before, raising
 `LockTimeoutError` on expiry — the caller must never proceed unlocked.
 
 This is a structural fix, not a tuned one: the **kernel itself releases an
-advisory lock the instant its holding process dies** (process exit, crash,
-or `SIGKILL` all close every fd the process held, and closing the last fd on
-a `flock`'d file — or terminating the process holding a `msvcrt.locking`
-byte-range lock — releases the lock automatically). There is therefore no
-such thing as a "stale" lock under this design: nothing is ever reclaimed,
-because nothing crash-held is ever left locked. The entire former stale-lock
-machinery — age/pid-liveness reclaim, a separate `.reclaiming` marker file,
+advisory lock when its holding process dies** (process exit, crash, or
+`SIGKILL` all close every fd the process held, and closing the last fd on a
+`flock`'d file — or terminating the process holding a `msvcrt.locking`
+byte-range lock — releases the lock). There is therefore no such thing as a
+"stale" lock under this design: nothing is ever reclaimed, because nothing
+crash-held is ever left locked. The entire former stale-lock machinery —
+age/pid-liveness reclaim, a separate `.reclaiming` marker file,
 `O_CREAT|O_EXCL` as the mutual-exclusion primitive, `_pid_is_alive` — is
 deleted along with it, and with it every TOCTOU/ABA hazard that machinery
 was prone to (including the load-dependent double-reclaim race that
 motivated this redesign: two racers both winning a reclaim's check→remove
 gap on a reused lock path, defeating mutual exclusion).
+
+Release timing differs slightly by platform, though neither requires any
+reclaim logic: on POSIX, `flock` release on process death is immediate — it
+happens as part of the kernel's normal fd-table teardown during process
+exit, not a separate asynchronous step. On Windows, Microsoft's own
+`LockFileEx` documentation (which `msvcrt.locking` wraps) states only that a
+dead process's byte-range locks are released "when the process terminates,"
+with the exact timing "depend[ing] upon available system resources" —
+prompt, but not a documented-synchronous guarantee the instant the process
+exits. Either way, a second acquirer never needs to know or care which case
+applies: `acquire_lock`'s existing bounded retry/timeout contract already
+covers it — the default `timeout` (10s) is generous relative to how quickly
+Windows actually releases these locks in practice.
+
+**fork() caveat:** the lock holder must not `fork()` while holding it.
+`flock` (POSIX) locks belong to the *open file description*, not the
+process — a forked child inherits the locked fd and keeps the OS lock alive
+even after the original holder (the parent) exits or crashes, defeating
+crash-release entirely (the child, not the dead parent, is still holding
+it). Not triggered anywhere in this codebase today: every multiprocessing
+caller here (`test_concurrency.py`, `test_lock_os_native.py`, …) uses the
+`spawn` start method — a fresh interpreter with its own fd table, never a
+`fork` of the holder — but this would need care if `fork` start method
+usage were ever introduced.
 
 **Local-filesystem constraint:** OS advisory locks (`flock`/`msvcrt.locking`)
 are a promise the *local* filesystem driver enforces between processes on
@@ -46,6 +70,7 @@ location ever changes.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import time
@@ -68,30 +93,47 @@ else:
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_RETRY_INTERVAL = 0.02
 
-#: Errors that mean "the OS lock is currently held by someone else, retry"
-#: rather than a real failure.
-#:
-#: POSIX (`fcntl.flock` with `LOCK_NB`): "If LOCK_NB is used and the lock
+#: POSIX errnos that mean "the OS lock is currently held by someone else,
+#: retry" for `fcntl.flock(..., LOCK_NB)`: "If LOCK_NB is used and the lock
 #: cannot be acquired, an OSError will be raised and the exception will have
 #: an errno attribute set to EACCES or EAGAIN (depending on the operating
 #: system; for portability, check for both values)."
 #: https://docs.python.org/3.14/library/fcntl.html#fcntl.flock
 #:
-#: Windows (`msvcrt.locking` with `LK_NBLCK`): "If the file cannot be locked,
-#: the exception OSError is raised." No specific errno is documented, so the
-#: contended case is any `OSError` from that call.
-#: https://docs.python.org/3.14/library/msvcrt.html#msvcrt.locking
-#:
-#: Both platforms are simply "any OSError from this specific, narrowly
-#: scoped lock call" — `BlockingIOError`/`PermissionError` (the concrete
-#: subclasses Python raises for EAGAIN/EACCES per PEP 3151) are themselves
-#: `OSError` subclasses, so catching `OSError` here already covers them. If
-#: some other, genuinely unrelated `OSError` were ever raised by this call,
-#: bounded retry+timeout still fails loud (`LockTimeoutError`) rather than
-#: proceeding unlocked — the same "worse case is a loud, safe failure, never
-#: silent corruption" precedent this module has always used for platform
-#: lock-error quirks.
-_LOCK_CONTENDED_ERRORS: tuple[type[OSError], ...] = (OSError,)
+#: `_lock_fd` still has to catch `OSError` broadly (Python raises the errno
+#: as a plain attribute on `OSError`, not as a distinguishing exception
+#: type), but `_is_lock_contended` below narrows the *retry* decision to
+#: exactly these two errnos on POSIX — any other errno (`EBADF`, `ENOSPC`,
+#: …) is a real failure and is re-raised immediately rather than silently
+#: burning the whole retry/timeout budget only to surface as a misleading
+#: `LockTimeoutError`.
+_POSIX_CONTENDED_ERRNOS: tuple[int, ...] = (errno.EACCES, errno.EAGAIN)
+
+
+def _is_lock_contended(exc: OSError) -> bool:
+    """Return whether `exc` (from `_lock_fd`) means "held, retry."
+
+    POSIX: only `errno.EACCES`/`errno.EAGAIN` mean contention (see
+    `_POSIX_CONTENDED_ERRNOS`) — anything else is a genuine failure and must
+    propagate, not be retried away.
+
+    Windows (`msvcrt.locking` with `LK_NBLCK`): "If the file cannot be
+    locked, the exception OSError is raised." No specific errno is
+    documented for the failure, so — unlike POSIX — there is no reliable
+    attribute to narrow on; any `OSError` from `_lock_fd` on this platform
+    is treated as contention.
+    https://docs.python.org/3.14/library/msvcrt.html#msvcrt.locking
+
+    Args:
+        exc: the `OSError` raised by `_lock_fd`.
+
+    Returns:
+        bool: True if the caller should retry (the lock is held elsewhere);
+        False if `exc` should propagate as a genuine, non-contention error.
+    """
+    if os.name == "nt":
+        return True
+    return exc.errno in _POSIX_CONTENDED_ERRNOS
 
 
 def lock_path_for(log_path: Path | str) -> Path:
@@ -135,9 +177,11 @@ def _lock_fd(fd: int) -> None:
         fd: an open, writable OS file descriptor for the lock anchor file.
 
     Raises:
-        OSError: (see `_LOCK_CONTENDED_ERRORS`) if the lock is currently
-            held by another process. Callers must treat this as "held,
-            retry" — never as "safe to proceed unlocked."
+        OSError: if the lock could not be acquired right now — either
+            because it is held by another process (see `_is_lock_contended`,
+            which the caller uses to tell that case apart) or, on POSIX,
+            because of a genuine unrelated failure that must propagate
+            rather than be retried.
     """
     if os.name == "nt":
         os.lseek(fd, 0, os.SEEK_SET)
@@ -174,7 +218,7 @@ def _unlock_fd(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class LockHandle:
     """An acquired OS advisory lock, returned by `acquire_lock`.
 
@@ -182,10 +226,21 @@ class LockHandle:
     letting `LockedLog` do that for you) — the fields exist for diagnostics
     and testing, not for callers to act on directly.
 
+    Deliberately **not** frozen, unlike every other dataclass in this
+    module/package — a `LockHandle` is single-use state, not an immutable
+    value: `release_lock` mutates `fd` to `-1` the instant it starts
+    releasing, so a second `release_lock` call on the same handle (a bug,
+    but a plausible one — e.g. a caller's own `finally` racing `LockedLog`'s)
+    is a safe no-op instead of `os.close()`-ing a file descriptor number the
+    OS may have already reused for something else entirely. Correctness of
+    that guard requires mutability; frozen would only protect against a
+    much less dangerous mistake (rebinding `path`/`fd` to nonsense).
+
     Attributes:
         path: the lock anchor file this handle's lock guards.
-        fd: the open OS file descriptor the lock is held on. Must stay open
-            for as long as the lock is held; closed by `release_lock`.
+        fd: the open OS file descriptor the lock is held on, or `-1` once
+            `release_lock` has processed this handle. `-1` is never a valid
+            fd, so it doubles as the "already released" sentinel.
     """
 
     path: Path
@@ -221,6 +276,11 @@ def acquire_lock(
             caller must treat this as "did not acquire" — never proceed as
             if unlocked. The anchor's fd is closed before this is raised, so
             a timed-out attempt leaks nothing.
+        OSError: if `_lock_fd` fails for a reason other than contention (see
+            `_is_lock_contended`) — e.g. a genuine POSIX `EBADF`/`ENOSPC`.
+            Propagated immediately rather than silently retried away and
+            surfaced later as a misleading `LockTimeoutError`. The anchor's
+            fd is closed before this is raised.
     """
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -234,7 +294,10 @@ def acquire_lock(
     while True:
         try:
             _lock_fd(fd)
-        except _LOCK_CONTENDED_ERRORS:
+        except OSError as exc:
+            if not _is_lock_contended(exc):
+                os.close(fd)
+                raise
             if time.monotonic() >= deadline:
                 os.close(fd)
                 raise LockTimeoutError(f"timed out acquiring lock {lock_path}")
@@ -257,22 +320,35 @@ def acquire_lock(
 def release_lock(handle: LockHandle) -> None:
     """Release the OS advisory lock held by `handle`.
 
-    Unconditionally closes `handle.fd` — this both releases the OS lock (if
-    the explicit unlock below did not already) and frees the descriptor.
-    The anchor file at `handle.path` is deliberately left on disk: deleting
-    a lock-path anchor is exactly the reuse hazard this redesign removes,
-    so leaving it behind (empty or holding the last holder's diagnostic
+    Unconditionally closes the fd — this both releases the OS lock (if the
+    explicit unlock below did not already) and frees the descriptor. The
+    anchor file at `handle.path` is deliberately left on disk: deleting a
+    lock-path anchor is exactly the reuse hazard this redesign removes, so
+    leaving it behind (empty or holding the last holder's diagnostic
     `{pid, ts}`) is correct, not a leak.
+
+    Safe to call more than once on the same `handle`: the first call flips
+    `handle.fd` to `-1` before touching the OS, so a second call is a no-op
+    rather than `os.close()`-ing a file descriptor number the OS may have
+    since handed out to something completely unrelated (the classic
+    double-close/use-after-close hazard with raw fds).
 
     Args:
         handle: the handle returned by the matching `acquire_lock` call.
     """
+    if handle.fd == -1:
+        return  # already released — safe no-op, never touches a reused fd
+
+    fd = handle.fd
+    handle.fd = -1  # mark released before touching the OS: a second,
+    # possibly-concurrent call must see this immediately, not race the
+    # unlock/close below.
     try:
-        _unlock_fd(handle.fd)
+        _unlock_fd(fd)
     except OSError:
         pass  # closing fd below releases the OS-level lock regardless
     finally:
-        os.close(handle.fd)
+        os.close(fd)
 
 
 class LockedLog:

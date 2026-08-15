@@ -188,6 +188,29 @@ class TestLockContention:
         release_lock(handle2)
         assert elapsed < 1.0, "re-acquiring the same anchor after release should be immediate"
 
+    def test_double_release_is_a_safe_no_op(self, tmp_path: Path) -> None:
+        """`LockHandle` is single-use: a second `release_lock` call on the
+        same handle must not `os.close()` an fd number the OS may have
+        already reused for something unrelated. The first release flips
+        `handle.fd` to `-1`; the second call must see that and do nothing.
+        """
+        lock_path = tmp_path / ".lock"
+        handle = acquire_lock(lock_path, timeout=5.0, retry_interval=0.01)
+        release_lock(handle)
+        assert handle.fd == -1, "release_lock must mark the handle as released"
+
+        release_lock(handle)  # must not raise (e.g. a double-close OSError)
+        assert handle.fd == -1, "a second release must leave the handle exactly as-is"
+
+        # And the anchor must still be genuinely unlocked — a fresh acquire
+        # succeeds promptly, proving the double-release didn't somehow
+        # re-lock or corrupt anything.
+        start = time.monotonic()
+        handle2 = acquire_lock(lock_path, timeout=2.0, retry_interval=0.01)
+        elapsed = time.monotonic() - start
+        release_lock(handle2)
+        assert elapsed < 1.0
+
 
 class TestTornFinalLine:
     """TC-9."""

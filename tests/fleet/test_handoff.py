@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-# Belt-and-suspenders, matching test_concurrency.py / test_stale_lock_reclaim_race.py:
+# Belt-and-suspenders, matching test_concurrency.py / test_lock_os_native.py:
 # module-level worker functions must be independently importable-by-name in a
 # freshly `multiprocessing.get_context("spawn")`-ed child (Windows always
 # uses spawn), so this module needs the skill root on sys.path itself, not
@@ -650,7 +650,7 @@ class TestSelfRegisterCancelRaceGuard:
         self, git_repo: Path, fleet_dir: tuple[Path, Path]
     ) -> None:
         # A real-process race (multiprocessing.Barrier, matching TC-12 and
-        # test_stale_lock_reclaim_race.py's own "real OS processes, not
+        # test_lock_os_native.py's own "real OS processes, not
         # threads" reasoning): cancel and self_register (exact-id path)
         # fire at (as near as possible) the same instant against the same
         # node, repeated N_RACE_REPEATS times — must never resolve to
