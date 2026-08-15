@@ -62,6 +62,17 @@ DETECTOR_TIERS: dict[str, int] = {
 
 ACTION_CLASSES = ("promote_into", "act_unattended")
 
+#: Capability tiers the ``models:`` block declares (spec/DESIGN §Component C-PROF).
+#: Order is display order only; lookup is by name.
+MODEL_TIERS: tuple[str, ...] = ("most_capable", "standard", "cheap")
+
+#: Neutral, vendor-free placeholder written for a declined/deferred tier (FR-10).
+#: Self-documenting on purpose — never a concrete vendor/model name — so the
+#: dispatch layer can warn (C-DISP) instead of silently assuming a provider.
+MODEL_PLACEHOLDER = "PROMPT_ME"
+
+_MODEL_ENTRY_KEYS = {"primary", "fallback"}
+
 _APPROVER_RE = re.compile(r"^(human|self|human:[\w.-]+|agent:[\w.-]+)$")
 _STABLE_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
 
@@ -257,7 +268,12 @@ class Profile:
         require_profile: In-file equivalent of ``SUPERHUMAN_REQUIRE_PROFILE``.
         ladder: Ordered rungs.
         conventions: Convention pack names or overlay paths.
-        models: Tier -> model id/alias.
+        models: Tier -> ``{"primary": <alias>, "fallback": <alias> | None}``.
+            Normalized at load time (ADR-6): a legacy bare-string tier value
+            (``most_capable: opus``) is read as ``{"primary": "opus", "fallback":
+            None}``; an already-mapping value passes through unchanged. Every
+            downstream reader sees the mapping form regardless of which shape
+            the file was written in.
         path: Source file, or ``None`` for the built-in ladder.
         digest: Hash over declared cells only (spec §5, decision D-12).
     """
@@ -267,7 +283,7 @@ class Profile:
     require_profile: bool
     ladder: tuple[Rung, ...]
     conventions: tuple[str, ...]
-    models: dict[str, str]
+    models: dict[str, dict[str, str | None]]
     path: Path | None
     digest: str
 
@@ -383,6 +399,67 @@ def _digest(declared: Any) -> str:
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _normalize_model_entry(value: Any, where: str) -> dict[str, str | None]:
+    """Normalize one ``models:`` tier value to the canonical mapping form.
+
+    Per ADR-6, a legacy bare string is the primary with no fallback; an
+    already-mapping value is validated and taken as-is. Any other shape fails
+    loud rather than being silently coerced (spec §Error handling).
+
+    Args:
+        value: The raw YAML value for one tier (``str`` or a mapping).
+        where: Dotted path used in error messages.
+
+    Returns:
+        A mapping with exactly ``primary`` and ``fallback`` keys.
+
+    Raises:
+        ProfileError: If ``value`` is neither a non-empty string nor a mapping
+            with a valid ``primary``/``fallback`` shape.
+    """
+    if isinstance(value, str):
+        if not value:
+            raise ProfileError(f"{where}: model alias must not be empty")
+        return {"primary": value, "fallback": None}
+    if isinstance(value, dict):
+        extra = set(value) - _MODEL_ENTRY_KEYS
+        if extra:
+            raise ProfileError(f"{where}: unknown key(s) {sorted(extra)}")
+        primary = value.get("primary")
+        if not isinstance(primary, str) or not primary:
+            raise ProfileError(f"{where}: 'primary' is required and must be a non-empty string")
+        fallback = value.get("fallback")
+        if fallback is not None and not isinstance(fallback, str):
+            raise ProfileError(f"{where}: 'fallback' must be a string or null")
+        return {"primary": primary, "fallback": fallback}
+    raise ProfileError(f"{where}: must be a string or a {{primary, fallback}} mapping, got {value!r}")
+
+
+def _normalize_models(raw_models: Any, where: str) -> dict[str, dict[str, str | None]]:
+    """Normalize the whole ``models:`` block to the canonical per-tier mapping.
+
+    Args:
+        raw_models: The raw YAML value of the ``models:`` key, or ``None``.
+        where: Dotted path used in error messages.
+
+    Returns:
+        Tier name -> normalized ``{primary, fallback}`` mapping. Empty when
+        ``raw_models`` is ``None`` (FR-9: an absent block is not an error).
+
+    Raises:
+        ProfileError: If ``raw_models`` is present but not a mapping, or any
+            tier value fails :func:`_normalize_model_entry`.
+    """
+    if raw_models is None:
+        return {}
+    if not isinstance(raw_models, dict):
+        raise ProfileError(f"{where}: must be a mapping")
+    return {
+        tier: _normalize_model_entry(value, f"{where}.{tier}")
+        for tier, value in raw_models.items()
+    }
+
+
 def load_profile(path: Path | None) -> Profile:
     """Load and validate a profile, or build the zero-config default.
 
@@ -490,7 +567,7 @@ def load_profile(path: Path | None) -> Profile:
         require_profile=bool(raw.get("require_profile", False)),
         ladder=tuple(rungs),
         conventions=tuple(raw.get("conventions") or ()),
-        models=raw.get("models") or {},
+        models=_normalize_models(raw.get("models"), "models"),
         path=path,
         digest=_digest(declared),
     )
@@ -1581,6 +1658,93 @@ def render_profile(ladder: list[dict[str, Any]], disc: "Discovery | None" = None
                 out.append("      " + action + ": " + _render_approval(rung["approvals"][action]))
         out.append("")
     return "\n".join(out).rstrip() + "\n"
+
+
+def write_models_block(
+    profile_path: Path,
+    answers: dict[str, dict[str, str | None]] | None = None,
+    *,
+    decline: bool | Iterable[str] = False,
+) -> Path:
+    """Deterministically write/merge the ``models:`` block of a profile.yaml.
+
+    This is C-PROF's writer (FR-9): the elicitation sub-flow (Chunk 6, C-KICK)
+    collects per-tier primary/fallback answers and hands them here — config
+    generation stays code, never LLM free-text, per dev-principle #5. Creates
+    ``profile_path`` (and its parent directories) if absent, and creates the
+    ``models:`` section if the file exists but lacks one. Existing top-level
+    keys (``ladder``, ``conventions``, …) and tiers not touched by this call
+    are preserved — a second call for one tier must not clobber another
+    tier's prior answer.
+
+    Every one of :data:`MODEL_TIERS` ends up populated after this call: a
+    tier that is neither answered nor explicitly declined, and was not
+    already present in the file, still gets :data:`MODEL_PLACEHOLDER` rather
+    than being left absent — fail safe, not fail silent (FR-10).
+
+    Args:
+        profile_path: Destination ``profile.yaml``.
+        answers: Tier -> ``{"primary": <alias>, "fallback": <alias> | None}``
+            for tiers the operator answered. ``None`` (the default) answers
+            none.
+        decline: ``True`` to decline every tier in :data:`MODEL_TIERS`, or an
+            iterable of tier names to decline individually. A declined tier
+            is written with :data:`MODEL_PLACEHOLDER` for both ``primary`` and
+            ``fallback`` — never a concrete vendor/model name (FR-10, the
+            provider-agnostic immutable constraint).
+
+    Returns:
+        ``profile_path``, for chaining.
+
+    Raises:
+        ProfileError: If ``answers``/``decline`` name a tier outside
+            :data:`MODEL_TIERS`, if ``profile_path`` exists but is not valid
+            YAML, or if the merged result fails to load back.
+    """
+    answers = answers or {}
+    declined = set(MODEL_TIERS) if decline is True else (set() if decline is False else set(decline))
+
+    unknown = (set(answers) | declined) - set(MODEL_TIERS)
+    if unknown:
+        raise ProfileError(f"models: unknown tier(s) {sorted(unknown)}")
+
+    if profile_path.is_file():
+        try:
+            existing: Any = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            raise ProfileError(f"{profile_path}: invalid YAML — {exc}") from exc
+        if not isinstance(existing, dict):
+            raise ProfileError(f"{profile_path}: top level must be a mapping")
+    else:
+        existing = {"version": SCHEMA_VERSION}
+
+    models_block: dict[str, Any] = dict(existing.get("models") or {})
+    for tier in MODEL_TIERS:
+        if tier in declined:
+            models_block[tier] = {"primary": MODEL_PLACEHOLDER, "fallback": MODEL_PLACEHOLDER}
+        elif tier in answers:
+            entry = answers[tier]
+            models_block[tier] = {
+                "primary": entry.get("primary") or MODEL_PLACEHOLDER,
+                "fallback": entry.get("fallback"),
+            }
+        elif tier not in models_block:
+            models_block[tier] = {"primary": MODEL_PLACEHOLDER, "fallback": MODEL_PLACEHOLDER}
+
+    existing["models"] = models_block
+    existing.setdefault("version", SCHEMA_VERSION)
+
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    # yaml.safe_dump(data, default_flow_style=False, sort_keys=False):
+    # https://pyyaml.org/wiki/PyYAMLDocumentation (PyYAML 6.0.3, installed version)
+    # — block style, insertion order preserved, no Python-specific tags.
+    profile_path.write_text(
+        yaml.safe_dump(existing, default_flow_style=False, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    load_profile(profile_path)  # validate what was just written before handing it back
+    return profile_path
 
 
 def cmd_init(args: argparse.Namespace) -> int:

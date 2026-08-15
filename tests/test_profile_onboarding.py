@@ -295,3 +295,159 @@ def test_doctor_surfaces_the_agent_only_approver_warning(tmp_path: Path) -> None
     proc = _cli(["doctor", str(tmp_path / "prod")], extra={"SUPERHUMAN_PROFILE": str(dest)})
     assert proc.returncode == 0, "a warning must not block"
     assert "WARNING" in proc.stdout and "no 'human' approver" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# models: generator (C-PROF, #139) — TC-10, TC-11, TC-12
+# --------------------------------------------------------------------------- #
+
+
+def test_models_generator_round_trips_primary_fallback(tmp_path: Path) -> None:
+    """The writer populates all 3 tiers, and the loader reads them back as mappings.
+
+    TC-10 (FR-9): a deterministic writer, not LLM free-text, produces the
+    ``models:`` block; the loader must resolve every tier to a ``{primary,
+    fallback}`` mapping with no further edits.
+    """
+    dest = tmp_path / "profile.yaml"
+    answers = {
+        "most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"},
+        "standard": {"primary": "vendor-a/mid", "fallback": "vendor-b/mid"},
+        "cheap": {"primary": "vendor-a/small", "fallback": "vendor-b/small"},
+    }
+    sp.write_models_block(dest, answers)
+
+    profile = sp.load_profile(dest)
+    for tier, entry in answers.items():
+        resolved = profile.models[tier]
+        assert set(resolved) == {"primary", "fallback"}
+        assert resolved["primary"] == entry["primary"]
+        assert resolved["fallback"] == entry["fallback"]
+
+
+def test_models_generator_creates_file_and_section_if_absent(tmp_path: Path) -> None:
+    """FR-9: the writer creates the profile file (and `models:` section) when absent."""
+    dest = tmp_path / "nested" / "profile.yaml"
+    assert not dest.exists()
+
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    assert dest.is_file()
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["most_capable"]["fallback"] is None
+    # Untouched tiers still fail safe rather than silently vanishing.
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_generator_merges_into_existing_profile(tmp_path: Path) -> None:
+    """Re-running the writer for one tier must not clobber a prior tier's answer."""
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+    sp.write_models_block(dest, {"standard": {"primary": "vendor-a/mid", "fallback": None}})
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+
+
+def test_models_generator_rejects_unknown_tier(tmp_path: Path) -> None:
+    """An unrecognised tier name fails loud rather than being written silently."""
+    dest = tmp_path / "profile.yaml"
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, {"fastest": {"primary": "vendor-a/big", "fallback": None}})
+    assert not dest.exists()
+
+
+def test_legacy_bare_string_models_normalizes_to_mapping(tmp_path: Path) -> None:
+    """TC-11: a legacy bare-string `models:` tier loads and normalizes to a mapping.
+
+    ADR-6: back-compat is via parse-time normalization, so every downstream
+    reader of ``Profile.models`` sees the mapping form regardless of which
+    shape the file was written in.
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\nmodels:\n  most_capable: opus\n",  # test data only, per LD-1
+        encoding="utf-8",
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"] == {"primary": "opus", "fallback": None}
+
+
+def test_mapping_form_models_pass_through_unchanged(tmp_path: Path) -> None:
+    """An already-mapping `models:` tier is taken as-is (ADR-6)."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\nmodels:\n  standard:\n    primary: vendor-a/mid\n"
+        "    fallback: vendor-b/mid\n",
+        encoding="utf-8",
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["standard"] == {"primary": "vendor-a/mid", "fallback": "vendor-b/mid"}
+
+
+def test_malformed_models_entry_fails_loud(tmp_path: Path) -> None:
+    """An unrecognised `models:` tier shape raises rather than silently coercing."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\nmodels:\n  most_capable: 123\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.load_profile(dest)
+
+
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        "models:\n  most_capable: ''\n",  # empty bare-string alias
+        "models:\n  most_capable:\n    primary: opus\n    extra: nope\n",  # unknown key
+        "models:\n  most_capable:\n    fallback: sonnet\n",  # missing primary
+        "models:\n  most_capable:\n    primary: opus\n    fallback: 7\n",  # non-string fallback
+        "models: nope\n",  # models: itself not a mapping
+    ],
+)
+def test_normalize_models_rejects_every_bad_shape(tmp_path: Path, models_yaml: str) -> None:
+    """Each malformed `models:` shape fails loud with a `ProfileError`, not silently."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\n" + models_yaml, encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.load_profile(dest)
+
+
+def test_models_absent_normalizes_to_empty_mapping(tmp_path: Path) -> None:
+    """No `models:` key at all is not an error — it normalizes to `{}` (FR-9)."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\n", encoding="utf-8")
+    assert sp.load_profile(dest).models == {}
+
+
+def test_decline_path_writes_neutral_placeholder(tmp_path: Path) -> None:
+    """TC-12 (FR-10): declining every tier writes a neutral, vendor-free placeholder.
+
+    The written file must still load (fail safe, not fail loud), and the
+    placeholder token must never be a concrete vendor/model name.
+    """
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, decline=True)
+
+    profile = sp.load_profile(dest)
+    for tier in sp.MODEL_TIERS:
+        entry = profile.models[tier]
+        assert entry["primary"] == sp.MODEL_PLACEHOLDER
+        assert entry["fallback"] == sp.MODEL_PLACEHOLDER
+        # Vendor-free: the placeholder is a self-documenting token, not a model alias.
+        for vendor_hint in ("opus", "sonnet", "haiku", "gpt", "gemini", "claude"):
+            assert vendor_hint not in entry["primary"].lower()
+
+
+def test_decline_specific_tiers_only(tmp_path: Path) -> None:
+    """A per-tier decline list leaves answered tiers alone."""
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(
+        dest,
+        answers={"most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"}},
+        decline=["standard", "cheap"],
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+    assert profile.models["cheap"]["fallback"] == sp.MODEL_PLACEHOLDER
