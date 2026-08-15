@@ -103,11 +103,19 @@ _DEFAULT_RETRY_INTERVAL = 0.02
 #: `_lock_fd` still has to catch `OSError` broadly (Python raises the errno
 #: as a plain attribute on `OSError`, not as a distinguishing exception
 #: type), but `_is_lock_contended` below narrows the *retry* decision to
-#: exactly these two errnos on POSIX — any other errno (`EBADF`, `ENOSPC`,
-#: …) is a real failure and is re-raised immediately rather than silently
-#: burning the whole retry/timeout budget only to surface as a misleading
-#: `LockTimeoutError`.
-_POSIX_CONTENDED_ERRNOS: tuple[int, ...] = (errno.EACCES, errno.EAGAIN)
+#: exactly these errnos on POSIX — any other errno (`EBADF`, `ENOSPC`, …) is
+#: a real failure and is re-raised immediately rather than silently burning
+#: the whole retry/timeout budget only to surface as a misleading
+#: `LockTimeoutError`. `EWOULDBLOCK` is included alongside `EAGAIN` because
+#: `flock(2)` documents `EWOULDBLOCK` for the "operation would block" case;
+#: on Linux/glibc it is numerically identical to `EAGAIN` (so this is a
+#: harmless superset), but on platforms/libcs where the two differ, omitting
+#: it would misclassify genuine contention as a real error and fail an
+#: otherwise-acquirable lock. Deduped via a frozenset so the alias case adds
+#: no duplicate.
+_POSIX_CONTENDED_ERRNOS: frozenset[int] = frozenset(
+    {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
+)
 
 
 def _is_lock_contended(exc: OSError) -> bool:
@@ -226,15 +234,21 @@ class LockHandle:
     letting `LockedLog` do that for you) — the fields exist for diagnostics
     and testing, not for callers to act on directly.
 
-    Deliberately **not** frozen, unlike every other dataclass in this
-    module/package — a `LockHandle` is single-use state, not an immutable
-    value: `release_lock` mutates `fd` to `-1` the instant it starts
-    releasing, so a second `release_lock` call on the same handle (a bug,
-    but a plausible one — e.g. a caller's own `finally` racing `LockedLog`'s)
-    is a safe no-op instead of `os.close()`-ing a file descriptor number the
-    OS may have already reused for something else entirely. Correctness of
-    that guard requires mutability; frozen would only protect against a
-    much less dangerous mistake (rebinding `path`/`fd` to nonsense).
+    A handle has a **single owner** — the `LockedLog` (or direct caller)
+    that acquired it — and is not designed to be shared across threads for
+    concurrent release; the owner releases it exactly once. Deliberately
+    **not** frozen, unlike every other dataclass in this module/package,
+    because it is single-use state, not an immutable value: `release_lock`
+    mutates `fd` to `-1` before touching the OS, so a *sequential* second
+    `release_lock` on the same handle (a plausible owner-side bug — e.g. a
+    caller's own `finally` running after `LockedLog.__exit__` already
+    released) is a safe no-op instead of `os.close()`-ing a descriptor
+    number the OS may have since reused. The `-1` flip is check-then-set,
+    not atomic, so it does **not** make two *concurrent* releases of one
+    shared handle safe — that is out of contract (a handle is owned by one
+    thread); it hardens only the realistic sequential-double-release path.
+    Correctness of that guard requires mutability; frozen would only protect
+    against a much less dangerous mistake (rebinding `path`/`fd` to nonsense).
 
     Attributes:
         path: the lock anchor file this handle's lock guards.
@@ -279,8 +293,17 @@ def acquire_lock(
         OSError: if `_lock_fd` fails for a reason other than contention (see
             `_is_lock_contended`) — e.g. a genuine POSIX `EBADF`/`ENOSPC`.
             Propagated immediately rather than silently retried away and
-            surfaced later as a misleading `LockTimeoutError`. The anchor's
-            fd is closed before this is raised.
+            surfaced later as a misleading `LockTimeoutError`.
+
+    On **any** exit before the `LockHandle` is returned — a timeout, a
+    non-contention `OSError`, or an asynchronous `KeyboardInterrupt`/
+    `MemoryError` landing anywhere in the retry loop or the diagnostic write
+    — the anchor's fd is closed exactly once (the `finally` below). That
+    both frees the descriptor and, if the async exception happened to land
+    *after* `_lock_fd` already succeeded, releases the just-acquired OS lock
+    (no `LockHandle` exists in that case to release it later). The fd stays
+    open only on the success path, where ownership transfers to the returned
+    handle.
     """
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,30 +314,42 @@ def acquire_lock(
         open_flags |= os.O_BINARY
     fd = os.open(str(lock_path), open_flags)
 
-    while True:
-        try:
-            _lock_fd(fd)
-        except OSError as exc:
-            if not _is_lock_contended(exc):
-                os.close(fd)
-                raise
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                raise LockTimeoutError(f"timed out acquiring lock {lock_path}")
-            time.sleep(retry_interval)
-            continue
+    # `fd` is owned by this function until it is handed to a `LockHandle`.
+    # Any exception before that hand-off (including an async
+    # `KeyboardInterrupt`/`MemoryError` mid-`time.sleep` or mid-diagnostic-
+    # write) must not leak the descriptor or strand a held lock, so the
+    # whole acquire path runs under one `finally` that closes the fd unless
+    # ownership was transferred.
+    fd_needs_close = True
+    try:
+        while True:
+            try:
+                _lock_fd(fd)
+            except OSError as exc:
+                if not _is_lock_contended(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise LockTimeoutError(f"timed out acquiring lock {lock_path}")
+                time.sleep(retry_interval)
+                continue
 
-        # Diagnostics only (`{pid, ts}`, same shape the old lock content
-        # used) — nothing in this module or its callers reads this back for
-        # correctness; a human inspecting a held `.lock` file mid-incident
-        # is the only consumer. Written under the lock we just won, so it
-        # can never race with another holder's own diagnostic write.
-        try:
-            os.ftruncate(fd, 0)
-            os.write(fd, json.dumps({"pid": os.getpid(), "ts": _now_iso()}).encode("utf-8"))
-        except OSError:
-            pass  # purely diagnostic; never fail acquisition over this
-        return LockHandle(path=lock_path, fd=fd)
+            # Diagnostics only (`{pid, ts}`, same shape the old lock content
+            # used) — nothing in this module or its callers reads this back
+            # for correctness; a human inspecting a held `.lock` file
+            # mid-incident is the only consumer. Written under the lock we
+            # just won, so it can never race with another holder's own
+            # diagnostic write.
+            try:
+                os.ftruncate(fd, 0)
+                os.write(fd, json.dumps({"pid": os.getpid(), "ts": _now_iso()}).encode("utf-8"))
+            except OSError:
+                pass  # purely diagnostic; never fail acquisition over this
+            handle = LockHandle(path=lock_path, fd=fd)
+            fd_needs_close = False  # ownership transferred to `handle`
+            return handle
+    finally:
+        if fd_needs_close:
+            os.close(fd)
 
 
 def release_lock(handle: LockHandle) -> None:
@@ -327,11 +362,16 @@ def release_lock(handle: LockHandle) -> None:
     leaving it behind (empty or holding the last holder's diagnostic
     `{pid, ts}`) is correct, not a leak.
 
-    Safe to call more than once on the same `handle`: the first call flips
-    `handle.fd` to `-1` before touching the OS, so a second call is a no-op
-    rather than `os.close()`-ing a file descriptor number the OS may have
-    since handed out to something completely unrelated (the classic
-    double-close/use-after-close hazard with raw fds).
+    Safe to call more than once *sequentially* on the same `handle` (the
+    handle's single owner double-releasing — e.g. a caller `finally` running
+    after `LockedLog.__exit__` already released): the first call flips
+    `handle.fd` to `-1` before touching the OS, so the second is a no-op
+    rather than `os.close()`-ing a descriptor number the OS may have since
+    handed out to something unrelated (the classic double-close /
+    use-after-close hazard with raw fds). This guard is check-then-set, not
+    atomic: it is **not** a license to release one shared handle from two
+    threads at once — a handle is owned by a single thread (see
+    `LockHandle`); concurrent release of one handle is out of contract.
 
     Args:
         handle: the handle returned by the matching `acquire_lock` call.
@@ -340,9 +380,9 @@ def release_lock(handle: LockHandle) -> None:
         return  # already released — safe no-op, never touches a reused fd
 
     fd = handle.fd
-    handle.fd = -1  # mark released before touching the OS: a second,
-    # possibly-concurrent call must see this immediately, not race the
-    # unlock/close below.
+    handle.fd = -1  # mark released before touching the OS so a sequential
+    # second call sees it immediately and no-ops (not concurrency-safe by
+    # design; see the docstring — a handle has one owner).
     try:
         _unlock_fd(fd)
     except OSError:

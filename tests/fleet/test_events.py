@@ -11,13 +11,16 @@ processes, not just this file's in-process/thread-level contention checks.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+from scripts.fleet.core import events as events_mod
 from scripts.fleet.core.errors import LockTimeoutError, PreconditionUnmet, ValidationError
 from scripts.fleet.core.events import (
     acquire_lock,
@@ -210,6 +213,103 @@ class TestLockContention:
         elapsed = time.monotonic() - start
         release_lock(handle2)
         assert elapsed < 1.0
+
+
+class TestAcquireLockFdSafety:
+    """Cross-model (GPT-5/codex) review Finding 2: `acquire_lock` must not
+    leak the anchor fd — nor strand a just-acquired OS lock — if an
+    exception lands anywhere between opening the fd and returning the
+    `LockHandle` (a non-contention `OSError`, or an async
+    `KeyboardInterrupt`/`MemoryError` mid-retry or mid-diagnostic-write).
+    The fix wraps the whole acquire path in one `try/finally` that closes
+    the fd unless ownership transferred to a returned handle.
+    """
+
+    @staticmethod
+    def _fd_is_closed(fd: int) -> bool:
+        """True iff `fd` is not a currently-open descriptor in this process."""
+        try:
+            os.fstat(fd)
+            return False
+        except OSError:
+            return True
+
+    def test_error_from_lock_fd_closes_the_fd_on_every_platform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whatever exit path an `OSError` from `_lock_fd` takes — immediate
+        propagation on POSIX, or (since Windows `msvcrt` exposes no errno to
+        narrow on) a retry that ends in `LockTimeoutError` — the anchor fd
+        must not leak. Both paths run the same `finally`.
+        """
+        captured: list[int] = []
+
+        def _boom(fd: int) -> None:
+            captured.append(fd)
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        monkeypatch.setattr(events_mod, "_lock_fd", _boom)
+
+        # A short timeout keeps the Windows retry-to-timeout branch quick.
+        with pytest.raises((OSError, LockTimeoutError)):
+            acquire_lock(tmp_path / ".lock", timeout=0.1, retry_interval=0.01)
+        assert captured, "_lock_fd should have been called with the opened fd"
+        assert self._fd_is_closed(captured[0]), "acquire_lock leaked the anchor fd"
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="errno narrowing is POSIX-only; Windows msvcrt exposes no errno to narrow on",
+    )
+    def test_non_contention_errno_propagates_immediately_on_posix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POSIX Finding-4 behavior: a genuine (non-EACCES/EAGAIN/EWOULDBLOCK)
+        errno propagates immediately instead of degrading to a misleading
+        `LockTimeoutError` after burning the whole retry budget.
+        """
+        def _boom(fd: int) -> None:
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        monkeypatch.setattr(events_mod, "_lock_fd", _boom)
+
+        with pytest.raises(OSError) as excinfo:
+            acquire_lock(tmp_path / ".lock", timeout=5.0, retry_interval=0.01)
+        assert excinfo.value.errno == errno.ENOSPC
+        assert not isinstance(excinfo.value, LockTimeoutError)
+
+    def test_async_exception_during_diagnostics_releases_fd_and_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If an async exception (here `KeyboardInterrupt`) lands during the
+        post-lock diagnostic write — after `_lock_fd` already acquired the OS
+        lock but before the handle is returned — the fd must be closed
+        (releasing the OS lock, since no handle exists to release it later),
+        proven by both the fd being closed and the anchor being immediately
+        re-acquirable.
+        """
+        lock_path = tmp_path / ".lock"
+        captured: list[int] = []
+
+        def _boom(fd: int, length: int) -> None:
+            captured.append(fd)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(os, "ftruncate", _boom)
+
+        with pytest.raises(KeyboardInterrupt):
+            acquire_lock(lock_path, timeout=5.0, retry_interval=0.01)
+        assert captured, "the diagnostic ftruncate should have run under the held lock"
+        assert self._fd_is_closed(captured[0]), "the held-lock fd was leaked on interruption"
+
+        # The OS lock must be gone: a fresh acquire on the same anchor
+        # succeeds promptly (the finally released it, not just closed a
+        # handle while secretly still holding).
+        monkeypatch.undo()  # restore the real os.ftruncate for the real acquire
+        start = time.monotonic()
+        handle = acquire_lock(lock_path, timeout=2.0, retry_interval=0.01)
+        elapsed = time.monotonic() - start
+        release_lock(handle)
+        assert elapsed < 1.0, "the interrupted acquire stranded the OS lock"
 
 
 class TestTornFinalLine:
