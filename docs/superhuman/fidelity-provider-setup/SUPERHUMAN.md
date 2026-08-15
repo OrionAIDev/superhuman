@@ -45,6 +45,7 @@
 [2026-08-15] Pre-flight: fixed pre-existing pre-commit hook GIT_DIR-leak defect (scripts/git-hooks/pre-commit) that blocked all commits and had corrupted shared core.bare=true; repaired shared config; committed c6933b8. Orthogonal to #165/#139; user decision: fix hook source now.
 [2026-08-15] G2: REQUIREMENTS approved (10 FR / 6 NFR; 5 OQ deferred to Design); user decision: approve & proceed.
 [2026-08-15] G3: DESIGN approved — foundation-first, 8 chunks; artifact set = baseline + DECISIONS.md + light README; OQ-1..OQ-5 resolved as Option A; ARCHITECTURE.md ruled out; user decision: approve all + DECISIONS.md + light README.
+[2026-08-15] G4: TEST.md approved (18 TC / all FR-NFR traced; git-as-backup; inference-eval ruled out; TC-17 vendor-grep gate); user decision: approve & proceed to implementation.
 [2026-08-15] Foundation decision: role schema references (C3/C-ROLES) — rework if standalone would be significant because every role would reference a schema doc that does not yet exist. Decision: C1 (C-RS schema doc) precedes.
 [2026-08-15] Foundation decision: read-packet-first semantics (C4/C-ORCH) — rework if standalone would be significant because the semantics describe template sections that must exist to be read. Decision: C2 (C-TPL template sections) precedes.
 [2026-08-15] Foundation decision: #139 elicitation wiring (C6/C-KICK) — rework if standalone would be significant because the phase recipe invokes the deterministic generator; eliciting into LLM-written YAML would violate dev-principle #5. Decision: C5 (C-PROF generator) precedes.
@@ -54,8 +55,8 @@
 <!-- Append-only table. -->
 | # | Title | Files | Dev model | Status | Started | Ended |
 |---|---|---|---|---|---|---|
-| 1 | Canonical return-schema convention doc (C-RS) | conventions/subagent-return-schema.md | _tbd_ | pending | | |
-| 2 | Resume packet + Decisions-locked template sections (C-TPL) | templates/SUPERHUMAN.md.tpl | _tbd_ | pending | | |
+| 1 | Canonical return-schema convention doc (C-RS) | conventions/subagent-return-schema.md, tests/test_content.py, tests/test_structure.py | sonnet | done (361331e) | 2026-08-15 | 2026-08-15 |
+| 2 | Resume packet + Decisions-locked template sections (C-TPL) | templates/SUPERHUMAN.md.tpl, tests/test_content.py | sonnet | done (9542ee9) | 2026-08-15 | 2026-08-15 |
 | 3 | Thread canonical schema through all roles (C-ROLES) | roles/*.md (7) | _tbd_ | pending | | |
 | 4 | Orchestration semantics + backward-compat (C-ORCH) | SKILL.md, roles/pm.md | _tbd_ | pending | | |
 | 5 | Profile models: generator + schema normalization (C-PROF) | scripts/superhuman_profile.py | _tbd_ | pending | | |
