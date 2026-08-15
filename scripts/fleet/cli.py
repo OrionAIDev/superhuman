@@ -45,6 +45,7 @@ from .handoff import emit as handoff_emit
 from .handoff import extract_handoff_id
 from .handoff import self_register as handoff_self_register
 from .handoff import stale_report
+from .view import render_status_table, write_fleet_md
 
 #: `fleet --version` output. Not tied to `VERSION` at the skill root — this
 #: is the manifest CLI's own schema-facing version, matching `schema_version`
@@ -794,6 +795,56 @@ def _cmd_query_edges(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Handle `fleet status` (PLAN.md Chunk 6, FR-7/CC-7).
+
+    Prints the read-only session/status/edges table to stdout. Read-only:
+    `view.render_status_table` reads exclusively via `core/query` and never
+    writes the manifest.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — a read-only view has nothing to reject.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+
+    table = render_status_table(sessions_dir, log_path, project_id=args.project_id)
+    print(table)
+    return 0
+
+
+def _cmd_gen_view(args: argparse.Namespace) -> int:
+    """Handle `fleet gen-view` (PLAN.md Chunk 6, DESIGN "Decision A").
+
+    Writes/refreshes `docs/superhuman/<slug>/FLEET.md` — a generated DOC,
+    not the manifest (FR-7/CC-7's prohibition is on writing `events.jsonl` /
+    fragments / `.lock`, which this never touches).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — generating a read-only view has nothing to reject.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+    sessions_dir = fleet_dir / "sessions"
+
+    target = write_fleet_md(
+        sessions_dir,
+        log_path,
+        slug=args.slug,
+        workspace=args.workspace,
+        project_id=args.project_id,
+    )
+    print(f"wrote {target}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `fleet` argument parser.
 
@@ -883,6 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_handoff_subparsers(subparsers)
     _add_done_subparsers(subparsers)
     _add_query_subparsers(subparsers)
+    _add_view_subparsers(subparsers)
 
     return parser
 
@@ -1151,6 +1203,56 @@ def _add_query_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
     )
     edges_parser.set_defaults(func=_cmd_query_edges)
+
+
+def _add_view_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `status` and `gen-view` subcommands (PLAN.md Chunk 6, FR-7/CC-7).
+
+    Both are top-level subcommands (not nested under a group, unlike
+    `handoff`/`done`/`query`) — each is a single read-only action, matching
+    DESIGN's component table naming `status`/`gen-view` directly.
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    status_parser = subparsers.add_parser(
+        "status", help="Print every tracked session's status fields + dependency edges."
+    )
+    status_parser.add_argument("--workspace", required=True, type=Path)
+    status_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    status_parser.add_argument(
+        "--project-id",
+        default=None,
+        help="only show sessions with this exact project_id (default: all)",
+    )
+    status_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    status_parser.set_defaults(func=_cmd_status)
+
+    gen_view_parser = subparsers.add_parser(
+        "gen-view",
+        help="Write/refresh docs/superhuman/<slug>/FLEET.md (DESIGN Decision A).",
+    )
+    gen_view_parser.add_argument("--workspace", required=True, type=Path)
+    gen_view_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    gen_view_parser.add_argument(
+        "--project-id",
+        default=None,
+        help="only include sessions with this exact project_id (default: all)",
+    )
+    gen_view_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    gen_view_parser.set_defaults(func=_cmd_gen_view)
 
 
 def main(argv: list[str] | None = None) -> int:
