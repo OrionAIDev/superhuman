@@ -2,8 +2,8 @@
 
 Read-only: nothing here ever writes the manifest. `list_sessions()` is fully
 implemented in Chunk 1 (it is what proves `project_id` equality-grouping,
-G3-1). `edges_of()` is a documented stub — its real implementation lands
-with `core/edges.py` (Chunk 4); Chunk 1 has no edge data to query yet.
+G3-1). `edges_of()` lands in this chunk (Chunk 4) — a thin filter over
+`core.edges.resolve_graph()`.
 
 `stale_handoffs()` lands in this chunk (Chunk 3). It answers "which
 `awaiting-launch` rows are past expiry" from the manifest **alone** — no
@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .edges import resolve_graph
 from .events import read_all
 from .schema import Fragment
 from .store import iter_fragments
@@ -51,17 +52,28 @@ def list_sessions(sessions_dir: Path | str, project_id: str | None = None) -> li
     return [f for f in fragments if f.project_id == project_id]
 
 
-def edges_of(node_id: str) -> list[dict[str, Any]]:
-    """Return the dependency edges touching `node_id`.
+def edges_of(node_id: str, log_path: Path | str) -> list[dict[str, Any]]:
+    """Return the dependency edges touching `node_id` (DESIGN §5).
+
+    A thin filter over `core.edges.resolve_graph()` — the resolved graph
+    already excludes any edge that would close a cycle (FR-4), so nothing
+    extra needs to happen here.
 
     Args:
         node_id: the node to query.
+        log_path: path to the project's event log.
 
-    Raises:
-        NotImplementedError: `core/edges.py` (Chunk 4) has not landed yet.
-            There is no edge data for Chunk 1 to query.
+    Returns:
+        list[dict[str, Any]]: one dict per matching edge (`src`, `type`,
+        `dst`, `source`, `evidence`) where `node_id` is either endpoint.
+        `evidence` is a copy, safe for a caller to mutate.
     """
-    raise NotImplementedError("edges_of() is implemented in Chunk 4 (core/edges.py)")
+    graph = resolve_graph(log_path)
+    return [
+        {"src": e.src, "type": e.type, "dst": e.dst, "source": e.source, "evidence": dict(e.evidence)}
+        for e in graph.edges
+        if e.src == node_id or e.dst == node_id
+    ]
 
 
 def _parse_ts(ts: str) -> datetime:

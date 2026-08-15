@@ -23,9 +23,11 @@ from uuid import uuid4
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
+from .core.edges import resolve_graph
 from .core.errors import LockTimeoutError, OwnershipError, ValidationError
 from .core.events import append
 from .core.projection import project_event
+from .core.query import edges_of
 from .core.schema import Event, Fragment, validate_event
 from .core.store import read_fragment
 from .handoff import cancel as handoff_cancel
@@ -523,6 +525,44 @@ def _cmd_handoff_self_register(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_query_edges(args: argparse.Namespace) -> int:
+    """Handle `fleet query edges` (PLAN.md Chunk 4).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — a read-only query has nothing to reject.
+    """
+    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    log_path = fleet_dir / "events.jsonl"
+
+    if args.node:
+        edges = edges_of(args.node, log_path)
+    else:
+        graph = resolve_graph(log_path)
+        edges = [
+            {
+                "src": e.src,
+                "type": e.type,
+                "dst": e.dst,
+                "source": e.source,
+                "evidence": dict(e.evidence),
+            }
+            for e in graph.edges
+        ]
+
+    if not edges:
+        print("no edges")
+        return 0
+    for edge in edges:
+        print(
+            f"{edge['src']} --{edge['type']}--> {edge['dst']}  "
+            f"source={edge['source']}  evidence={edge['evidence']}"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `fleet` argument parser.
 
@@ -610,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_parser.set_defaults(func=_cmd_register)
 
     _add_handoff_subparsers(subparsers)
+    _add_query_subparsers(subparsers)
 
     return parser
 
@@ -791,6 +832,33 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     self_register_parser.set_defaults(func=_cmd_handoff_self_register)
+
+
+def _add_query_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `query edges` subcommand (PLAN.md Chunk 4).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    query_parser = subparsers.add_parser("query", help="Read-side queries over the manifest.")
+    query_subparsers = query_parser.add_subparsers(dest="query_command", required=True)
+
+    edges_parser = query_subparsers.add_parser(
+        "edges", help="List dependency edges, optionally filtered to one node."
+    )
+    edges_parser.add_argument("--workspace", required=True, type=Path)
+    edges_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    edges_parser.add_argument(
+        "--node", default=None, help="only show edges touching this node id"
+    )
+    edges_parser.add_argument(
+        "--fleet-dir",
+        type=Path,
+        default=None,
+        help="override the fleet manifest directory "
+        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+    )
+    edges_parser.set_defaults(func=_cmd_query_edges)
 
 
 def main(argv: list[str] | None = None) -> int:
