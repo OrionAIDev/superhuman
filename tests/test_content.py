@@ -558,6 +558,98 @@ def test_decisions_locked_distinct_from_decisions_log(skill_root: Path) -> None:
     assert "Decisions log" in sections, "template missing '## Decisions log' section"
 
 
+def test_orch_documents_read_packet_first_and_refresh(skill_root: Path) -> None:
+    """SKILL.md and/or pm.md document read-packet-first resume + refresh-at-each-gate (FR-2).
+
+    On resume, the PM must read the '## Resume packet' FIRST as the single
+    always-current entry point before reconstructing from the logs; the PM must
+    also refresh (keep current) the packet at every gate — not merely append to
+    it. This extends the existing resume path (HARD-GATE step 1 in SKILL.md); it
+    does not replace it.
+    """
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined = skill_text + "\n" + pm_text
+    lower = combined.lower()
+
+    assert "resume packet" in lower, (
+        "SKILL.md and/or pm.md must reference the '## Resume packet' section on resume"
+    )
+    assert "first" in lower and "resume packet" in lower, (
+        "must document reading the Resume packet FIRST on resume"
+    )
+    assert "refresh" in lower, (
+        "must document that the PM refreshes the Resume packet at every gate"
+    )
+    assert "kept-current" in lower or "kept current" in lower, (
+        "must state the packet is kept-current (not append-only) at every gate"
+    )
+
+
+def test_orch_documents_locked_not_relitigated(skill_root: Path) -> None:
+    """SKILL.md and/or pm.md document locked-decisions-not-relitigated semantics (FR-7).
+
+    A decision in '## Decisions locked' must not be relitigated/reopened on
+    resume; changing one requires an explicit surfaced action (a gate or a
+    drift entry) — never a silent edit. This is distinct from the append-only
+    '## Decisions log'.
+    """
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined = skill_text + "\n" + pm_text
+    lower = combined.lower()
+
+    assert "decisions locked" in lower, (
+        "SKILL.md and/or pm.md must reference the '## Decisions locked' section"
+    )
+    assert "relitigat" in lower or "reopen" in lower, (
+        "must document that locked decisions are not relitigated/reopened on resume"
+    )
+    assert "silent edit" in lower, (
+        "must document that changing a locked decision is never a silent edit"
+    )
+    assert "drift" in lower and ("gate" in lower), (
+        "must document that changing a locked decision requires a surfaced gate/drift event"
+    )
+
+
+def test_backward_compat_fixture_resumes_without_error(skill_root: Path) -> None:
+    """A pre-existing SUPERHUMAN.md lacking the new sections still resumes cleanly (NFR-2).
+
+    Resume is prose/PM-judgment — there is no resume script to call — so this is
+    a presence assertion on the documented rule plus a durable regression-anchor
+    fixture. The fixture has a structurally VALID '## Decisions log' (the
+    HARD-GATE validity check would pass) but lacks both '## Resume packet' and
+    '## Decisions locked'. SKILL.md and/or pm.md must explicitly document that
+    absence of the new sections is treated as empty, never as corruption.
+    """
+    fixture_path = skill_root / "tests" / "fixtures" / "superhuman_legacy_no_resume_packet.md"
+    assert fixture_path.is_file(), "missing backward-compat fixture superhuman_legacy_no_resume_packet.md"
+    fixture_text = fixture_path.read_text(encoding="utf-8")
+
+    # Fixture has a valid Decisions log per the HARD-GATE rule (G<digit> + 'user decision:').
+    assert "## Decisions log" in fixture_text
+    assert re.search(r"G\d+:.*user decision:", fixture_text), (
+        "fixture must contain a G<n> entry with a 'user decision:' field so the "
+        "HARD-GATE validity check would pass"
+    )
+    # Fixture genuinely lacks the two new sections.
+    assert "## Resume packet" not in fixture_text
+    assert "## Decisions locked" not in fixture_text
+
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined_lower = (skill_text + "\n" + pm_text).lower()
+
+    assert "not as corruption" in combined_lower or "never as corruption" in combined_lower, (
+        "SKILL.md and/or pm.md must state that absent new sections are treated as "
+        "empty, not corruption"
+    )
+    assert "treated as empty" in combined_lower, (
+        "SKILL.md and/or pm.md must explicitly say the absent sections are 'treated as empty'"
+    )
+
+
 def test_skill_md_has_autonomous_progression_rule(skill_root: Path) -> None:
     """SKILL.md must include the autonomous-phase-progression cross-cutting rule.
 

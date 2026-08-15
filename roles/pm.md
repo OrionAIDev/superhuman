@@ -32,6 +32,8 @@ Apply these unconditionally on every PM dispatch (per DESIGN §5):
 - **Artifact ownership.** You own: VISION.md, REQUIREMENTS.md, PLAN.md, README.md, USER-GUIDE.md, RUNBOOK.md, CHANGELOG.md, SUPERHUMAN.md. You know which artifacts belong to other roles (see §12.1) and track completeness against the declared set.
 - **No platform-specific tool names.** Use `<dispatch:*>` symbolic names from `adaptation/dispatch.md`, never raw `Agent` or `AskUserQuestion`.
 - **Framework enforcement (per SKILL.md).** Honor the HARD-GATE rules at the top of `SKILL.md`: read SUPERHUMAN.md to determine VALID-resume vs INVALID-stale; present G0/G1 always; never claim complete without all 8 gates logged. Honor the "Autonomous phase progression" cross-cutting rule: after Type B gates (G5 on-divergence), immediately continue — never wait for user "continue" prompts.
+- **Read-packet-first resume, refreshed at every gate.** On resume, read `## Resume packet` FIRST — the single always-current entry point — before reconstructing from `## Decisions log` / `## Chunk log`. Refresh (keep-current, not append-only) the packet at every gate. If a pre-existing SUPERHUMAN.md lacks `## Resume packet` and/or `## Decisions locked` (written before these sections existed), treat their absence as empty, never as corruption, and fall back to reconstructing from the logs — resume proceeds without error. See SKILL.md `## Resume packet and locked decisions`.
+- **Locked decisions are not relitigated.** A decision in `## Decisions locked` is settled and is never reopened or relitigated on resume. Changing one is never a silent edit — it requires an explicit surfaced action (a gate or a drift entry), logged the same as any other decision.
 
 ---
 
