@@ -444,6 +444,22 @@ def load_profile(path: Path | None) -> Profile:
         if bad:
             raise ProfileError(f"rung {name!r}: unknown detector(s) {sorted(bad)}")
 
+        labels = entry.get("labels") or {}
+        if not isinstance(labels, dict):
+            # #R6-2 (PM-reproduced, BLOCKING): unlike `detect` above, `labels`
+            # was never validated as a mapping. A scalar `labels: D0-code`
+            # loaded cleanly and produced a `Rung` whose `labels` was the
+            # *string* `"D0-code"` — downstream, `cli._resolve_d_ceiling`'s
+            # `_D_CEILING_LABEL_KEY not in resolution.stage.labels` then ran
+            # as a substring test against that string instead of a mapping
+            # membership test, silently granting the unrestricted D4-prod
+            # default rather than failing closed. Rejected here, at the LOAD
+            # boundary, so every downstream consumer of `labels` is
+            # protected, not just `_resolve_d_ceiling` — mirroring the
+            # `detect` check immediately above. Absent `labels` is still
+            # valid (a rung need not declare any).
+            raise ProfileError(f"rung {name!r}: 'labels' must be a mapping")
+
         merged = {**default_approvals, **(entry.get("approvals") or {})}
         approvals: dict[str, Approval] = {}
         for action in ACTION_CLASSES:
@@ -459,7 +475,7 @@ def load_profile(path: Path | None) -> Profile:
             Rung(
                 name=name,
                 kind=entry.get("kind"),
-                labels=entry.get("labels") or {},
+                labels=labels,
                 detect=detect,
                 approvals=approvals,
                 tests=tuple(entry.get("tests") or ()),

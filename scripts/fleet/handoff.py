@@ -364,12 +364,31 @@ def _open_awaiting_launch_rows(
     `core.projection.rebuild()` from the log (the source of truth) before
     retrying once — the same recover-not-guess contract every other
     decision-driving fragment read in this module follows.
+
+    Nor must a corrupt cached fragment crash this decision when it has
+    nothing to do with it (#R6-1, GPT-5 round-6, BLOCKING, PM-reproduced):
+    `rebuild()` only rewrites fragments backed by a log event — it cannot
+    remove or fix an *orphan* fragment file (no matching `handoff_emitted`
+    event in the log at all, e.g. dropped in by an external process). Such
+    an orphan is still corrupt after the rebuild, so a naive retry with
+    `skip_corrupt=False` re-raises `FragmentCorrupt` and crashes an
+    otherwise-legitimate fuzzy `self_register` that never touches it. The
+    retry below therefore uses `skip_corrupt=True`: any fragment still
+    corrupt AFTER a full `rebuild()` is *provably* an orphan, because
+    `rebuild()` rewrites every log-backed node to a valid, readable
+    fragment — and an orphan, being not log-backed, can never be the
+    awaiting-launch row being matched here (that row is always reachable
+    via its own `handoff_emitted` event, read separately below). Skipping
+    post-rebuild corrupt files therefore drops only proven non-candidates —
+    it does not reintroduce the P5-2 silent-drop of a real, log-backed
+    awaiting-launch row, since a real row is always rebuilt to a valid
+    fragment and never lands in the skipped set.
     """
     try:
         current_fragments = iter_fragments(sessions_dir, skip_corrupt=False)
     except FragmentCorrupt:
         rebuild(log_path, sessions_dir)
-        current_fragments = iter_fragments(sessions_dir, skip_corrupt=False)
+        current_fragments = iter_fragments(sessions_dir, skip_corrupt=True)
 
     open_node_ids = {f.node_id for f in current_fragments if f.lifecycle == "awaiting-launch"}
     if not open_node_ids:

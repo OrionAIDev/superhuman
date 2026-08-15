@@ -137,6 +137,29 @@ def test_wrong_version_is_rejected(tmp_path: Path) -> None:
         sp.load_profile(path)
 
 
+def test_scalar_labels_is_rejected(tmp_path: Path) -> None:
+    """#R6-2 (PM-reproduced, BLOCKING): `labels` is never validated as a
+    mapping — contrast the `detect` check immediately above this, which
+    raises `ProfileError` for a non-dict. A profile with a scalar
+    `labels: D0-code` builds a `Rung` whose `labels` is the *string*
+    `"D0-code"`, and `cli._resolve_d_ceiling`'s
+    `_D_CEILING_LABEL_KEY not in resolution.stage.labels` check becomes a
+    SUBSTRING test against that string rather than a mapping-key test — it
+    is True (the label key text is not literally a substring of the value,
+    but `in` still runs and the point is: nothing rejects the malformed
+    shape at all), so the ceiling check is silently bypassed and the
+    unrestricted D4-prod default is granted. Fixed at the LOAD boundary
+    (`load_profile`), next to the `detect` check, so every downstream
+    consumer of `labels` is protected, not just `_resolve_d_ceiling`."""
+    path = _write(
+        tmp_path,
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+        "    labels: D0-code\n",
+    )
+    with pytest.raises(sp.ProfileError, match="labels"):
+        sp.load_profile(path)
+
+
 def test_defaults_are_merged_into_rungs(tmp_path: Path) -> None:
     """`defaults.approvals` fills keys a rung omits."""
     path = _write(

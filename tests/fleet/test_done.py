@@ -1502,6 +1502,39 @@ class TestCliDoneAdvanceSubcommand:
         with pytest.raises(ValueError):
             _resolve_d_ceiling(workspace)
 
+    def test_resolve_d_ceiling_fails_closed_for_scalar_labels_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#R6-2 (PM-reproduced, BLOCKING): pre-fix, a profile with a scalar
+        `labels: D0-code` (not a mapping) loaded cleanly and produced a Rung
+        whose `labels` was the string `"D0-code"`; `_resolve_d_ceiling`'s
+        `_D_CEILING_LABEL_KEY not in resolution.stage.labels` then ran as a
+        substring test against that string rather than raising, and silently
+        returned the unrestricted `D4-prod` default — a promotion-control
+        fail-open reachable via a normal `fleet done advance`. Post-fix,
+        `load_profile` rejects the scalar `labels` at load time, so this
+        raises `ValueError` (fail closed) via the existing
+        `ProfileError`->`ValueError` path, exactly like the #N3/#F5 cases
+        above."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text(
+            "version: 1\n"
+            "ladder:\n"
+            "  - name: work\n"
+            "    detect:\n"
+            "      default: true\n"
+            "    labels: D0-code\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+
+        with pytest.raises(ValueError):
+            _resolve_d_ceiling(workspace)
+
 
 class TestCliDoneAdvanceRecoversFromCorruptCachedFragment:
     """G5 round-5 (eliminate-the-class fix, #P4-1/#P4-2).

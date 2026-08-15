@@ -1455,3 +1455,61 @@ class TestCorruptCachedFragmentRecovery:
         )
 
         assert result.status == "not_found"
+
+    def test_fuzzy_self_register_survives_orphan_corrupt_fragment_after_rebuild(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """#R6-1 (PM-reproduced): a corrupt fragment with NO matching log
+        event (an orphan — e.g. dropped in by an external process) survives
+        `rebuild()` unchanged, since `rebuild()` only rewrites log-backed
+        nodes. Pre-fix, `_open_awaiting_launch_rows`'s post-rebuild retry
+        used `skip_corrupt=False` and re-raised `FragmentCorrupt` on this
+        orphan, crashing an otherwise-legitimate fuzzy `self_register` that
+        has nothing to do with the orphan. Post-fix, the retry uses
+        `skip_corrupt=True` — an orphan can never be the awaiting-launch row
+        being matched (that row is always log-backed), so skipping it after
+        a full rebuild drops only a proven non-candidate."""
+        log_path, sessions_dir = fleet_dir
+        _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-legit")
+
+        orphan_path = sessions_dir / "zzz-orphan.json"
+        orphan_path.write_bytes(b"\xff\xfe not json")
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "launched"
+        assert result.match_method == "fuzzy"
+        events = read_all(log_path)
+        assert len([e for e in events if e.type == "handoff_launched"]) == 1
+
+    def test_fuzzy_self_register_still_resolves_log_backed_corrupt_row_after_r6_1_fix(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """Regression guard for #R6-1: the fix to `_open_awaiting_launch_rows`
+        (post-rebuild retry now uses `skip_corrupt=True`) must not reintroduce
+        the P5-2 silent-drop of a REAL, log-backed awaiting-launch row —
+        `rebuild()` always rewrites a log-backed node to a valid, readable
+        fragment, so this case never hits the post-rebuild skip path at all."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-real-row")
+        _corrupt_fragment(emission.node_id, sessions_dir)
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "launched"
+        assert result.node_id == emission.node_id
+        assert result.match_method == "fuzzy"
