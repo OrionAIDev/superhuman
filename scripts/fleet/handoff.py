@@ -39,10 +39,10 @@ from typing import Any
 from uuid import uuid4
 
 from .adapter.base import HANDOFF_ID_LINE_PREFIX, SessionAdapter, workspace_component
-from .core.errors import LockTimeoutError, PreconditionUnmet
+from .core.errors import FragmentCorrupt, LockTimeoutError, PreconditionUnmet
 from .core.events import append, read_all
 from .core.nodes import make_node_id
-from .core.projection import project_event
+from .core.projection import project_event, rebuild
 from .core.query import stale_handoffs
 from .core.schema import Event, Fragment, validate_event
 from .core.store import iter_fragments, read_fragment
@@ -264,7 +264,11 @@ def emit(
 
     Returns:
         HandoffEmission: the minted id, the intent row's node id, and the
-        prompt with the handoff-id line embedded.
+        prompt with the handoff-id line embedded. Returned even if the
+        node's cached fragment was found corrupt on disk and had to be
+        recovered via `core.projection.rebuild()` (G5 round-5, #P4-1/#P4-2)
+        — the event is already durably appended to the log by this point,
+        so a corrupt fragment cache is recovered, never fatal.
 
     Raises:
         ValidationError: if the built event fails schema validation.
@@ -301,7 +305,13 @@ def emit(
         # anyway so the fragment is guaranteed to exist (matches
         # cli.register_session's precedent for the same situation).
         appended = validate_event(event_dict)
-    project_event(appended, sessions_dir)
+    try:
+        project_event(appended, sessions_dir)
+    except FragmentCorrupt:
+        # G5 round-5 (#P4-1/#P4-2): recover via full replay rather than
+        # letting `project_event` guess at a partial fragment — `appended`
+        # is already durably in the log by this point.
+        rebuild(log_path, sessions_dir, project_id=project_id)
 
     emitted_prompt = adapter.emit_prompt(prompt_text, minted_id)
     return HandoffEmission(handoff_id=minted_id, node_id=node_id, prompt_text=emitted_prompt)
@@ -502,7 +512,13 @@ def self_register(
             retries.
 
     Returns:
-        SelfRegisterResult: see the class docstring for the status vocabulary.
+        SelfRegisterResult: see the class docstring for the status
+        vocabulary. A `"launched"` result is still returned even if the
+        node's cached fragment was found corrupt on disk and had to be
+        recovered via `core.projection.rebuild()` (G5 round-5,
+        #P4-1/#P4-2) — the launch event is already durably appended to the
+        log by that point, so a corrupt fragment cache is recovered, never
+        fatal.
 
     Raises:
         ValueError: if `handoff_id` is given but no `handoff_emitted` event
@@ -594,7 +610,12 @@ def self_register(
             status="already_launched", node_id=node_id, match_method=match_method
         )
 
-    project_event(appended, sessions_dir)
+    try:
+        project_event(appended, sessions_dir)
+    except FragmentCorrupt:
+        # G5 round-5 (#P4-1/#P4-2): recover via full replay — `appended` is
+        # already durably in the log by this point.
+        rebuild(log_path, sessions_dir, project_id=current.project_id)
     return SelfRegisterResult(status="launched", node_id=node_id, match_method=match_method)
 
 
@@ -629,7 +650,12 @@ def cancel(
             retries.
 
     Returns:
-        Fragment: the row's fragment after the cancel is applied.
+        Fragment: the row's fragment after the cancel is applied. Correct
+        even if the cached fragment was found corrupt on disk and had to
+        be recovered via `core.projection.rebuild()` (G5 round-5,
+        #P4-1/#P4-2) — the cancel event is already durably appended to the
+        log by that point, so a corrupt fragment cache is recovered, never
+        fatal.
 
     Raises:
         ValidationError: if the built event fails schema validation.
@@ -653,12 +679,21 @@ def cancel(
         log_path, event_dict, attempts=lock_retry_attempts, backoff=lock_retry_backoff
     )
     if appended is None:
-        existing = read_fragment(node_id, sessions_dir)
+        try:
+            existing = read_fragment(node_id, sessions_dir)
+        except FragmentCorrupt:
+            existing = None
         if existing is not None:
             return existing
         appended = validate_event(event_dict)
 
-    return project_event(appended, sessions_dir)
+    try:
+        return project_event(appended, sessions_dir)
+    except FragmentCorrupt:
+        # G5 round-5 (#P4-1/#P4-2): recover via full replay — `appended` is
+        # already durably in the log by this point.
+        fragments = rebuild(log_path, sessions_dir, project_id=project_id)
+        return fragments[node_id]
 
 
 def _resolve_handoff_expiry_seconds(profile_path: Path | None = None) -> float:

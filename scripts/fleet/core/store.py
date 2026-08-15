@@ -36,7 +36,7 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import quote
 
-from .errors import ValidationError
+from .errors import FragmentCorrupt, ValidationError
 from .schema import Fragment, validate_fragment
 
 #: Above this length, the readable percent-encoded filename risks the
@@ -136,6 +136,36 @@ def write_fragment(fragment: Fragment, sessions_dir: Path | str) -> None:
                 pass
 
 
+def _read_fragment_file(path: Path) -> Fragment:
+    """Read and validate one fragment file that is known to exist.
+
+    The single place that turns "any failure to produce a valid `Fragment`
+    from an existing file" into one uniform typed error — undecodable bytes
+    (`UnicodeDecodeError`), unparseable JSON (`json.JSONDecodeError`),
+    schema-invalid content (`ValidationError`), or an unreadable file
+    (`OSError`, e.g. permissions) all collapse to `FragmentCorrupt` here, so
+    every caller (`read_fragment`, `iter_fragments`) has exactly one
+    exception type to handle instead of four.
+
+    Args:
+        path: the fragment file path. Caller is responsible for having
+            already established the file exists — this function does not
+            distinguish "absent" from "corrupt," only "corrupt."
+
+    Returns:
+        Fragment: the validated fragment.
+
+    Raises:
+        FragmentCorrupt: if the file cannot be decoded as UTF-8, parsed as
+            JSON, validated against the fragment schema, or read at all.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return validate_fragment(data)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, OSError) as exc:
+        raise FragmentCorrupt(f"corrupt fragment file: {path}") from exc
+
+
 def read_fragment(node_id: str, sessions_dir: Path | str) -> Fragment | None:
     """Read the fragment for `node_id`, or `None` if it does not exist.
 
@@ -145,20 +175,20 @@ def read_fragment(node_id: str, sessions_dir: Path | str) -> Fragment | None:
 
     Returns:
         Fragment | None: the validated fragment, or `None` if no fragment
-        file exists for `node_id`.
+        file exists for `node_id`. A genuinely absent file is not an error.
 
     Raises:
-        ValidationError: if the fragment file exists but fails schema
-            validation (e.g. corrupt or wrong schema version). Callers that
-            need to tolerate a corrupt fragment should use
-            `core/projection.py`'s rebuild path instead of catching this
-            directly.
+        FragmentCorrupt: if the fragment file EXISTS but cannot be read as
+            a valid `Fragment` — undecodable bytes, unparseable JSON,
+            schema-invalid content, or an unreadable file. The log
+            (`events.jsonl`) remains the source of truth; callers that need
+            to recover should call `core.projection.rebuild()`, not catch
+            this and improvise a partial fragment.
     """
     path = fragment_path(node_id, sessions_dir)
     if not path.is_file():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return validate_fragment(data)
+    return _read_fragment_file(path)
 
 
 def iter_fragments(sessions_dir: Path | str, *, skip_corrupt: bool = True) -> list[Fragment]:
@@ -177,12 +207,10 @@ def iter_fragments(sessions_dir: Path | str, *, skip_corrupt: bool = True) -> li
         list[Fragment]: every readable fragment, in filename order.
 
     Raises:
-        json.JSONDecodeError: if `skip_corrupt` is False and a fragment file
-            is not valid JSON.
-        ValidationError: if `skip_corrupt` is False and a fragment file's
-            content fails schema validation.
-        OSError: if `skip_corrupt` is False and a fragment file cannot be
-            read.
+        FragmentCorrupt: if `skip_corrupt` is False and a fragment file
+            cannot be read as a valid `Fragment` (undecodable bytes,
+            unparseable JSON, schema-invalid content, or an unreadable
+            file).
     """
     sessions_dir = Path(sessions_dir)
     if not sessions_dir.is_dir():
@@ -191,9 +219,8 @@ def iter_fragments(sessions_dir: Path | str, *, skip_corrupt: bool = True) -> li
     fragments: list[Fragment] = []
     for path in sorted(sessions_dir.glob("*.json")):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            fragments.append(validate_fragment(data))
-        except (json.JSONDecodeError, ValidationError, OSError):
+            fragments.append(_read_fragment_file(path))
+        except FragmentCorrupt:
             if skip_corrupt:
                 continue
             raise

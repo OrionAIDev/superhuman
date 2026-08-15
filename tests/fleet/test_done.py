@@ -1501,3 +1501,231 @@ class TestCliDoneAdvanceSubcommand:
 
         with pytest.raises(ValueError):
             _resolve_d_ceiling(workspace)
+
+
+class TestCliDoneAdvanceRecoversFromCorruptCachedFragment:
+    """G5 round-5 (eliminate-the-class fix, #P4-1/#P4-2).
+
+    A 4th GPT-5 review round found two BLOCKING findings that converge to
+    one root cause: `project_event`'s corrupt-cached-fragment recovery was
+    incomplete. `#P4-1` — it only caught `ValidationError`/
+    `json.JSONDecodeError`; a non-UTF-8 or unreadable cached fragment still
+    crashed with an uncaught exception. `#P4-2` (the important one) — even
+    when it did catch the corruption, it silently reset every status field
+    the triggering event's own payload does not mention (a
+    `done_level_advanced` event carries only done/evidence/approver, so a
+    node's `block_state`/`review_state`/`adoption_state` would be quietly
+    reset to their registration defaults — silent state loss).
+
+    The fix: `project_event` no longer guesses. On a corrupt EXISTING
+    cached fragment it raises `core.errors.FragmentCorrupt` and leaves
+    recovery to the caller. `fleet done advance` (`cli._cmd_done_advance`)
+    now catches `FragmentCorrupt` and recovers via
+    `core.projection.rebuild()` — a full, correct, all-fields
+    reconstruction from the log, since the just-appended transition event
+    is already durably recorded there by the time projection runs.
+    """
+
+    def _parser_args(self, workspace: Path, fleet_dir: Path, target: str, **extra: str):
+        from scripts.fleet.cli import build_parser
+
+        argv = [
+            "done",
+            "advance",
+            "--node-id",
+            _NODE,
+            "--target-level",
+            target,
+            "--project-id",
+            _PROJECT_ID,
+            "--slug",
+            "demo-slug",
+            "--workspace",
+            str(workspace),
+            "--writer-role",
+            _WRITER_ROLE,
+            "--fleet-dir",
+            str(fleet_dir),
+        ]
+        for flag, value in extra.items():
+            argv.extend([f"--{flag.replace('_', '-')}", value])
+        return build_parser().parse_args(argv)
+
+    def _block_the_node(self, log_path: Path) -> None:
+        """Append a `block_changed` event directly, independent of `advance()` —
+        `block_state` is a separate status field `core/done.py` never
+        touches, so this is the only way to put the node in a non-default
+        blocked state for the test."""
+        from scripts.fleet.core.events import append
+
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "eid-block",
+                "idempotency_key": f"block:{_NODE}",
+                "ts": "2026-08-15T00:00:00.000000Z",
+                "type": "block_changed",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"block_state": "blocked"},
+            },
+        )
+
+    def _corrupt_the_cached_fragment(self, sessions_dir: Path, *, non_utf8: bool = False) -> None:
+        from scripts.fleet.core.store import fragment_path
+
+        path = fragment_path(_NODE, sessions_dir)
+        if non_utf8:
+            path.write_bytes(b"\xff\xfe garbage not utf-8")
+        else:
+            path.write_text('{"node_id": "portable/ws/proj/x", "lifecy', encoding="utf-8")
+
+    def test_p4_2_recovered_fragment_keeps_block_state_not_reset_to_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The important one. Pre-fix, this fails: the recovered fragment's
+        `block_state` comes back `"unblocked"` (the registration default)
+        instead of the log's true `"blocked"`, because the old
+        `_fresh_fragment(event)` fallback only applied the triggering
+        `done_level_advanced` event's own fields (done/evidence/approver)
+        and defaulted everything else — silently discarding the
+        `block_changed` event that came before it in the log."""
+        from scripts.fleet.core.projection import rebuild
+        from scripts.fleet.core.store import read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        log_path = fleet_dir / "events.jsonl"
+        sessions_dir = fleet_dir / "sessions"
+
+        # Block the node, then legitimately advance it to D1-merged —
+        # both facts must survive the recovery below.
+        self._block_the_node(log_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+        assert read_fragment(_NODE, sessions_dir).block_state == "blocked"  # sanity
+
+        self._corrupt_the_cached_fragment(sessions_dir)
+
+        # A legitimate D2-test advance through the CLI — the caller path
+        # under test.
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(
+            json.dumps({"deploy_id": "dep-1", "ci_run": "ci-1"}), encoding="utf-8"
+        )
+        args = self._parser_args(
+            workspace, fleet_dir, "D2-test", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 0
+        recovered = read_fragment(_NODE, sessions_dir)
+        assert recovered is not None
+        assert recovered.done_level == "D2-test"
+        assert recovered.block_state == "blocked", (
+            "corrupt-cached-fragment recovery silently reset block_state to "
+            "its default instead of recovering it from the log (#P4-2)"
+        )
+
+        # Property: the recovered fragment agrees with a from-scratch
+        # rebuild() on every status field, not just the ones this test
+        # happens to assert on individually.
+        expected = rebuild(log_path, tmp_path / "sessions-expected", project_id=_PROJECT_ID)[
+            _NODE
+        ]
+        assert recovered.lifecycle == expected.lifecycle
+        assert recovered.block_state == expected.block_state
+        assert recovered.review_state == expected.review_state
+        assert recovered.adoption_state == expected.adoption_state
+        assert recovered.done_level == expected.done_level
+
+    def test_p4_1_non_utf8_cached_fragment_recovers_without_crashing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pre-fix, this fails: `read_fragment` does `path.read_text(encoding
+        ="utf-8")` before `json.loads` ever runs, so undecodable bytes raise
+        an uncaught `UnicodeDecodeError` — a case the old
+        `except (ValidationError, json.JSONDecodeError)` in `project_event`
+        never covered — crashing `fleet done advance` with a traceback
+        instead of a clean exit, even though the transition had already
+        been durably appended to the log."""
+        from scripts.fleet.core.projection import rebuild
+        from scripts.fleet.core.store import read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        log_path = fleet_dir / "events.jsonl"
+        sessions_dir = fleet_dir / "sessions"
+
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+        self._corrupt_the_cached_fragment(sessions_dir, non_utf8=True)
+
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(
+            json.dumps({"deploy_id": "dep-1", "ci_run": "ci-1"}), encoding="utf-8"
+        )
+        args = self._parser_args(
+            workspace, fleet_dir, "D2-test", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 0
+        recovered = read_fragment(_NODE, sessions_dir)
+        assert recovered is not None
+        assert recovered.done_level == "D2-test"
+
+    def test_p4_1_unreadable_cached_fragment_recovers_without_crashing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other #P4-1 shape: a fragment file that exists and is valid
+        UTF-8/JSON-shaped but cannot be `read_text()`'d at all (permissions,
+        a transient disk error) — `OSError`, not `UnicodeDecodeError` or
+        `json.JSONDecodeError`. Simulated here rather than via real file
+        permissions, since POSIX permission bits are not reliably enforced
+        for the file owner on every CI platform this suite runs on."""
+        import pathlib
+
+        from scripts.fleet.core.projection import rebuild
+        from scripts.fleet.core.store import fragment_path, read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        log_path = fleet_dir / "events.jsonl"
+        sessions_dir = fleet_dir / "sessions"
+
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+
+        target_name = fragment_path(_NODE, sessions_dir).name
+        original_read_text = pathlib.Path.read_text
+
+        def _boom(self: pathlib.Path, *args: object, **kwargs: object) -> str:
+            if self.name == target_name:
+                raise PermissionError("simulated unreadable fragment file")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", _boom)
+
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(
+            json.dumps({"deploy_id": "dep-1", "ci_run": "ci-1"}), encoding="utf-8"
+        )
+        args = self._parser_args(
+            workspace, fleet_dir, "D2-test", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        monkeypatch.undo()
+        assert exit_code == 0
+        recovered = read_fragment(_NODE, sessions_dir)
+        assert recovered is not None
+        assert recovered.done_level == "D2-test"

@@ -6,6 +6,7 @@ writes, so a fragment is never observed half-written.
 
 from __future__ import annotations
 
+import json
 import random
 import string
 from pathlib import Path
@@ -13,7 +14,7 @@ from urllib.parse import quote
 
 import pytest
 
-from scripts.fleet.core.errors import ValidationError
+from scripts.fleet.core.errors import FragmentCorrupt
 from scripts.fleet.core.nodes import make_node_id
 from scripts.fleet.core.schema import Fragment
 from scripts.fleet.core.store import (
@@ -164,8 +165,77 @@ class TestIterFragments:
         write_fragment(_fragment("portable/ws/proj/good"), sessions_dir)
         (sessions_dir / "zzz-corrupt.json").write_text("{not valid json", encoding="utf-8")
 
-        with pytest.raises((ValidationError, ValueError)):
+        with pytest.raises(FragmentCorrupt):
             iter_fragments(sessions_dir, skip_corrupt=False)
+
+    def test_non_utf8_fragment_is_skipped_by_default(self, tmp_path: Path) -> None:
+        """P4-1 (G5 round-5): a fragment file with undecodable bytes used to
+        raise an uncaught `UnicodeDecodeError` — a case the old
+        `except (json.JSONDecodeError, ValidationError, OSError)` did not
+        cover at all, since `UnicodeDecodeError` is neither. Must be treated
+        as corrupt, same as bad JSON."""
+        sessions_dir = tmp_path / "sessions"
+        write_fragment(_fragment("portable/ws/proj/good"), sessions_dir)
+        (sessions_dir / "zzz-badbytes.json").write_bytes(b"\xff\xfe garbage not utf-8")
+
+        fragments = iter_fragments(sessions_dir)
+        assert {f.node_id for f in fragments} == {"portable/ws/proj/good"}
+
+    def test_non_utf8_fragment_raises_fragment_corrupt_when_skip_corrupt_is_false(
+        self, tmp_path: Path
+    ) -> None:
+        sessions_dir = tmp_path / "sessions"
+        (sessions_dir).mkdir(parents=True, exist_ok=True)
+        (sessions_dir / "zzz-badbytes.json").write_bytes(b"\xff\xfe garbage not utf-8")
+
+        with pytest.raises(FragmentCorrupt):
+            iter_fragments(sessions_dir, skip_corrupt=False)
+
+
+class TestReadFragmentCorruption:
+    """P4-1/P4-2 (G5 round-5): `read_fragment` distinguishes a genuinely
+    ABSENT fragment file (returns `None`, unchanged) from an EXISTING file
+    that cannot be read as a valid `Fragment` (raises `FragmentCorrupt`,
+    uniformly for undecodable bytes, bad JSON, schema-invalid content, or an
+    unreadable file) — the two are not the same thing, and only the caller
+    (via `core.projection.rebuild()`) may decide how to recover from the
+    latter.
+    """
+
+    def test_absent_fragment_still_returns_none(self, tmp_path: Path) -> None:
+        sessions_dir = tmp_path / "sessions"
+        assert read_fragment("no/such/node", sessions_dir) is None
+
+    def test_non_json_existing_fragment_raises_fragment_corrupt(self, tmp_path: Path) -> None:
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        node_id = "portable/ws/proj/torn"
+        fragment_path(node_id, sessions_dir).write_text("{not valid json", encoding="utf-8")
+
+        with pytest.raises(FragmentCorrupt):
+            read_fragment(node_id, sessions_dir)
+
+    def test_non_utf8_existing_fragment_raises_fragment_corrupt(self, tmp_path: Path) -> None:
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        node_id = "portable/ws/proj/badbytes"
+        fragment_path(node_id, sessions_dir).write_bytes(b"\xff\xfe garbage not utf-8")
+
+        with pytest.raises(FragmentCorrupt):
+            read_fragment(node_id, sessions_dir)
+
+    def test_schema_invalid_existing_fragment_raises_fragment_corrupt(
+        self, tmp_path: Path
+    ) -> None:
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        node_id = "portable/ws/proj/wrong-schema"
+        fragment_path(node_id, sessions_dir).write_text(
+            json.dumps({"node_id": node_id}), encoding="utf-8"
+        )
+
+        with pytest.raises(FragmentCorrupt):
+            read_fragment(node_id, sessions_dir)
 
 
 class TestFragmentPathIsLengthSafeForPathologicalNodeIds:

@@ -12,7 +12,7 @@ import pytest
 
 from scripts.fleet.core.done import advance as done_advance
 from scripts.fleet.core.done import _current_level as done_current_level
-from scripts.fleet.core.errors import OwnershipError
+from scripts.fleet.core.errors import FragmentCorrupt, OwnershipError
 from scripts.fleet.core.events import append, read_all
 from scripts.fleet.core.projection import project_event, rebuild
 from scripts.fleet.core.schema import Event, Fragment, validate_event
@@ -261,11 +261,17 @@ class TestDoneLevelOnlyFoldsFromAdvanceEvents:
 
 
 class TestCorruptCachedFragmentDoneLevelNeverCrashesProjection:
-    """G5 fix #N2: `project_event` must never crash on a corrupt cached
-    fragment whose `done_level` is not one of `DONE_LEVELS` (e.g. a stale
-    legacy value) — `validate_fragment` only checks that `done_level` is a
-    non-empty string, not that it is a recognized ladder rung, so this is a
-    real read-time state, not merely a hypothetical.
+    """G5 fix #N2 (superseded here by round-5, #P4-1/#P4-2 — see below) plus
+    G5 round-3 fix #R3-1(a): a cached fragment whose `done_level` is not one
+    of `DONE_LEVELS` (e.g. a stale legacy value) is schema-INVALID —
+    `validate_fragment` rejects it (`core/schema.py`'s own `done_level not
+    in DONE_LEVELS` check) — so reading it back now raises `FragmentCorrupt`
+    just like any other existing-but-corrupt fragment. This is exactly the
+    same "existing corrupt fragment" case the JSON/UTF-8 corruption tests
+    above cover, just reached via a schema violation instead of a decode
+    failure; `project_event` no longer distinguishes by *how* a fragment
+    ended up corrupt — only "absent" (fold from defaults) vs. "corrupt"
+    (raise `FragmentCorrupt`, caller recovers via `rebuild()`).
     """
 
     def _write_corrupt_fragment(self, node_id: str, sessions_dir: Path) -> None:
@@ -282,16 +288,13 @@ class TestCorruptCachedFragmentDoneLevelNeverCrashesProjection:
             sessions_dir,
         )
 
-    def test_project_event_does_not_raise_and_lands_on_the_correct_level(
+    def test_project_event_raises_fragment_corrupt_on_bogus_done_level(
         self, tmp_path: Path
     ) -> None:
         sessions_dir = tmp_path / "sessions"
         node_id = "portable/ws/proj/corrupt-cached"
         self._write_corrupt_fragment(node_id, sessions_dir)
 
-        # A legitimate D1-merged advance (adjacent to the D0-code floor the
-        # corrupt "D9-bogus" value folds from, per G5 #N2) — must not raise
-        # KeyError, and must land the fragment on D1-merged.
         event = validate_event(
             {
                 "schema_version": 1,
@@ -306,10 +309,8 @@ class TestCorruptCachedFragmentDoneLevelNeverCrashesProjection:
             }
         )
 
-        fragment = project_event(event, sessions_dir)
-
-        assert fragment.done_level == "D1-merged"
-        assert read_fragment(node_id, sessions_dir).done_level == "D1-merged"
+        with pytest.raises(FragmentCorrupt):
+            project_event(event, sessions_dir)
 
     def test_rebuild_still_fully_recovers_regardless_of_the_corrupt_cached_fragment(
         self, tmp_path: Path
@@ -342,18 +343,20 @@ class TestCorruptCachedFragmentDoneLevelNeverCrashesProjection:
         assert fragments[node_id].done_level == "D1-merged"
 
 
-class TestCorruptCachedFragmentJSONNeverCrashesProjection:
-    """G5 round-3 fix #R3-2: `project_event` must never crash on a cached
-    fragment file that is not even well-formed JSON (truncated by a crash
-    mid-write, disk corruption, etc.) — `read_fragment` does `json.loads`
-    before it ever reaches `validate_fragment`, and `project_event` only
-    caught `ValidationError`, not `json.JSONDecodeError`, leaving this case
-    to traceback. Worse in `fleet done advance`: `project_event` runs AFTER
-    the event is durably appended to the log, so a legitimate transition
-    would be recorded and the CLI would still crash. The fix treats this
-    exactly like a `ValidationError`-corrupt fragment — "treated as absent"
-    (the module docstring's documented guarantee), landing on
-    `_fresh_fragment(event)`.
+class TestCorruptCachedFragmentJSONRaisesFragmentCorrupt:
+    """G5 round-5 (eliminate-the-class fix, #P4-1/#P4-2) supersedes round-3
+    fix #R3-2 here. Round 3 made `project_event` treat a truncated/non-JSON
+    cached fragment as "absent" and fold the triggering event alone onto
+    `_fresh_fragment(event)` — which quietly RESET every status field the
+    event's own payload does not mention (e.g. a `done_level_advanced`
+    event, carrying only done/evidence/approver, would reset `block_state`,
+    `review_state`, and `adoption_state` back to their registration
+    defaults: silent state loss, #P4-2). An EXISTING-but-corrupt fragment is
+    not the same thing as a genuinely absent one, and `project_event` no
+    longer guesses between them — it raises `FragmentCorrupt` and leaves
+    recovery (a full `rebuild()` from the log) to the caller. See
+    `TestCliDoneAdvanceRecoversFromCorruptCachedFragment` in
+    `tests/fleet/test_done.py` for the caller-side recovery this enables.
     """
 
     def _write_truncated_json_fragment(self, node_id: str, sessions_dir: Path) -> None:
@@ -364,7 +367,7 @@ class TestCorruptCachedFragmentJSONNeverCrashesProjection:
         # write, or plain garbage.
         path.write_text('{"node_id": "portable/ws/proj/x", "lifecy', encoding="utf-8")
 
-    def test_project_event_does_not_raise_on_non_json_cached_fragment(
+    def test_project_event_raises_fragment_corrupt_on_non_json_cached_fragment(
         self, tmp_path: Path
     ) -> None:
         sessions_dir = tmp_path / "sessions"
@@ -373,16 +376,10 @@ class TestCorruptCachedFragmentJSONNeverCrashesProjection:
 
         event = validate_event(_registered_event(node_id))
 
-        # Must not raise json.JSONDecodeError (or anything else) despite the
-        # unparseable cached fragment file.
-        fragment = project_event(event, sessions_dir)
+        with pytest.raises(FragmentCorrupt):
+            project_event(event, sessions_dir)
 
-        assert fragment.node_id == node_id
-        assert fragment.lifecycle == "active"
-        # A valid fragment is now written, overwriting the corrupt one.
-        assert read_fragment(node_id, sessions_dir) == fragment
-
-    def test_project_event_does_not_raise_on_non_json_cached_fragment_for_a_later_event(
+    def test_project_event_raises_fragment_corrupt_for_a_later_event_too(
         self, tmp_path: Path
     ) -> None:
         """Same scenario, but the corrupt cache is hit on a non-first event
@@ -395,11 +392,20 @@ class TestCorruptCachedFragmentJSONNeverCrashesProjection:
 
         event = validate_event(_lifecycle_changed_event(node_id, "blocked"))
 
-        fragment = project_event(event, sessions_dir)
+        with pytest.raises(FragmentCorrupt):
+            project_event(event, sessions_dir)
 
-        # Treated as absent -> _fresh_fragment(event), same as the
-        # ValidationError-corrupt case; the new event's own payload still
-        # folds in on top of the defaults.
-        assert fragment.node_id == node_id
-        assert fragment.lifecycle == "blocked"
-        assert read_fragment(node_id, sessions_dir) == fragment
+    def test_non_utf8_cached_fragment_also_raises_fragment_corrupt(
+        self, tmp_path: Path
+    ) -> None:
+        """P4-1: undecodable bytes are as much "corrupt" as bad JSON — must
+        raise the same typed error, not an uncaught `UnicodeDecodeError`."""
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/badbytes"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        fragment_path(node_id, sessions_dir).write_bytes(b"\xff\xfe garbage not utf-8")
+
+        event = validate_event(_lifecycle_changed_event(node_id, "blocked"))
+
+        with pytest.raises(FragmentCorrupt):
+            project_event(event, sessions_dir)

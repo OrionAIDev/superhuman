@@ -41,10 +41,8 @@ enforcement.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from .errors import ValidationError
 from .events import read_all
 from .ownership import assert_writer_may
 from .schema import STATUS_FIELDS, Event, Fragment, fold_done_level
@@ -156,32 +154,41 @@ def project_event(event: Event, sessions_dir: Path | str) -> Fragment:
 
     Returns:
         Fragment: the fragment after applying `event`, already written to
-        disk. A corrupt existing fragment is treated as absent rather than
-        raised — the same non-fatal-corruption guarantee `rebuild()` gives,
-        applied to the incremental path.
+        disk.
 
     Raises:
         OwnershipError: if `event.writer_role` may not write `event.type`
             or one of the owned fields present in `event.payload` (FR-8).
             Nothing is written.
+        FragmentCorrupt: if `event.node_id`'s cached fragment file EXISTS
+            but cannot be read as a valid `Fragment` (undecodable bytes,
+            unparseable JSON, schema-invalid content, or an unreadable
+            file). G5 round-5 (eliminate-the-class fix, #P4-1/#P4-2):
+            earlier rounds treated this case as "no cached fragment" and
+            folded `event` alone onto `_fresh_fragment(event)` — which
+            silently RESET every status field `event`'s payload does not
+            mention (e.g. a `done_level_advanced` event, which carries only
+            done/evidence/approver, would reset `block_state`,
+            `review_state`, and `adoption_state` to their registration
+            defaults). That was wrong: a genuinely ABSENT fragment means
+            "no prior state, defaults are correct," but an EXISTING-but-
+            corrupt fragment means "prior state exists and is unknown from
+            here" — those are not the same thing, and only the former may
+            fall through to `_fresh_fragment`. This function no longer
+            guesses; it propagates `FragmentCorrupt` and leaves recovery to
+            the caller, which has `log_path` and can call
+            `rebuild(log_path, sessions_dir, project_id=event.project_id)`
+            for a full, correct, all-fields reconstruction from the log
+            (the just-appended `event` is already in the log by the time
+            this function runs, so the rebuilt node ends at the correct
+            current state). `project_event` itself stays simple — it does
+            not import `rebuild` or accept a `log_path`.
     """
     assert_writer_may(event.type, event.writer_role)
     for field in event.payload:
         assert_writer_may(field, event.writer_role)
 
-    try:
-        current = read_fragment(event.node_id, sessions_dir)
-    except (ValidationError, json.JSONDecodeError):
-        # G5 fix #R3-2: `read_fragment` does `json.loads` before
-        # `validate_fragment` ever runs, so a truncated/non-JSON cached
-        # fragment file (a crash mid-write, disk corruption) raises
-        # `json.JSONDecodeError`, not `ValidationError` — a case this
-        # `except` did not used to cover, crashing this function despite
-        # its own documented "a corrupt existing fragment is treated as
-        # absent" guarantee (see this function's docstring). Treated
-        # identically to a schema-invalid fragment: `current = None` ->
-        # `_fresh_fragment(event)` below.
-        current = None
+    current = read_fragment(event.node_id, sessions_dir)
     fragment = _fresh_fragment(event) if current is None else _apply(current, event)
     write_fragment(fragment, sessions_dir)
     return fragment

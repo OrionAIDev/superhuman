@@ -28,9 +28,15 @@ from .core.done import DONE_LEVELS
 from .core.done import advance as done_advance
 from .core.done import event_for as done_event_for
 from .core.edges import resolve_graph
-from .core.errors import DonePolicyError, LockTimeoutError, OwnershipError, ValidationError
+from .core.errors import (
+    DonePolicyError,
+    FragmentCorrupt,
+    LockTimeoutError,
+    OwnershipError,
+    ValidationError,
+)
 from .core.events import append
-from .core.projection import project_event
+from .core.projection import project_event, rebuild
 from .core.query import edges_of
 from .core.schema import Event, Fragment, validate_event
 from .core.store import read_fragment
@@ -221,7 +227,12 @@ def register_session(
         Fragment: the session's fragment after the registration is applied.
         On a repeat registration of the same session (idempotency-key
         dedupe), this is the *existing* fragment, read back rather than
-        re-projected — the original event is the one of record.
+        re-projected — the original event is the one of record. Correct
+        even if the cached fragment was found corrupt on disk and had to
+        be recovered via `core.projection.rebuild()` (G5 round-5,
+        #P4-1/#P4-2) — the registration event is already durably appended
+        to the log by that point, so a corrupt fragment cache is
+        recovered, never fatal.
 
     Raises:
         ValidationError: if the built event fails schema validation.
@@ -246,14 +257,26 @@ def register_session(
         # The event of record is whatever was appended first; re-projecting
         # this call's (possibly stale) payload on top would be wrong, so the
         # existing fragment is read back instead.
-        existing = read_fragment(session.node_id, sessions_dir)
+        try:
+            existing = read_fragment(session.node_id, sessions_dir)
+        except FragmentCorrupt:
+            existing = None
         if existing is not None:
             return existing
         # Fragment missing but the log entry exists (e.g. a corrupt/deleted
         # fragment) — re-validate and project the built event to rebuild it.
         appended = validate_event(event_dict)
 
-    return project_event(appended, sessions_dir)
+    try:
+        return project_event(appended, sessions_dir)
+    except FragmentCorrupt:
+        # G5 round-5 (#P4-1/#P4-2): the cached fragment exists but cannot be
+        # read — recover by replaying the whole log (which already contains
+        # `appended`, just durably written by `_append_with_bounded_retry`
+        # above) rather than letting `project_event` guess at a partial
+        # fragment. Full, correct, all-fields reconstruction.
+        fragments = rebuild(log_path, sessions_dir, project_id=project_id)
+        return fragments[session.node_id]
 
 
 def _default_fleet_dir(workspace: Path, slug: str) -> Path:
@@ -717,7 +740,17 @@ def _cmd_done_advance(args: argparse.Namespace) -> int:
     # the same boundary `register_session` and `handoff.py` already draw.
     event = done_event_for(args.node_id, args.target_level, log_path)
     if event is not None:
-        project_event(event, sessions_dir)
+        try:
+            project_event(event, sessions_dir)
+        except FragmentCorrupt:
+            # G5 round-5 (#P4-1/#P4-2): the transition is already durably
+            # appended to the log by `done_advance` above; a corrupt cached
+            # fragment must not turn a successful transition into a crash,
+            # and must not silently reset the other status fields either
+            # (the bug this round eliminates). Recover via a full replay —
+            # the just-appended event is already in the log, so the
+            # rebuilt fragment ends at the correct current state.
+            rebuild(log_path, sessions_dir, project_id=args.project_id)
 
     print(f"{result.status}: {result.node_id} -> {result.level} (ceiling={ceiling})")
     return 0

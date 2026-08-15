@@ -53,6 +53,22 @@ class PreconditionUnmet(FleetError):
     """
 
 
+class FragmentCorrupt(FleetError):
+    """A cached fragment on disk could not be read as a valid `Fragment`.
+
+    Raised by `core.store.read_fragment` (and `core.store.iter_fragments`
+    when `skip_corrupt=False`) for an EXISTING fragment file whose bytes
+    are not valid UTF-8, whose content is not valid JSON, whose content
+    fails `core.schema.validate_fragment`, or that cannot be read at all
+    (permissions, disk error) — as opposed to a genuinely absent fragment
+    file, which is not an error (`read_fragment` returns `None` for that
+    case, unchanged). The log (`events.jsonl`) remains the source of
+    truth regardless: `core.projection.rebuild()` replays it from scratch
+    and fully recovers, independent of whatever is (or is not, or is
+    corrupt) on disk in the fragment cache.
+    """
+
+
 class DonePolicyError(FleetError):
     """A ``done_level`` advance was rejected by policy, not malformed input.
 
