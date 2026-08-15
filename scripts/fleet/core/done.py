@@ -84,18 +84,20 @@ from uuid import uuid4
 
 from .errors import DonePolicyError, PreconditionUnmet
 from .events import append, read_all
-from .schema import Event, is_model_vendor_name
+from .schema import DONE_LEVELS, Event, fold_done_level, is_model_vendor_name
 
-#: The done-ladder, in strict ascending order (Decision F / FR-6).
-DONE_LEVELS: Final[tuple[str, ...]] = (
-    "D0-code",
-    "D1-merged",
-    "D2-test",
-    "D3-uat",
-    "D4-prod",
-)
-
-#: Ladder position lookup, e.g. `_LEVEL_INDEX["D2-test"] == 2`.
+#: G5 fix #F2: `DONE_LEVELS` now lives in `core/schema.py` (the vocabulary a
+#: `done_level_advanced` payload is validated against) and is imported here,
+#: not redefined — `core.projection` imports the same constant, so there is
+#: exactly one source of truth for the ladder. Re-exported under this name so
+#: existing callers (`cli.py`, `tests/fleet/test_done.py`) importing
+#: `DONE_LEVELS` from `core.done` are unaffected.
+#:
+#: Ladder position lookup, e.g. `_LEVEL_INDEX["D2-test"] == 2`. Derived
+#: locally from the imported `DONE_LEVELS` rather than imported from
+#: `schema._LEVEL_INDEX` — cheap, deterministic, derived data, not a second
+#: copy of the vocabulary itself, and keeps this module from reaching into
+#: `schema`'s private names.
 _LEVEL_INDEX: Final[dict[str, int]] = {level: i for i, level in enumerate(DONE_LEVELS)}
 
 #: `evidence` keys that count as "merge evidence" for the D1-merged gate —
@@ -109,14 +111,20 @@ _TEST_EVIDENCE_KEY: Final[str] = "ci_run"
 #: Levels whose gate requires a recorded human approver (FR-6).
 _APPROVER_REQUIRED_LEVELS: Final[frozenset[str]] = frozenset({"D3-uat", "D4-prod"})
 
-#: G5 fix #2 — automation-shaped stems rejected by `_is_human_approver`,
-#: matched at whole-TOKEN boundaries only (never raw substring — see
-#: `_has_automation_stem`), so a human name that merely *contains* one of
-#: these as a substring (e.g. "Cindy"/"Cicero" contain "ci") is never
-#: rejected. Hyphenated stems (`"github-actions"`, `"gitlab-ci"`,
-#: `"service-account"`, `"no-reply"`) are stored with the hyphen already
-#: stripped, matching how `_has_automation_stem` normalizes the candidate
-#: string before tokenizing.
+#: G5 fix #2 (round 1) / #F3 (round 2) — automation-shaped stems rejected by
+#: `_is_human_approver`, matched at whole-TOKEN boundaries only (never raw
+#: substring), so a human name that merely *contains* one of these as a
+#: substring (e.g. "Cindy"/"Cicero" contain "ci") is never rejected. Two
+#: entry shapes coexist deliberately (see `_has_automation_stem`):
+#: single-word stems (`"ci"`, `"jenkins"`, ...) are matched against each
+#: SEPARATED word of the candidate (`_word_tokens`); the hyphen-joined
+#: compound entries (`"githubactions"`, `"gitlabci"`, `"serviceaccount"`,
+#: `"noreply"`) are matched against the candidate with its separators
+#: removed (`_concatenated_form`) — never the other way around. Round 1's
+#: bug (G5 F3) collapsed both into a single concatenate-then-split pass,
+#: which let a per-word stem hide inside a longer fused blob: normalizing
+#: `"ci-runner-01"` to `"cirunner01"` *before* tokenizing produced one token
+#: matching nothing, so the whole approver silently passed the gate.
 _AUTOMATION_STEMS: Final[frozenset[str]] = frozenset(
     {
         "jenkins",
@@ -142,10 +150,14 @@ _AUTOMATION_STEMS: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: Splits a (hyphen/underscore-normalized) approver string into candidate
-#: tokens for the automation-stem check — any run of non-alphanumeric
-#: characters is a boundary.
-_TOKEN_SPLIT_RE: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
+#: Splits a lowercased approver string into candidate word tokens for
+#: `_word_tokens` — any run of a character that is NOT a lowercase ASCII
+#: letter is a boundary (G5 fix #F3): hyphens, underscores, dots,
+#: whitespace, AND digits all separate words, so `"ci-runner-01"` splits to
+#: `["ci", "runner"]` (the trailing digits vanish as a boundary, never
+#: fusing onto `"runner"`), never the single fused `"cirunner01"` blob round
+#: 1's concatenate-then-split order produced.
+_TOKEN_SPLIT_RE: Final[re.Pattern[str]] = re.compile(r"[^a-z]+")
 
 
 def _now_iso() -> str:
@@ -197,24 +209,27 @@ def _validate_known_level(value: str, what: str) -> None:
 
 
 def _is_present(value: Any) -> bool:
-    """Return whether `value` counts as "present" evidence (G5 fix #3).
+    """Return whether `value` counts as "present" evidence (G5 fix #F4).
 
-    A plain `bool(value)` treats a whitespace-only string like `"   "` as
-    present (non-empty strings are always truthy in Python) — this closes
-    that gap: a string only counts if it has a non-whitespace character
-    after stripping. Non-string truthy values (e.g. a caller passing an int)
-    are unaffected.
+    Only a non-blank STRING counts as present. The prior implementation fell
+    back to `bool(value)` for a non-string value, which meant `{"commit":
+    True}` (or `{"deploy_id": 1}`) satisfied an evidence gate — `bool(True)`
+    and `bool(1)` are both truthy — even though neither is an actual commit/
+    deploy/CI reference a human or system recorded; evidence in this
+    manifest is always a reference *string* (a SHA, a PR number as text, a
+    deploy id, a CI run id). Rejecting every non-string value closes that
+    gap: `True`, `1`, `None`, `""`, and `"   "` are all "not present" now,
+    matching the whitespace-only handling this function already had for
+    strings.
 
     Args:
         value: the candidate evidence value (e.g. `evidence.get("commit")`).
 
     Returns:
-        bool: True iff `value` is truthy and, when a string, non-blank after
-        `.strip()`.
+        bool: True iff `value` is a string with a non-whitespace character
+        after `.strip()`; False for every other type, however truthy.
     """
-    if isinstance(value, str):
-        return bool(value.strip())
-    return bool(value)
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _has_merge_evidence(evidence: dict[str, Any]) -> bool:
@@ -246,28 +261,85 @@ def _has_deploy_and_test_evidence(evidence: dict[str, Any]) -> bool:
     )
 
 
-def _has_automation_stem(approver: str) -> bool:
-    """Return whether `approver` contains a whole token matching an automation stem.
+def _concatenated_form(approver: str) -> str:
+    """Return `approver` lowercased with every hyphen/underscore removed.
 
-    G5 fix #2. Deliberately a whole-TOKEN match, not a raw substring test:
-    the candidate is lowercased, its hyphens/underscores are removed (so
-    `"github-actions"` normalizes the same way as the stored stem
-    `"githubactions"`), and the result is split on every remaining run of
-    non-alphanumeric characters (spaces, dots, ...) into tokens. A plausible
-    human name like "Cindy Lee" or "Cicero Nash" tokenizes to
-    `{"cindy", "lee"}` / `{"cicero", "nash"}` — neither *equals* the stem
-    `"ci"`, so neither is rejected, even though both *contain* it as a
-    substring.
+    Used only to catch a hyphen-joined COMPOUND automation name (e.g.
+    `"service-account"` -> `"serviceaccount"`, `"github-actions"` ->
+    `"githubactions"`, `"no-reply"` -> `"noreply"`) against
+    `_AUTOMATION_STEMS`'s compound entries. Deliberately never used as the
+    sole check — see `_has_automation_stem`'s docstring for why relying on
+    concatenation alone (round 1's bug, G5 F3) let a per-word stem hide
+    inside a longer fused blob.
 
     Args:
         approver: the candidate approver identity (already known non-blank).
 
     Returns:
-        bool: True iff any token equals a member of `_AUTOMATION_STEMS`.
+        str: `approver`, lowercased, with `-` and `_` characters removed.
     """
-    normalized = approver.lower().replace("-", "").replace("_", "")
-    tokens = (t for t in _TOKEN_SPLIT_RE.split(normalized) if t)
-    return any(token in _AUTOMATION_STEMS for token in tokens)
+    return approver.lower().replace("-", "").replace("_", "")
+
+
+def _word_tokens(approver: str) -> list[str]:
+    """Split `approver` into lowercase alphabetic word tokens.
+
+    Every run of a non-lowercase-letter character (hyphens, underscores,
+    dots, whitespace, AND digits — see `_TOKEN_SPLIT_RE`) is a boundary, so
+    `"ci-runner-01"` splits to `["ci", "runner"]` and `"jenkins-x"` splits to
+    `["jenkins", "x"]` — each word checked independently, never fused with
+    its neighbors (G5 fix #F3).
+
+    Args:
+        approver: the candidate approver identity (already known non-blank).
+
+    Returns:
+        list[str]: the non-empty word tokens, in order.
+    """
+    return [t for t in _TOKEN_SPLIT_RE.split(approver.lower()) if t]
+
+
+def _has_automation_stem(approver: str) -> bool:
+    """Return whether `approver` matches an automation stem (G5 fix #F3).
+
+    Two independent checks, either of which rejects — deliberately a
+    whole-TOKEN/whole-STRING match, never a raw substring test, so a
+    plausible human name like "Cindy Lee" or "Cicero Nash" (tokens
+    `["cindy", "lee"]` / `["cicero", "nash"]`) is never rejected merely for
+    *containing* the substring "ci":
+
+    1. `_word_tokens(approver)` — each SEPARATED word of `approver`, checked
+       against `_AUTOMATION_STEMS` individually. This is what catches a
+       stem hidden behind an extra hyphenated word/number that round 1's
+       concatenate-then-split order missed: `"ci-runner-01"` -> token
+       `"ci"` matches; `"jenkins-x"` -> token `"jenkins"` matches.
+    2. `_concatenated_form(approver)` — the WHOLE string with separators
+       removed, checked against `_AUTOMATION_STEMS`'s compound entries
+       (`"githubactions"`, `"gitlabci"`, `"serviceaccount"`, `"noreply"`).
+       This is what catches a two-word automation name whose halves are not
+       themselves stems: `"service-account"` -> neither "service" nor
+       "account" is a stem word, but the concatenated form
+       `"serviceaccount"` is a listed compound; likewise `"no-reply"` ->
+       `"noreply"`.
+
+    **Known, documented residual (approved, not fixed here):** a
+    CONCATENATED form with no separator at all — e.g. `"deploybot2"` or
+    `"jenkinsx"` — has no word boundary for `_word_tokens` to split on and
+    is not itself a listed compound, so it still slips past both checks.
+    This gate is a deterrent and an audit record, not proof of human-ness
+    (see the module/`_is_human_approver` docstrings); a determined caller
+    can still fabricate a name that passes.
+
+    Args:
+        approver: the candidate approver identity (already known non-blank).
+
+    Returns:
+        bool: True iff `approver`'s concatenated form or any of its word
+        tokens matches a member of `_AUTOMATION_STEMS`.
+    """
+    if _concatenated_form(approver) in _AUTOMATION_STEMS:
+        return True
+    return any(token in _AUTOMATION_STEMS for token in _word_tokens(approver))
 
 
 def _is_trivial_approver(stripped: str) -> bool:
@@ -335,28 +407,37 @@ def _is_human_approver(approver: str | None) -> bool:
 def _current_level(events: list[Event], node_id: str) -> str:
     """Return `node_id`'s current `done_level`, from a list of log events.
 
+    G5 fix #F1: folds through `core.schema.fold_done_level` — the SAME
+    helper `core.projection` uses to derive a fragment's `done_level` — so
+    this and the projection can never disagree, including on a forged log.
+    Before this fix, this function took the *last* `done_level_advanced`
+    payload verbatim (as long as it named a recognized level), which meant a
+    direct `append()` of a correctly-typed `done_level_advanced` event —
+    never through `advance()`, so none of its evidence/approver/adjacency
+    gates ever ran — could still set `node_id`'s current level to anything,
+    including a skip-level or backward value. Folding through
+    `fold_done_level` closes that: only a genuine single-rung-forward
+    advance (from whatever the fold-so-far level is) ever changes `current`;
+    a skip-level, backward, same-level, or unrecognized-value event is
+    ignored, exactly as if `advance()` itself had rejected it (see
+    `fold_done_level`'s own docstring for the residual this does NOT close —
+    a fully-forged *adjacent* chain with fabricated evidence).
+
     Args:
         events: event-log entries, e.g. as read by `core.events.read_all`.
         node_id: the node to compute the current level for.
 
     Returns:
-        str: the `done_level` payload of the *last* `done_level_advanced`
-        event for `node_id` in `events` (append order — later entries win);
-        `"D0-code"` if none is found, matching `core.projection`'s own
-        default for a freshly registered node. A malformed payload (missing
-        or unrecognized `done_level` value) is skipped defensively rather
-        than raised — the same read-time tolerance `core.edges` applies to
-        its own event payloads (G5 F3) — since every event that reached the
-        log through `advance()` itself always carries a recognized level;
-        only a directly-forged log entry could trigger this branch.
+        str: the fold-derived `done_level` for `node_id` over `events`, in
+        append order; `"D0-code"` if `node_id` has no matching events,
+        matching `core.projection`'s own default for a freshly registered
+        node.
     """
     current = "D0-code"
     for event in events:
-        if event.type != "done_level_advanced" or event.node_id != node_id:
+        if event.node_id != node_id:
             continue
-        level = event.payload.get("done_level")
-        if level in _LEVEL_INDEX:
-            current = level
+        current = fold_done_level(current, event)
     return current
 
 

@@ -12,11 +12,20 @@ Any event payload key that matches one of `schema.STATUS_FIELDS` is applied
 to the fragment directly — projection does not hardcode a table of event
 types to fields, so new event types introduced by later chunks (handoff,
 edges, done_level) project correctly without changes here, as long as their
-payload uses the same field names. **One exception (G5 fix #1(b)):**
-`done_level` is folded ONLY from `done_level_advanced` events, never via
-this generic fold — see `_done_level_override`, which mirrors
-`core.done.py::_current_level`'s own derivation rule, so the two can never
-disagree.
+payload uses the same field names. **One exception (G5 fix #1(b) / #F1):**
+`done_level` is folded ONLY through `schema.fold_done_level` — the SAME
+shared helper `core.done._current_level` folds through — never via this
+generic per-key fold. Round 1's fix (#1(b)) excluded `done_level` from the
+generic fold but still copied the payload's value verbatim if the event was
+`done_level_advanced`; that verbatim copy is what let a direct `append()` of
+a correctly-typed `done_level_advanced` event (never through
+`core.done.advance()`, so none of its evidence/approver/adjacency gates ever
+ran) still corrupt the projected fragment with any recognized-or-not value.
+Round 2's fix (#F1) closes that: `fold_done_level` re-derives adjacency on
+read, exactly mirroring `core.edges.resolve_graph`'s own "never trust a
+written fact, re-derive the invariant on read" pattern applied to the
+done-ladder — so a fragment's `done_level` and `core.done._current_level`'s
+computed current level can never disagree, on any log, forged or not.
 
 **Write-boundary invariant (HARDEN #3, GPT-5 review):** `core/events.append`
 is the *sole enforced write entry* for the log — schema validation and
@@ -37,7 +46,7 @@ from pathlib import Path
 from .errors import ValidationError
 from .events import read_all
 from .ownership import assert_writer_may
-from .schema import STATUS_FIELDS, Event, Fragment
+from .schema import STATUS_FIELDS, Event, Fragment, fold_done_level
 from .store import read_fragment, write_fragment
 
 #: Defaults for a freshly registered node, before any payload override.
@@ -50,37 +59,12 @@ _DEFAULT_STATUS: dict[str, str] = {
 }
 
 #: G5 fix #1(b): `done_level` is deliberately excluded from the generic
-#: STATUS_FIELDS fold below — see `_done_level_override` for why. The other
-#: four status fields keep folding generically; this scoping is intentional
-#: (per-field write authority for the rest is a tracked follow-up, not fixed
-#: here — see `core.schema._assert_done_level_write_boundary`).
+#: STATUS_FIELDS fold below — folded instead through `schema.fold_done_level`
+#: (`#F1`, round 2), the same shared helper `core.done._current_level` uses.
+#: The other four status fields keep folding generically; this scoping is
+#: intentional (per-field write authority for the rest is a tracked
+#: follow-up, not fixed here — see `core.schema._assert_done_level_write_boundary`).
 _GENERIC_FOLD_FIELDS: tuple[str, ...] = tuple(f for f in STATUS_FIELDS if f != "done_level")
-
-
-def _done_level_override(event: Event) -> str | None:
-    """Return the `done_level` this event should apply, or `None` for "no change."
-
-    G5 fix #1(b): mirrors `core.done.py::_current_level`'s own rule — a
-    node's `done_level` is derived ONLY from `done_level_advanced` events,
-    never from the generic per-field payload fold every other status field
-    uses. `core/schema.py`'s `_assert_done_level_write_boundary` already
-    rejects a non-advance event carrying `done_level` in its payload at the
-    write boundary (fix #1(a)); this is the defense-in-depth half, for an
-    `Event` that reached this function without passing through that check
-    (e.g. a directly-constructed `Event`, which `project_event`'s own
-    docstring already warns this module must not blindly trust).
-
-    Args:
-        event: the event being folded onto a fragment.
-
-    Returns:
-        str | None: the payload's `done_level` value if `event.type` is
-        `"done_level_advanced"` and the key is present; `None` otherwise
-        (meaning "leave the fragment's current/default done_level alone").
-    """
-    if event.type == "done_level_advanced":
-        return event.payload.get("done_level")
-    return None
 
 
 def _fresh_fragment(event: Event) -> Fragment:
@@ -91,16 +75,19 @@ def _fresh_fragment(event: Event) -> Fragment:
 
     Returns:
         Fragment: defaults overridden by any status-field keys in the
-        event's payload (`done_level` only from a `done_level_advanced`
-        event — see `_done_level_override`).
+        event's payload, plus `done_level` folded via
+        `schema.fold_done_level` starting from the default `"D0-code"` (G5
+        fix #F1) — a `done_level_advanced` establishing event only takes
+        effect if its value is a legal single-rung-forward advance from
+        `"D0-code"` (i.e. `"D1-merged"`); anything else (a skip-level or
+        unrecognized value, however it reached this event's payload) leaves
+        the fragment at the default.
     """
     fields = dict(_DEFAULT_STATUS)
     for key in _GENERIC_FOLD_FIELDS:
         if key in event.payload:
             fields[key] = event.payload[key]
-    done_level = _done_level_override(event)
-    if done_level is not None:
-        fields["done_level"] = done_level
+    fields["done_level"] = fold_done_level("D0-code", event)
     return Fragment(node_id=event.node_id, project_id=event.project_id, **fields)
 
 
@@ -110,17 +97,20 @@ def _apply(fragment: Fragment, event: Event) -> Fragment:
     Args:
         fragment: the fragment to update.
         event: the event to fold in; only keys in `_GENERIC_FOLD_FIELDS` are
-            applied generically, plus `done_level` from a
-            `done_level_advanced` event only (see `_done_level_override`).
+            applied generically. `done_level` is folded separately via
+            `schema.fold_done_level(fragment.done_level, event)` (G5 fix
+            #F1) — the fragment's CURRENT `done_level` is always the fold's
+            starting point, so a non-adjacent (skip-level, backward,
+            same-level, or unrecognized-value) `done_level_advanced` event
+            is a no-op here too, not just at write time in
+            `core.done.advance()`.
 
     Returns:
         Fragment: `fragment` with any matching payload values overwritten.
     """
     overrides = {k: v for k, v in event.payload.items() if k in _GENERIC_FOLD_FIELDS}
-    done_level = _done_level_override(event)
-    if done_level is not None:
-        overrides["done_level"] = done_level
-    if not overrides:
+    folded_done_level = fold_done_level(fragment.done_level, event)
+    if not overrides and folded_done_level == fragment.done_level:
         return fragment
     fields = {
         "node_id": fragment.node_id,
@@ -129,7 +119,7 @@ def _apply(fragment: Fragment, event: Event) -> Fragment:
         "block_state": fragment.block_state,
         "review_state": fragment.review_state,
         "adoption_state": fragment.adoption_state,
-        "done_level": fragment.done_level,
+        "done_level": folded_done_level,
         **overrides,
     }
     return Fragment(**fields)

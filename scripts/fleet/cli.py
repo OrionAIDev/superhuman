@@ -567,14 +567,33 @@ def _resolve_d_ceiling(workspace: Path) -> str:
         workspace: the project's working tree root — the profile search
             starts here (`superhuman_profile.find_profile`).
 
+    **G5 fix #F5 — fail CLOSED on a present-but-invalid value.** If the
+    matched rung declares a `d_ceiling` label at all, it must name a
+    recognized `DONE_LEVELS` value or this function raises — it never
+    silently falls back to the unrestricted `_DEFAULT_D_CEILING` for a value
+    an operator actually configured. Before this fix, ANY unrecognized
+    `d_ceiling` value (a typo like `"D2_test"`, a stale/renamed level) fell
+    through the same `ceiling if ceiling in DONE_LEVELS else
+    _DEFAULT_D_CEILING` line as "no label configured," silently granting the
+    unrestricted top of the ladder — exactly the opposite of what an
+    operator who bothered to set a ceiling at all almost certainly intended.
+    Only the genuinely-absent case (no label, no matching rung, no profile,
+    or an unreadable profile) still defaults to `_DEFAULT_D_CEILING`.
+
     Returns:
         str: the resolved D-ceiling, one of `core.done.DONE_LEVELS`.
         `_DEFAULT_D_CEILING` if no profile is found, no rung matches the
-        workspace, the matched rung declares no `d_ceiling` label, or the
-        profile itself fails to load (a malformed profile should not by
+        workspace, the matched rung declares no `d_ceiling` label at all, or
+        the profile itself fails to load (a malformed profile should not by
         itself block every `done advance` call — it already fails loudly
         for the deployment-rung concerns `superhuman_profile`'s own CLI
         commands cover).
+
+    Raises:
+        ValueError: if the matched rung DOES declare a `d_ceiling` label,
+            but its value is not one of `DONE_LEVELS`. `_cmd_done_advance`
+            catches this the same way it catches every other rejection —
+            a clean nonzero exit, never an uncaught traceback.
     """
     try:
         profile = superhuman_profile.load_profile(superhuman_profile.find_profile(workspace))
@@ -583,8 +602,17 @@ def _resolve_d_ceiling(workspace: Path) -> str:
         return _DEFAULT_D_CEILING
     if resolution.stage is None:
         return _DEFAULT_D_CEILING
-    ceiling = resolution.stage.labels.get(_D_CEILING_LABEL_KEY)
-    return ceiling if ceiling in DONE_LEVELS else _DEFAULT_D_CEILING
+    if _D_CEILING_LABEL_KEY not in resolution.stage.labels:
+        return _DEFAULT_D_CEILING
+    ceiling = resolution.stage.labels[_D_CEILING_LABEL_KEY]
+    if ceiling not in DONE_LEVELS:
+        raise ValueError(
+            f"profile d_ceiling label {ceiling!r} is not a recognized "
+            f"done_level (expected one of {DONE_LEVELS}) — failing closed "
+            "rather than silently granting the unrestricted D4-prod default "
+            "(G5 F5)"
+        )
+    return ceiling
 
 
 def _cmd_done_advance(args: argparse.Namespace) -> int:
@@ -603,9 +631,15 @@ def _cmd_done_advance(args: argparse.Namespace) -> int:
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
-    ceiling = args.ceiling or _resolve_d_ceiling(args.workspace)
-
     try:
+        # G5 fix #F5: ceiling resolution moved INSIDE the try (it used to run
+        # before this block even started) — `_resolve_d_ceiling` now raises
+        # `ValueError` on a present-but-unrecognized `d_ceiling` profile
+        # label (failing closed) instead of silently defaulting to the
+        # unrestricted D4-prod, and that raise must produce a clean nonzero
+        # exit here, never an uncaught traceback.
+        ceiling = args.ceiling or _resolve_d_ceiling(args.workspace)
+
         # G5 fix #4: evidence-JSON parsing moved INSIDE the try (it used to
         # run before this block even started), and the decoded value is
         # checked to actually be a JSON object — a missing --evidence-json

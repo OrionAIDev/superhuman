@@ -62,6 +62,28 @@ STATUS_FIELDS: Final[tuple[str, ...]] = (
     "done_level",
 )
 
+#: The done-ladder, in strict ascending order (Decision F / FR-6). G5 F2:
+#: moved here from `core/done.py` — the valid-value vocabulary for
+#: `done_level` is a schema concern (this module is the single source of
+#: truth `validate_event` checks a `done_level_advanced` payload against),
+#: and keeping it here avoids a `schema -> done` import cycle for
+#: `fold_done_level` below. `core/done.py` and `core/projection.py` both
+#: import this rather than redefining it.
+DONE_LEVELS: Final[tuple[str, ...]] = (
+    "D0-code",
+    "D1-merged",
+    "D2-test",
+    "D3-uat",
+    "D4-prod",
+)
+
+#: Ladder position lookup, e.g. `_LEVEL_INDEX["D2-test"] == 2`. Private —
+#: `fold_done_level` is this module's only consumer; other modules that need
+#: a level's ladder position (e.g. `core/done.py`'s ceiling/adjacency checks)
+#: derive their own copy from the imported `DONE_LEVELS`, since it is cheap,
+#: deterministic, derived data, not a second copy of the vocabulary itself.
+_LEVEL_INDEX: Final[dict[str, int]] = {level: i for i, level in enumerate(DONE_LEVELS)}
+
 #: Required keys on every fragment; matches STATUS_FIELDS plus identity.
 _REQUIRED_FRAGMENT_FIELDS: Final[frozenset[str]] = frozenset(
     {"node_id", "project_id", *STATUS_FIELDS}
@@ -232,6 +254,7 @@ def validate_event(data: dict[str, Any]) -> Event:
         raise ValidationError("payload must be a dict")
     _assert_done_level_write_boundary(event_type, payload)
     _assert_payload_status_values_are_valid(payload)
+    _assert_done_level_value_is_recognized(event_type, payload)
 
     return Event(
         schema_version=data["schema_version"],
@@ -357,6 +380,103 @@ def _assert_payload_status_values_are_valid(payload: dict[str, Any]) -> None:
                 f"payload status field {field!r} must be a non-empty string, "
                 f"got {value!r}"
             )
+
+
+def _assert_done_level_value_is_recognized(event_type: str, payload: dict[str, Any]) -> None:
+    """Raise ValidationError if a `done_level_advanced` payload's value is unrecognized.
+
+    G5 fix #F2: `payload["done_level"]` must be one of `DONE_LEVELS` when
+    `event_type` is `"done_level_advanced"` — without this check, a
+    schema-valid-but-unrecognized value like `"D9-bogus"` (a non-empty
+    string, so it already passes `_assert_payload_status_values_are_valid`)
+    would be accepted at the write boundary and only be caught later, if at
+    all, by the read-side tolerance every fold in this package applies to
+    malformed log entries (`fold_done_level` below; `core.done._current_level`;
+    `core.edges`'s own "skip defensively, never raise on read" pattern).
+    Rejecting here means nothing bad is ever persisted in the first place
+    (NFR-7), matching every other malformed-write case `validate_event`
+    already handles. `core.events.read_all` also runs `validate_event` on
+    every line it reads, so a bogus value written directly to the log file
+    (bypassing `core.events.append` entirely) is skipped on read the same
+    way a torn/corrupt line is — it never becomes an `Event` at all, which
+    is why `fold_done_level`'s own read-time tolerance for this case is
+    unreachable except via a raw file write, not via anything that ever
+    passed through this function.
+
+    Args:
+        event_type: the event's `type`.
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: if `event_type == "done_level_advanced"` and
+            `payload["done_level"]` is present but not in `DONE_LEVELS`.
+    """
+    if event_type != "done_level_advanced" or "done_level" not in payload:
+        return
+    value = payload["done_level"]
+    if value not in DONE_LEVELS:
+        raise ValidationError(
+            f"done_level_advanced payload 'done_level' {value!r} is not a "
+            f"recognized done_level (expected one of {DONE_LEVELS})"
+        )
+
+
+def fold_done_level(current_level: str, event: Event) -> str:
+    """Return the `done_level` after folding one event onto `current_level` (G5 F1).
+
+    The single shared read-time derivation rule both `core.done._current_level`
+    and `core.projection` (`_fresh_fragment`/`_apply`) fold through — so a
+    node's *projected* `done_level` and its *policy-computed* current level
+    (what `core.done.advance()`'s adjacency check reads) can never disagree,
+    no matter what is actually in the log. Mirrors `core.edges.resolve_graph`'s
+    own "re-derive on read, don't trust what was written" philosophy applied
+    to the done-ladder.
+
+    `event` advances the level ONLY if all three hold: `event.type ==
+    "done_level_advanced"`; `event.payload["done_level"]` is a recognized
+    `DONE_LEVELS` value; and that value's ladder position is exactly
+    `current_level`'s position + 1 (single-rung forward, the same adjacency
+    rule `core.done.advance()` enforces at write time). Any other event
+    — a different type, a missing/unrecognized `done_level`, or a
+    non-adjacent (skip-level, backward, same-level) value — leaves
+    `current_level` unchanged. This closes the hole a direct `append()` of a
+    correctly-typed `done_level_advanced` event used to exploit: bypassing
+    `advance()` entirely no longer bypasses the ladder's adjacency rule too,
+    because the read side re-derives it independently rather than trusting
+    the payload verbatim.
+
+    **Residual (accepted, out of scope for this fix):** a deliberately
+    fully-forged *adjacent* chain — separate direct-append `done_level_advanced`
+    events for D0->D1->D2->D3->D4, each one rung past the last, with
+    fabricated evidence/approver values that were never actually checked —
+    still advances all the way to D4-prod on read, because this function has
+    no way to re-verify at read time whether evidence was genuinely recorded
+    or an approver was genuinely human; only `advance()` enforces those gates,
+    and only at write time. This is equivalent to a raw file write bypassing
+    every in-process check by definition (the same caveat `core.projection`'s
+    own module docstring already carries for `project_event`'s ownership
+    re-check) — a determined caller with direct log-file write access is out
+    of this scope, not a gap this fold could plausibly close.
+
+    Args:
+        current_level: the node's `done_level` before folding `event`
+            (`"D0-code"` for a fresh/unseen node — every caller's own
+            documented default).
+        event: the event to fold in.
+
+    Returns:
+        str: `event.payload["done_level"]` if it is a legal single-rung
+        forward advance from `current_level`; `current_level` unchanged
+        otherwise.
+    """
+    if event.type != "done_level_advanced":
+        return current_level
+    candidate = event.payload.get("done_level")
+    if candidate not in _LEVEL_INDEX:
+        return current_level
+    if _LEVEL_INDEX[candidate] != _LEVEL_INDEX[current_level] + 1:
+        return current_level
+    return candidate
 
 
 def validate_fragment(data: dict[str, Any]) -> Fragment:
