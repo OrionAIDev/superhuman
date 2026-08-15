@@ -230,6 +230,7 @@ def validate_event(data: dict[str, Any]) -> Event:
     payload = data.get("payload", {})
     if not isinstance(payload, dict):
         raise ValidationError("payload must be a dict")
+    _assert_done_level_write_boundary(event_type, payload)
     _assert_payload_status_values_are_valid(payload)
 
     return Event(
@@ -286,6 +287,44 @@ def _assert_role_only(writer_role: Any) -> None:
                 f"writer_role {writer_role!r} looks like a model/vendor name, "
                 f"not a role (matched {token!r}); NFR-6 requires a role string"
             )
+
+
+def _assert_done_level_write_boundary(event_type: str, payload: dict[str, Any]) -> None:
+    """Raise ValidationError if `payload` carries `done_level` on a non-advance event.
+
+    G5 fix #1(a): `done_level` is the entry point to the evidence-gated
+    done-ladder state machine (`core.done.advance()`, FR-6/DP#5) — every one
+    of its rung invariants (single-rung-forward, evidence gates, human-
+    approver gate, D-ceiling) is enforced ONLY inside `advance()`. Without
+    this check, any sanctioned event of another type (e.g.
+    `lifecycle_changed`) could carry `done_level` in its payload and, via
+    `core.projection`'s generic `STATUS_FIELDS` fold, set a node's projected
+    done_level directly — bypassing every one of those gates entirely, since
+    `done_level` is a `"shared"` field in `FIELD_OWNERS` (either class may
+    write it; ownership alone does not close this hole). `core/projection.py`
+    additionally excludes `done_level` from its own generic fold as
+    defense-in-depth (fix #1(b)), so the two checks must always agree.
+
+    Scoped to `done_level` only — the same generic-fold bypass technically
+    exists for the other four `STATUS_FIELDS` (lifecycle/block_state/
+    review_state/adoption_state), but those are not evidence-gated; the
+    general "which event types may write which status field" question is a
+    tracked follow-up (G5 decision), not fixed here.
+
+    Args:
+        event_type: the event's `type`.
+        payload: the event's payload dict.
+
+    Raises:
+        ValidationError: if `"done_level"` is a key in `payload` and
+            `event_type` is not `"done_level_advanced"`.
+    """
+    if "done_level" in payload and event_type != "done_level_advanced":
+        raise ValidationError(
+            "payload key 'done_level' may only be set by a "
+            "'done_level_advanced' event — core.done.advance() is the sole "
+            f"write path onto the done-ladder (FR-6/DP#5); got type {event_type!r}"
+        )
 
 
 def _assert_payload_status_values_are_valid(payload: dict[str, Any]) -> None:

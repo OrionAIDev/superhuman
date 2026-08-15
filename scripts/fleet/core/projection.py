@@ -12,7 +12,11 @@ Any event payload key that matches one of `schema.STATUS_FIELDS` is applied
 to the fragment directly — projection does not hardcode a table of event
 types to fields, so new event types introduced by later chunks (handoff,
 edges, done_level) project correctly without changes here, as long as their
-payload uses the same field names.
+payload uses the same field names. **One exception (G5 fix #1(b)):**
+`done_level` is folded ONLY from `done_level_advanced` events, never via
+this generic fold — see `_done_level_override`, which mirrors
+`core.done.py::_current_level`'s own derivation rule, so the two can never
+disagree.
 
 **Write-boundary invariant (HARDEN #3, GPT-5 review):** `core/events.append`
 is the *sole enforced write entry* for the log — schema validation and
@@ -45,6 +49,39 @@ _DEFAULT_STATUS: dict[str, str] = {
     "done_level": "D0-code",
 }
 
+#: G5 fix #1(b): `done_level` is deliberately excluded from the generic
+#: STATUS_FIELDS fold below — see `_done_level_override` for why. The other
+#: four status fields keep folding generically; this scoping is intentional
+#: (per-field write authority for the rest is a tracked follow-up, not fixed
+#: here — see `core.schema._assert_done_level_write_boundary`).
+_GENERIC_FOLD_FIELDS: tuple[str, ...] = tuple(f for f in STATUS_FIELDS if f != "done_level")
+
+
+def _done_level_override(event: Event) -> str | None:
+    """Return the `done_level` this event should apply, or `None` for "no change."
+
+    G5 fix #1(b): mirrors `core.done.py::_current_level`'s own rule — a
+    node's `done_level` is derived ONLY from `done_level_advanced` events,
+    never from the generic per-field payload fold every other status field
+    uses. `core/schema.py`'s `_assert_done_level_write_boundary` already
+    rejects a non-advance event carrying `done_level` in its payload at the
+    write boundary (fix #1(a)); this is the defense-in-depth half, for an
+    `Event` that reached this function without passing through that check
+    (e.g. a directly-constructed `Event`, which `project_event`'s own
+    docstring already warns this module must not blindly trust).
+
+    Args:
+        event: the event being folded onto a fragment.
+
+    Returns:
+        str | None: the payload's `done_level` value if `event.type` is
+        `"done_level_advanced"` and the key is present; `None` otherwise
+        (meaning "leave the fragment's current/default done_level alone").
+    """
+    if event.type == "done_level_advanced":
+        return event.payload.get("done_level")
+    return None
+
 
 def _fresh_fragment(event: Event) -> Fragment:
     """Build the default fragment for a node's first-seen event.
@@ -54,12 +91,16 @@ def _fresh_fragment(event: Event) -> Fragment:
 
     Returns:
         Fragment: defaults overridden by any status-field keys in the
-        event's payload.
+        event's payload (`done_level` only from a `done_level_advanced`
+        event — see `_done_level_override`).
     """
     fields = dict(_DEFAULT_STATUS)
-    for key in STATUS_FIELDS:
+    for key in _GENERIC_FOLD_FIELDS:
         if key in event.payload:
             fields[key] = event.payload[key]
+    done_level = _done_level_override(event)
+    if done_level is not None:
+        fields["done_level"] = done_level
     return Fragment(node_id=event.node_id, project_id=event.project_id, **fields)
 
 
@@ -68,12 +109,17 @@ def _apply(fragment: Fragment, event: Event) -> Fragment:
 
     Args:
         fragment: the fragment to update.
-        event: the event to fold in; only keys in `STATUS_FIELDS` are applied.
+        event: the event to fold in; only keys in `_GENERIC_FOLD_FIELDS` are
+            applied generically, plus `done_level` from a
+            `done_level_advanced` event only (see `_done_level_override`).
 
     Returns:
         Fragment: `fragment` with any matching payload values overwritten.
     """
-    overrides = {k: v for k, v in event.payload.items() if k in STATUS_FIELDS}
+    overrides = {k: v for k, v in event.payload.items() if k in _GENERIC_FOLD_FIELDS}
+    done_level = _done_level_override(event)
+    if done_level is not None:
+        overrides["done_level"] = done_level
     if not overrides:
         return fragment
     fields = {

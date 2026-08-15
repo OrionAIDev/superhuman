@@ -10,10 +10,12 @@ from pathlib import Path
 
 import pytest
 
+from scripts.fleet.core.done import advance as done_advance
+from scripts.fleet.core.done import _current_level as done_current_level
 from scripts.fleet.core.errors import OwnershipError
-from scripts.fleet.core.events import append
+from scripts.fleet.core.events import append, read_all
 from scripts.fleet.core.projection import project_event, rebuild
-from scripts.fleet.core.schema import validate_event
+from scripts.fleet.core.schema import Event, validate_event
 from scripts.fleet.core.store import fragment_path, read_fragment
 
 
@@ -165,3 +167,94 @@ class TestProjectEventIsNotABackDoorAroundOwnership:
 
         assert fragment.lifecycle == "active"
         assert read_fragment(node_id, sessions_dir) == fragment
+
+
+class TestDoneLevelOnlyFoldsFromAdvanceEvents:
+    """G5 fix #1(b): `done_level` is folded ONLY from `done_level_advanced`
+    events — never via the generic STATUS_FIELDS fold every other status
+    field uses. `core/events.append` (and its `validate_event` call)
+    already rejects a non-advance event carrying `done_level` in its
+    payload at the write boundary (fix #1(a), `core/schema.py`); this is
+    the defense-in-depth half — a directly-constructed `Event` (the
+    dataclass, bypassing `validate_event` entirely, exactly the shape
+    `project_event`'s own docstring warns it must not trust) must still
+    have its `done_level` payload key ignored by both the incremental
+    (`project_event`) and full-replay (`rebuild`) projection paths, so
+    `core/projection.py` and `core/done.py::_current_level` can never
+    disagree about a node's done_level.
+    """
+
+    def _forged_lifecycle_event_with_done_level(self, node_id: str) -> Event:
+        # Bypasses validate_event() on purpose — the scenario under test is
+        # exactly "something got an Event object past the schema-level
+        # write-boundary check," e.g. a future in-process caller that
+        # constructs Event(...) directly rather than going through append().
+        return Event(
+            schema_version=1,
+            event_id="eid-forged",
+            idempotency_key=f"lifecycle:{node_id}:active",
+            ts="2026-08-15T00:00:00Z",
+            type="lifecycle_changed",
+            project_id="proj-abc",
+            node_id=node_id,
+            writer_role="Developer",
+            payload={"lifecycle": "active", "done_level": "D4-prod"},
+        )
+
+    def test_project_event_ignores_done_level_on_a_fresh_fragment(
+        self, tmp_path: Path
+    ) -> None:
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/forged-fresh"
+
+        fragment = project_event(
+            self._forged_lifecycle_event_with_done_level(node_id), sessions_dir
+        )
+
+        assert fragment.lifecycle == "active"  # the legitimate field still folds
+        assert fragment.done_level == "D0-code"  # forged done_level ignored
+
+    def test_project_event_ignores_done_level_on_an_existing_fragment(
+        self, tmp_path: Path
+    ) -> None:
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/forged-existing"
+        project_event(validate_event(_registered_event(node_id)), sessions_dir)
+
+        fragment = project_event(
+            self._forged_lifecycle_event_with_done_level(node_id), sessions_dir
+        )
+
+        assert fragment.lifecycle == "active"
+        assert fragment.done_level == "D0-code"
+
+    def test_projection_and_done_current_level_agree_on_a_mixed_log(
+        self, tmp_path: Path
+    ) -> None:
+        """A log with a legitimate `done_level_advanced` transition plus an
+        (in-process, forged) `Event` carrying `done_level` in a non-advance
+        payload must still leave `core/projection` and
+        `core/done.py::_current_level` in agreement — the whole point of
+        fix #1(b)."""
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+        node_id = "portable/ws/proj/mixed"
+
+        append(log_path, _registered_event(node_id))
+        done_advance(
+            node_id,
+            "D1-merged",
+            evidence={"commit": "abc123"},
+            approver=None,
+            ceiling="D4-prod",
+            project_id="proj-abc",
+            writer_role="Developer",
+            log_path=log_path,
+        )
+
+        fragments = rebuild(log_path, sessions_dir, project_id="proj-abc")
+
+        assert fragments[node_id].done_level == "D1-merged"
+        assert fragments[node_id].done_level == done_current_level(
+            read_all(log_path), node_id
+        )

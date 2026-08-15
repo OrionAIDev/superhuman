@@ -603,13 +603,25 @@ def _cmd_done_advance(args: argparse.Namespace) -> int:
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
-    evidence: dict[str, Any] = {}
-    if args.evidence_json is not None:
-        evidence = json.loads(args.evidence_json.read_text(encoding="utf-8"))
-
     ceiling = args.ceiling or _resolve_d_ceiling(args.workspace)
 
     try:
+        # G5 fix #4: evidence-JSON parsing moved INSIDE the try (it used to
+        # run before this block even started), and the decoded value is
+        # checked to actually be a JSON object — a missing --evidence-json
+        # path, a malformed file, or a well-formed-but-non-object top-level
+        # value (e.g. `[1, 2]`) must all produce a clean nonzero exit and a
+        # stderr message, never an uncaught traceback.
+        evidence: dict[str, Any] = {}
+        if args.evidence_json is not None:
+            decoded = json.loads(args.evidence_json.read_text(encoding="utf-8"))
+            if not isinstance(decoded, dict):
+                raise ValueError(
+                    "--evidence-json must contain a JSON object, got "
+                    f"{type(decoded).__name__}"
+                )
+            evidence = decoded
+
         result = done_advance(
             args.node_id,
             args.target_level,
@@ -623,7 +635,14 @@ def _cmd_done_advance(args: argparse.Namespace) -> int:
     except LockTimeoutError as exc:
         print(f"fleet done advance: could not acquire the manifest lock: {exc}", file=sys.stderr)
         return 1
-    except (ValidationError, OwnershipError, ValueError, DonePolicyError) as exc:
+    except (
+        ValidationError,
+        OwnershipError,
+        ValueError,
+        DonePolicyError,
+        TypeError,
+        FileNotFoundError,
+    ) as exc:
         print(f"fleet done advance: rejected: {exc}", file=sys.stderr)
         return 1
 

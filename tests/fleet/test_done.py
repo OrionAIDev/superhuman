@@ -114,6 +114,19 @@ class TestTC26MergeEvidenceGate:
 
         assert read_all(log_path) == []
 
+    def test_whitespace_only_commit_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """G5 fix #3: `_has_merge_evidence` must not treat whitespace-only
+        as present — `bool("   ")` is `True`, so the pre-fix gate silently
+        accepted a blank-looking commit reference."""
+        log_path = _log(tmp_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "   "})
+
+        assert read_all(log_path) == []
+
 
 class TestTC27DeployTestEvidenceConjunction:
     """TC-27: D1-merged -> D2-test requires deploy+test evidence (conjunction)."""
@@ -139,6 +152,19 @@ class TestTC27DeployTestEvidenceConjunction:
             _advance(log_path, "D2-test", evidence={"ci_run": "ci-1"})
 
         assert len(read_all(log_path)) == 1  # only the D1 event from setup
+
+    def test_whitespace_only_deploy_and_test_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """G5 fix #3: a whitespace-only value for either D2-test evidence key
+        must not satisfy the conjunction."""
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D2-test", evidence={"deploy_id": "d", "ci_run": "\n"})
+
+        assert len(read_all(log_path)) == 1
 
     def test_deploy_id_only_raises_and_writes_nothing(self, tmp_path: Path) -> None:
         log_path = _log(tmp_path)
@@ -192,27 +218,58 @@ class TestTC28HumanApproverGateD3:
         with pytest.raises(DonePolicyError):
             _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="   ")
 
-    def test_bot_shaped_approver_is_rejected(self, tmp_path: Path) -> None:
-        """A role/bot-shaped approver (e.g. "automation") is not a human identity.
+    @pytest.mark.parametrize(
+        "approver",
+        [
+            "jenkins",
+            "Jenkins",
+            "cron",
+            "CI",
+            "cd",
+            "automation",
+            "system",
+            "robot",
+            "bot",
+            "daemon",
+            "github-actions",
+            "gitlab-ci",
+            "circleci",
+            "travis",
+            "service-account",
+            "noreply",
+            "no-reply",
+            "0",
+            ".",
+            "123",
+            "--",
+            "",
+            "   ",
+        ],
+    )
+    def test_bot_shaped_approver_is_rejected(self, tmp_path: Path, approver: str) -> None:
+        """G5 fix #2: an automation-stem-shaped or trivial approver is not a
+        human identity, and is rejected the same as a model/vendor-shaped
+        one.
 
-        `core/done.py`'s only deterministic distinction between human and
-        non-human is `core.schema.is_model_vendor_name` (the same
-        model/vendor denylist NFR-6 holds `writer_role` to) — it does not
-        encode "automation"/"bot"/"ci" as non-human, only known model/vendor
-        name stems (claude, gpt, ...). Per TC-28, this gap is flagged to
-        PM/Architect for ratification rather than silently inventing a
-        broader denylist inside this module; see this chunk's report.
-        This fixture documents that "automation" is presently a *known
-        gap* — it is currently treated as an acceptable (non-model) human
-        approver by the deterministic rule actually implemented, matching
-        what the docstring describes, not what a stricter policy might want.
+        `core/done.py`'s human-approver gate rejects three overlapping
+        categories, matched at TOKEN boundaries (never raw substring, so a
+        human "Cindy"/"Cicero" is never rejected for containing "ci" — see
+        `test_plausible_human_names_are_accepted` below): (1)
+        `core.schema.is_model_vendor_name` matches (claude, gpt, ...); (2)
+        a whole token equal to a known automation stem (jenkins, cron, ci,
+        cd, bot, robot, system, automation, daemon, actions, pipeline,
+        runner, svc, noreply, github-actions, gitlab-ci, circleci, travis,
+        service-account, agent); (3) a trivial string (< 2 chars, or no
+        alphabetic character at all). None of this proves biological
+        human-ness — the manifest records a *claimed* approver, an audit
+        trail, not identity proof; a determined caller could still enter a
+        fake human-shaped name. See the module/function docstrings.
         """
         log_path = _log(tmp_path)
         self._at_d2(log_path)
 
-        result = _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="automation")
-
-        assert result.status == "advanced"  # see docstring — flagged gap, not a silent decision
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver=approver)
 
     def test_model_vendor_shaped_approver_is_rejected(self, tmp_path: Path) -> None:
         log_path = _log(tmp_path)
@@ -220,6 +277,21 @@ class TestTC28HumanApproverGateD3:
 
         with pytest.raises(DonePolicyError):
             _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="Claude Opus")
+
+    @pytest.mark.parametrize(
+        "approver",
+        ["Jordan Rivera", "Cindy Lee", "Dana Fox", "Cicero Nash"],
+    )
+    def test_plausible_human_names_are_accepted(self, tmp_path: Path, approver: str) -> None:
+        """Names that merely *contain* an automation-stem substring (e.g.
+        "Cindy"/"Cicero" contain "ci") must NOT be rejected — the stem match
+        is whole-token only, never a raw substring test."""
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        result = _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver=approver)
+
+        assert result.status == "advanced"
 
 
 class TestTC29HumanApproverGateD4:
@@ -788,6 +860,65 @@ class TestCliDoneAdvanceSubcommand:
         fleet_dir = tmp_path / "fleet"
         evidence_file = tmp_path / "evidence.json"
         evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_missing_evidence_json_file_returns_nonzero_not_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 fix #4: `json.loads(path.read_text())` used to run OUTSIDE the
+        try/except in `_cmd_done_advance`, so a missing/malformed evidence
+        file crashed with an uncaught exception instead of a clean nonzero
+        exit."""
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+
+        args = self._parser_args(
+            workspace,
+            fleet_dir,
+            "D1-merged",
+            evidence_json=str(tmp_path / "does-not-exist.json"),
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_evidence_json_top_level_array_returns_nonzero_not_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text("[1, 2]", encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_malformed_evidence_json_returns_nonzero_not_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text("{not valid json", encoding="utf-8")
 
         args = self._parser_args(
             workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)

@@ -24,12 +24,14 @@ fragment or an adapter-supplied fact, keeping ``core/`` harness-neutral
   evidence (``deploy_id``) and test evidence (``ci_run``) — a conjunction;
   either alone is rejected.
 - **Human-approver gate.** ``D3-uat`` and ``D4-prod`` require a recorded
-  ``approver`` that is present, non-blank, and not model/vendor-shaped
-  (reuses ``core.schema.is_model_vendor_name`` — the same judgment
-  ``writer_role`` is held to, NFR-6). This is deterministic string
-  classification, not an attempt to infer whether a name genuinely belongs
-  to a human; see TC-28's own note and this chunk's report to PM for the
-  concern that flags.
+  ``approver`` that is present, non-trivial, not model/vendor-shaped (reuses
+  ``core.schema.is_model_vendor_name`` — the same judgment ``writer_role``
+  is held to, NFR-6), and not automation-shaped (a whole token matching a
+  known automation stem — jenkins, cron, ci, bot, "github-actions", etc.;
+  see ``_is_human_approver``). This is deterministic string classification,
+  not a genuine human/bot determination: the manifest records a *claimed*
+  approver, an audit trail, not identity proof — a determined caller could
+  still enter a plausible-looking fake human name. See TC-28's own note.
 - **D-ceiling.** ``ceiling`` is a plain parameter — the caller (the CLI)
   resolves it from the operator's profile before calling ``advance()``;
   nothing here reads a profile file. Advancing above ``ceiling`` is
@@ -50,14 +52,30 @@ own idempotency dedupe ever gets a chance to short-circuit it (see
 ``_reject_unless_single_rung_forward``, called both as a pre-lock fast-fail
 and, defensively, inside ``append()``'s ``precondition`` under the lock).
 Concurrent racers attempting the *same* legitimate next step still dedupe
-safely against each other (they share the same idempotency key and the
-loser's write is a genuine no-op) — only a *sequential* repeat by one caller
-is turned into a rejection. Flagged as a deliberate, TEST.md-driven deviation
-from the sibling modules' retry-idempotency convention, not an oversight.
+safely against each other, but which outcome the *loser* observes is
+timing-dependent, not a single guaranteed path: if the loser's pre-lock
+``_current_level`` read happens before the winner's write commits, the
+loser's own pre-lock adjacency check still passes, it proceeds to
+``append()``, and ``append()``'s idempotency dedupe (both callers share the
+same key ``done:<node_id>:<target_level>``) turns its write into a safe
+no-op — ``AdvanceResult(status="deduped", ...)``. If instead the loser's
+pre-lock read happens after the winner's write already committed, its own
+pre-lock adjacency check now sees the post-advance current level and
+rejects the call as a same-level attempt (``DonePolicyError``), exactly
+like TC-30's sequential-repeat case, before ``append()`` is ever reached.
+Both outcomes are equally safe — exactly one ``done_level_advanced`` event
+is ever written for that `(node, target)` pair, and the final recorded
+level is correct either way — but a caller cannot rely on which one it
+gets. A caller racing the same transition against another writer should
+treat a same-level ``DonePolicyError`` the same way it would treat
+``status="deduped"``: "already advanced by another writer," not a genuine
+policy violation. Flagged as a deliberate, TEST.md-driven deviation from
+the sibling modules' retry-idempotency convention, not an oversight.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +109,44 @@ _TEST_EVIDENCE_KEY: Final[str] = "ci_run"
 #: Levels whose gate requires a recorded human approver (FR-6).
 _APPROVER_REQUIRED_LEVELS: Final[frozenset[str]] = frozenset({"D3-uat", "D4-prod"})
 
+#: G5 fix #2 — automation-shaped stems rejected by `_is_human_approver`,
+#: matched at whole-TOKEN boundaries only (never raw substring — see
+#: `_has_automation_stem`), so a human name that merely *contains* one of
+#: these as a substring (e.g. "Cindy"/"Cicero" contain "ci") is never
+#: rejected. Hyphenated stems (`"github-actions"`, `"gitlab-ci"`,
+#: `"service-account"`, `"no-reply"`) are stored with the hyphen already
+#: stripped, matching how `_has_automation_stem` normalizes the candidate
+#: string before tokenizing.
+_AUTOMATION_STEMS: Final[frozenset[str]] = frozenset(
+    {
+        "jenkins",
+        "cron",
+        "ci",
+        "cd",
+        "bot",
+        "robot",
+        "system",
+        "automation",
+        "daemon",
+        "actions",
+        "pipeline",
+        "runner",
+        "svc",
+        "noreply",
+        "githubactions",
+        "gitlabci",
+        "circleci",
+        "travis",
+        "serviceaccount",
+        "agent",
+    }
+)
+
+#: Splits a (hyphen/underscore-normalized) approver string into candidate
+#: tokens for the automation-stem check — any run of non-alphanumeric
+#: characters is a boundary.
+_TOKEN_SPLIT_RE: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
+
 
 def _now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string with a `Z` suffix.
@@ -109,9 +165,14 @@ class AdvanceResult:
         status: `"advanced"` (a new `done_level_advanced` event was
             appended) or `"deduped"` (an event with this exact `(node_id,
             target_level)` idempotency key already existed — a genuine
-            concurrent-race no-op, not an error; see the module docstring's
-            "No retry-idempotency" note for why a *sequential* repeat never
-            reaches this path).
+            concurrent-race no-op, not an error). See the module docstring's
+            "No retry-idempotency" note: a *sequential* repeat never reaches
+            this path (it raises `DonePolicyError` instead), and even a
+            genuinely concurrent racer for the *same* transition may
+            observe either this `"deduped"` result or a same-level
+            `DonePolicyError`, depending on timing — both are safe, and a
+            caller should treat either as "already advanced by another
+            writer."
         node_id: the node this call targeted.
         level: the target level this call attempted to record.
     """
@@ -135,6 +196,27 @@ def _validate_known_level(value: str, what: str) -> None:
         raise ValueError(f"{what} {value!r} is not a recognized done_level (expected one of {DONE_LEVELS})")
 
 
+def _is_present(value: Any) -> bool:
+    """Return whether `value` counts as "present" evidence (G5 fix #3).
+
+    A plain `bool(value)` treats a whitespace-only string like `"   "` as
+    present (non-empty strings are always truthy in Python) — this closes
+    that gap: a string only counts if it has a non-whitespace character
+    after stripping. Non-string truthy values (e.g. a caller passing an int)
+    are unaffected.
+
+    Args:
+        value: the candidate evidence value (e.g. `evidence.get("commit")`).
+
+    Returns:
+        bool: True iff `value` is truthy and, when a string, non-blank after
+        `.strip()`.
+    """
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
 def _has_merge_evidence(evidence: dict[str, Any]) -> bool:
     """Return whether `evidence` satisfies the D1-merged gate.
 
@@ -142,9 +224,10 @@ def _has_merge_evidence(evidence: dict[str, Any]) -> bool:
         evidence: the candidate evidence dict.
 
     Returns:
-        bool: True iff a non-blank `commit` or `pr` value is present.
+        bool: True iff a non-blank (whitespace-only does not count, G5 fix
+        #3) `commit` or `pr` value is present.
     """
-    return any(bool(evidence.get(key)) for key in _MERGE_EVIDENCE_KEYS)
+    return any(_is_present(evidence.get(key)) for key in _MERGE_EVIDENCE_KEYS)
 
 
 def _has_deploy_and_test_evidence(evidence: dict[str, Any]) -> bool:
@@ -155,31 +238,98 @@ def _has_deploy_and_test_evidence(evidence: dict[str, Any]) -> bool:
 
     Returns:
         bool: True iff **both** a non-blank `deploy_id` and a non-blank
-        `ci_run` value are present — either alone is insufficient (FR-6).
+        `ci_run` value are present (whitespace-only does not count, G5 fix
+        #3) — either alone is insufficient (FR-6).
     """
-    return bool(evidence.get(_DEPLOY_EVIDENCE_KEY)) and bool(evidence.get(_TEST_EVIDENCE_KEY))
+    return _is_present(evidence.get(_DEPLOY_EVIDENCE_KEY)) and _is_present(
+        evidence.get(_TEST_EVIDENCE_KEY)
+    )
+
+
+def _has_automation_stem(approver: str) -> bool:
+    """Return whether `approver` contains a whole token matching an automation stem.
+
+    G5 fix #2. Deliberately a whole-TOKEN match, not a raw substring test:
+    the candidate is lowercased, its hyphens/underscores are removed (so
+    `"github-actions"` normalizes the same way as the stored stem
+    `"githubactions"`), and the result is split on every remaining run of
+    non-alphanumeric characters (spaces, dots, ...) into tokens. A plausible
+    human name like "Cindy Lee" or "Cicero Nash" tokenizes to
+    `{"cindy", "lee"}` / `{"cicero", "nash"}` — neither *equals* the stem
+    `"ci"`, so neither is rejected, even though both *contain* it as a
+    substring.
+
+    Args:
+        approver: the candidate approver identity (already known non-blank).
+
+    Returns:
+        bool: True iff any token equals a member of `_AUTOMATION_STEMS`.
+    """
+    normalized = approver.lower().replace("-", "").replace("_", "")
+    tokens = (t for t in _TOKEN_SPLIT_RE.split(normalized) if t)
+    return any(token in _AUTOMATION_STEMS for token in tokens)
+
+
+def _is_trivial_approver(stripped: str) -> bool:
+    """Return whether a stripped approver string is too trivial to be a name.
+
+    G5 fix #2. Rejects a stripped value shorter than 2 characters (`"0"`,
+    `"."`) or one with no alphabetic character at all (`"123"`, `"--"`) —
+    neither can plausibly be a human name, regardless of the denylist/stem
+    checks.
+
+    Args:
+        stripped: the approver string, already `.strip()`-ed.
+
+    Returns:
+        bool: True iff `stripped` is trivial by the rules above.
+    """
+    return len(stripped) < 2 or not any(ch.isalpha() for ch in stripped)
 
 
 def _is_human_approver(approver: str | None) -> bool:
     """Return whether `approver` satisfies the D3-uat/D4-prod human-approver gate.
 
-    Reuses `core.schema.is_model_vendor_name` — the same deterministic
-    "looks like a model/vendor name, not a role/human" judgment
-    `writer_role` is held to (NFR-6) — so this module has no second
-    denylist to drift out of sync with `schema.py`'s. This is a string
-    classification, not a genuine human/bot determination; see the module
-    docstring.
+    Rejects `approver` if it is `None`/blank; matches
+    `core.schema.is_model_vendor_name` (the same deterministic "looks like a
+    model/vendor name, not a role/human" judgment `writer_role` is held to,
+    NFR-6, so this module has no second denylist to drift out of sync with
+    `schema.py`'s); contains a whole-token automation stem (G5 fix #2, see
+    `_has_automation_stem` — jenkins, cron, ci, cd, bot, robot, system,
+    automation, daemon, actions, pipeline, runner, svc, noreply,
+    "github-actions", "gitlab-ci", circleci, travis, "service-account",
+    agent); or is trivial (G5 fix #2, see `_is_trivial_approver` — fewer
+    than 2 characters, or no alphabetic character at all, e.g. `"0"`,
+    `"."`, `"123"`, `"--"`).
+
+    None of this proves biological human-ness — it cannot. This is
+    deterministic string classification: the manifest records a *claimed*
+    approver identity, an audit trail, not identity proof. A determined
+    caller could still enter a plausible-looking fake human name and pass
+    every check here; see the module docstring and TC-28's own note.
+    Known pre-existing limitation (not addressed by this fix, NFR-6): since
+    `is_model_vendor_name` matches by substring rather than whole token, a
+    rare surname like "Palmer" (contains "palm") is false-rejected as
+    model/vendor-shaped.
 
     Args:
         approver: the candidate approver identity, or `None`.
 
     Returns:
-        bool: True iff `approver` is a non-blank string that does not match
-        the model/vendor denylist.
+        bool: True iff `approver` is a non-blank, non-trivial string that
+        does not match the model/vendor denylist and contains no
+        whole-token automation stem.
     """
     if approver is None:
         return False
-    return not is_model_vendor_name(approver)
+    stripped = approver.strip()
+    if _is_trivial_approver(stripped):
+        return False
+    if is_model_vendor_name(approver):
+        return False
+    if _has_automation_stem(approver):
+        return False
+    return True
 
 
 def _current_level(events: list[Event], node_id: str) -> str:

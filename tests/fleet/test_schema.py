@@ -277,6 +277,50 @@ class TestPayloadStatusValuesAreValidatedAtWriteTime:
         assert event.payload == {"note": "", "commit_sha": "abc123"}
 
 
+class TestDoneLevelWriteBoundary:
+    """G5 fix #1(a): `done_level` may only be set by a `done_level_advanced`
+    event. Without this, a sanctioned event of any other type (e.g.
+    `lifecycle_changed`) could carry `done_level` in its payload and, via
+    `core.projection`'s generic STATUS_FIELDS fold, set a node's projected
+    done_level directly — bypassing every one of `core.done.advance()`'s
+    evidence/approver/ceiling/adjacency gates entirely, since `done_level`
+    is a "shared" field in `FIELD_OWNERS` (ownership alone does not catch
+    this). See `core/projection.py`'s matching fold-exclusion (fix #1(b)).
+    """
+
+    def test_done_level_in_a_non_advance_event_payload_is_rejected(self) -> None:
+        data = _valid_event()
+        data["type"] = "lifecycle_changed"
+        data["payload"] = {"lifecycle": "active", "done_level": "D4-prod"}
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_done_level_in_a_non_advance_event_is_rejected_at_append_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        data = _valid_event()
+        data["type"] = "lifecycle_changed"
+        data["payload"] = {"done_level": "D4-prod"}
+        with pytest.raises(ValidationError):
+            append(log_path, data)
+        assert read_all(log_path) == []
+
+    def test_done_level_advanced_event_may_carry_done_level(self) -> None:
+        data = _valid_event()
+        data["type"] = "done_level_advanced"
+        data["payload"] = {"done_level": "D1-merged", "evidence": {}, "approver": None}
+        event = validate_event(data)
+        assert event.payload["done_level"] == "D1-merged"
+
+    def test_non_advance_event_without_done_level_in_payload_is_unaffected(self) -> None:
+        data = _valid_event()
+        data["type"] = "lifecycle_changed"
+        data["payload"] = {"lifecycle": "active"}
+        event = validate_event(data)
+        assert event.payload == {"lifecycle": "active"}
+
+
 class TestInvalidPayloadStatusIsRejectedAtAppendAndNeverStrandsASession:
     """The end-to-end version of the same finding: append() rejects it
     outright (nothing persisted), and a *valid* status written afterward is
