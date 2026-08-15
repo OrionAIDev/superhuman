@@ -1323,3 +1323,135 @@ class TestResolveHandoffExpirySeconds:
         )
         result = _resolve_handoff_expiry_seconds(profile_path=None)
         assert result == 42.0
+
+
+def _corrupt_fragment(node_id: str, sessions_dir: Path) -> None:
+    """Truncate `node_id`'s cached fragment file in place, matching
+    `test_projection.py`'s corruption pattern (invalid JSON, on-disk file
+    still present — the "corrupt", not "absent", case)."""
+    path = fragment_path(node_id, sessions_dir)
+    path.write_text('{"node_id": "' + node_id + '", "lifecy', encoding="utf-8")
+
+
+class TestCorruptCachedFragmentRecovery:
+    """G6 (systematic sweep): a corrupt cached fragment must never crash a
+    handoff decision or silently cause a wrong one — every fragment-read call
+    site in this module recovers via `core.projection.rebuild()` and retries,
+    per GPT-5 round-5's P5-1/P5-2 findings (the two BLOCKING call sites this
+    round fixes) plus a regression check for `cancel()` (already hardened in
+    G5 round-5, re-verified here).
+    """
+
+    def test_exact_id_self_register_recovers_from_corrupt_cached_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """P5-1: pre-fix, `read_fragment` raises `FragmentCorrupt` straight
+        out of `self_register`'s exact-id path (line ~560 was unwrapped) —
+        the launch crashes instead of succeeding. Post-fix: recovers via
+        `rebuild()` and the launch still flips to active."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, handoff_id="hid-corrupt-exact")
+        _corrupt_fragment(emission.node_id, sessions_dir)
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=emission.handoff_id,
+        )
+
+        assert result.status == "launched"
+        assert result.node_id == emission.node_id
+        assert result.match_method == "exact"
+
+        events = read_all(log_path)
+        assert len([e for e in events if e.type == "handoff_launched"]) == 1
+
+        sessions = list_sessions(sessions_dir, project_id="proj-abc123")
+        assert sessions[0].lifecycle == "active"
+
+    def test_fuzzy_self_register_recovers_from_corrupt_awaiting_launch_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """P5-2: pre-fix, `iter_fragments()`'s default `skip_corrupt=True`
+        silently drops the corrupt awaiting-launch row out of
+        `_open_awaiting_launch_rows`' candidate pool, so the real match
+        vanishes and this returns `not_found` — a silent wrong decision, not
+        a crash. Post-fix: recovers via `rebuild()` and the launch succeeds
+        rather than reporting a false not_found."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-corrupt-fuzzy")
+        _corrupt_fragment(emission.node_id, sessions_dir)
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "launched"
+        assert result.node_id == emission.node_id
+        assert result.match_method == "fuzzy"
+
+    def test_cancel_recovers_from_corrupt_cached_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """Site 3 (line ~683): already hardened in G5 round-5 — re-verified
+        here as part of this round's systematic sweep."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, handoff_id="hid-corrupt-cancel")
+        _corrupt_fragment(emission.node_id, sessions_dir)
+
+        fragment = handoff.cancel(
+            emission.node_id,
+            project_id="proj-abc123",
+            writer_role="Project Manager",
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+        )
+
+        assert fragment.lifecycle == "cancelled"
+        events = read_all(log_path)
+        assert len([e for e in events if e.type == "handoff_cancelled"]) == 1
+
+    def test_genuinely_absent_fragment_still_returns_not_found_exact_id(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """Regression: a genuinely-absent fragment (never written, no
+        corrupt file on disk) must not be masked as present by the recovery
+        path — `rebuild()` on a node id with no matching `handoff_emitted`
+        event simply leaves it absent, and `self_register` must still report
+        `not_found` rather than fabricating a launch."""
+        log_path, sessions_dir = fleet_dir
+        _emit(git_repo, fleet_dir, handoff_id="hid-real")
+
+        with pytest.raises(ValueError):
+            handoff.self_register(
+                log_path=log_path,
+                sessions_dir=sessions_dir,
+                writer_role="session",
+                handoff_id="hid-does-not-exist",
+            )
+
+    def test_genuinely_absent_row_still_returns_not_found_fuzzy(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """Regression: fuzzy path with no matching (cwd, branch) — and no
+        corruption anywhere — must still report `not_found`, not be swept
+        into a false recovery-driven match."""
+        log_path, sessions_dir = fleet_dir
+        _emit(git_repo, fleet_dir, branch="feature/other")
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/does-not-exist",
+        )
+
+        assert result.status == "not_found"

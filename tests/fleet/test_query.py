@@ -137,3 +137,33 @@ class TestStaleHandoffsFromManifestAlone:
 
         assert log_path.read_bytes() == log_before
         assert {f.node_id: f for f in iter_fragments(sessions_dir)} == fragments_before
+
+    def test_a_corrupt_awaiting_launch_fragment_is_intentionally_omitted_not_recovered(
+        self, tmp_path: Path
+    ) -> None:
+        """G6 (systematic sweep), site 5: `stale_handoffs` is a best-effort,
+        read-only report — no launch/cancel/write follows automatically from
+        its output — so per the documented tolerance a corrupt cached
+        fragment is silently skipped (`iter_fragments`'s default
+        `skip_corrupt=True`), not recovered via `rebuild()`. This asserts
+        that disposition directly: the corrupt row is simply absent, and a
+        healthy sibling row is still reported."""
+        log_path = tmp_path / "events.jsonl"
+        sessions_dir = tmp_path / "sessions"
+        now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+        old_ts = (now - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        append(log_path, _emitted_event("node-corrupt", "hid-corrupt", old_ts))
+        append(log_path, _emitted_event("node-healthy", "hid-healthy", old_ts))
+        write_fragment(_fragment("node-healthy", "awaiting-launch"), sessions_dir)
+
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        from scripts.fleet.core.store import fragment_path
+
+        fragment_path("node-corrupt", sessions_dir).write_text(
+            '{"node_id": "node-corrupt", "lifecy', encoding="utf-8"
+        )
+
+        rows = stale_handoffs(log_path, sessions_dir, now=now, expiry_seconds=3600)
+
+        assert [r["node_id"] for r in rows] == ["node-healthy"]

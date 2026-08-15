@@ -43,8 +43,14 @@ def list_sessions(sessions_dir: Path | str, project_id: str | None = None) -> li
             returned; otherwise every tracked session is returned.
 
     Returns:
-        list[Fragment]: the matching fragments. Corrupt fragments are
-        skipped (best-effort read-only listing; see `core/store.iter_fragments`).
+        list[Fragment]: the matching fragments. **Intentional tolerance
+        (G6 systematic sweep):** this is a best-effort, read-only listing —
+        it drives no decision or action on its own — so a corrupt fragment
+        is silently skipped rather than raised or recovered
+        (`core.store.iter_fragments`'s default `skip_corrupt=True`). The
+        skipped session is not lost: its cached fragment is recovered by
+        `core.projection.rebuild()` on the next write that touches it, or on
+        demand.
     """
     fragments = iter_fragments(sessions_dir)
     if project_id is None:
@@ -132,6 +138,19 @@ def stale_handoffs(
         deterministic, reproducible report. A row whose `handoff_emitted`
         event cannot be found (a fragment with no matching log entry — not
         expected in normal operation) is skipped rather than guessed at.
+
+        **Intentional tolerance (G6 systematic sweep):** the `awaiting`
+        lookup below uses `core.store.iter_fragments`'s default
+        `skip_corrupt=True`, same as `list_sessions`. Unlike
+        `handoff._open_awaiting_launch_rows` (the fuzzy self-register
+        candidate pool, which recovers via `rebuild()` because a dropped row
+        there silently mis-launches or mis-reports "not found"), this
+        function only ever *reports* — no launch, cancel, or other write
+        follows automatically from its output, an operator or PM always acts
+        on it separately. A corrupt-and-skipped row is simply absent from
+        this one report; it is not lost, and reappears once its fragment is
+        rebuilt (by any write that touches it, or an explicit
+        `core.projection.rebuild()`).
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)

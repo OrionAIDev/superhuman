@@ -352,10 +352,26 @@ def _open_awaiting_launch_rows(
         list[_HandoffRow]: one row per open handoff, in log order. A
         fragment with no matching `handoff_emitted` event (not expected in
         normal operation) is skipped rather than guessed at.
+
+    A corrupt cached fragment must never silently drop a live candidate out
+    of this pool (G6 systematic sweep, GPT-5 P5-2, BLOCKING): unlike
+    `core.query.list_sessions`'s best-effort listing, this pool's contents
+    *drive a decision* — `self_register`'s fuzzy match. `iter_fragments`'s
+    default `skip_corrupt=True` would make a corrupt awaiting-launch row
+    vanish from `open_node_ids` with no error, so the real match is silently
+    reported `not_found`. This calls `iter_fragments(skip_corrupt=False)`
+    instead, and on `FragmentCorrupt` recovers via a full
+    `core.projection.rebuild()` from the log (the source of truth) before
+    retrying once — the same recover-not-guess contract every other
+    decision-driving fragment read in this module follows.
     """
-    open_node_ids = {
-        f.node_id for f in iter_fragments(sessions_dir) if f.lifecycle == "awaiting-launch"
-    }
+    try:
+        current_fragments = iter_fragments(sessions_dir, skip_corrupt=False)
+    except FragmentCorrupt:
+        rebuild(log_path, sessions_dir)
+        current_fragments = iter_fragments(sessions_dir, skip_corrupt=False)
+
+    open_node_ids = {f.node_id for f in current_fragments if f.lifecycle == "awaiting-launch"}
     if not open_node_ids:
         return []
 
@@ -557,7 +573,19 @@ def self_register(
         handoff_id = candidates[0].handoff_id
         match_method = "fuzzy"
 
-    current = read_fragment(node_id, sessions_dir)
+    try:
+        current = read_fragment(node_id, sessions_dir)
+    except FragmentCorrupt:
+        # G6 (systematic sweep, GPT-5 P5-1, BLOCKING): a corrupt cached
+        # fragment must never crash a launch — `node_id` is already resolved
+        # (from the log, not the fragment) by this point either way, so
+        # recover by replaying the whole log and retry the read once.
+        # `project_id` is not yet known here (only `node_id` is), so this
+        # rebuild is unscoped — it replays every project sharing this
+        # log/sessions pair, which is correct, just broader than strictly
+        # necessary.
+        rebuild(log_path, sessions_dir)
+        current = read_fragment(node_id, sessions_dir)
     if current is None:
         return SelfRegisterResult(status="not_found", node_id=node_id, match_method=match_method)
     if current.lifecycle == "active":

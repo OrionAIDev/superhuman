@@ -24,6 +24,7 @@ from scripts.fleet.core.errors import LockTimeoutError
 from scripts.fleet.core.events import read_all
 from scripts.fleet.core.nodes import parse_node_id
 from scripts.fleet.core.query import list_sessions
+from scripts.fleet.core.store import fragment_path
 
 
 def _run(cwd: Path, *args: str) -> None:
@@ -184,6 +185,46 @@ class TestRegisterIsIdempotent:
 
         assert len(read_all(log_path)) == 1
         assert first.node_id == second.node_id
+
+    def test_repeat_registration_recovers_from_corrupt_cached_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """G6 (systematic sweep), site 4 (`cli.py:~261`): a repeat
+        registration's dedupe read hits a corrupt cached fragment. Already
+        hardened in G5 round-5 (the local `except FragmentCorrupt` falls
+        through to `project_event`, whose own `FragmentCorrupt` handling
+        rebuilds) — re-verified here as part of this round's systematic
+        sweep, since the earlier round had no direct test for this specific
+        call site."""
+        log_path, sessions_dir = fleet_dir
+        adapter = PortableAdapter(git_repo, "demo-slug", local_id="repeat-corrupt-1")
+
+        first = register_session(
+            adapter,
+            origination="manual",
+            project_id="proj-abc123",
+            writer_role="session",
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+        )
+
+        # Deliberately corrupt the cached fragment (truncated JSON) so the
+        # dedupe path's `read_fragment` at cli.py:~261 hits `FragmentCorrupt`.
+        path = fragment_path(first.node_id, sessions_dir)
+        path.write_text('{"node_id": "' + first.node_id + '", "lifecy', encoding="utf-8")
+
+        second = register_session(
+            adapter,
+            origination="manual",
+            project_id="proj-abc123",
+            writer_role="session",
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+        )
+
+        assert len(read_all(log_path)) == 1
+        assert second.node_id == first.node_id
+        assert second.lifecycle == "active"
 
 
 class TestRegisterHandlesLockTimeout:
