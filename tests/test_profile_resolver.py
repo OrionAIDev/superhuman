@@ -160,6 +160,44 @@ def test_scalar_labels_is_rejected(tmp_path: Path) -> None:
         sp.load_profile(path)
 
 
+@pytest.mark.parametrize("labels_yaml", ["[]", '""', "false", "0"])
+def test_present_but_falsy_non_mapping_labels_is_rejected(
+    tmp_path: Path, labels_yaml: str
+) -> None:
+    """#R7-1 (7th GPT-5 pass, PM-reproduced, BLOCKING): the round-6/#R6-2 fix
+    used `entry.get("labels") or {}`, which short-circuits a *present but
+    falsy* non-mapping (`labels: []`, `labels: ""`, `labels: false`,
+    `labels: 0`) to `{}` BEFORE the `isinstance` check ran — so those
+    malformed values slipped straight through to the SAME unrestricted
+    D4-prod fail-open the scalar-string case had. The fix distinguishes
+    genuinely-absent (`is None` -> default `{}`) from present-falsy (a
+    non-mapping -> rejected), so EVERY present non-mapping is failed closed
+    at the load boundary. See `test_scalar_labels_is_rejected` for the
+    truthy-string case and `test_empty_mapping_labels_is_accepted` for the
+    legitimately-empty mapping that must still load."""
+    path = _write(
+        tmp_path,
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+        f"    labels: {labels_yaml}\n",
+    )
+    with pytest.raises(sp.ProfileError, match="labels"):
+        sp.load_profile(path)
+
+
+def test_empty_mapping_labels_is_accepted(tmp_path: Path) -> None:
+    """A present, legitimately-empty mapping (`labels: {}`) is a dict and must
+    load — its absent-`d_ceiling` behavior is correct, not a fail-open. This
+    is the boundary the #R7-1 `is None` vs present-falsy distinction must NOT
+    over-reject: `{}` is falsy too, but it is a valid (empty) mapping."""
+    path = _write(
+        tmp_path,
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+        "    labels: {}\n",
+    )
+    profile = sp.load_profile(path)
+    assert profile.ladder[0].labels == {}
+
+
 def test_defaults_are_merged_into_rungs(tmp_path: Path) -> None:
     """`defaults.approvals` fills keys a rung omits."""
     path = _write(

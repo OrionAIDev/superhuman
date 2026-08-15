@@ -1535,6 +1535,36 @@ class TestCliDoneAdvanceSubcommand:
         with pytest.raises(ValueError):
             _resolve_d_ceiling(workspace)
 
+    @pytest.mark.parametrize("labels_yaml", ["[]", '""', "false", "0"])
+    def test_resolve_d_ceiling_fails_closed_for_falsy_labels_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels_yaml: str
+    ) -> None:
+        """#R7-1 (7th GPT-5 pass, PM-reproduced, BLOCKING): the #R6-2 fix only
+        caught a *truthy* non-mapping (`labels: D0-code`); a present-but-falsy
+        non-mapping (`labels: []`, `""`, `false`, `0`) was short-circuited to
+        `{}` by the `or {}` idiom BEFORE the mapping check, so it reached the
+        SAME unrestricted-`D4-prod` fail-open end to end via a normal
+        `fleet done advance`. Post-fix (`is None` vs present-falsy),
+        `_resolve_d_ceiling` fails closed (`ValueError`) on all of them."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text(
+            "version: 1\n"
+            "ladder:\n"
+            "  - name: work\n"
+            "    detect:\n"
+            "      default: true\n"
+            f"    labels: {labels_yaml}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+
+        with pytest.raises(ValueError):
+            _resolve_d_ceiling(workspace)
+
 
 class TestCliDoneAdvanceRecoversFromCorruptCachedFragment:
     """G5 round-5 (eliminate-the-class fix, #P4-1/#P4-2).

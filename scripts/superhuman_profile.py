@@ -444,20 +444,35 @@ def load_profile(path: Path | None) -> Profile:
         if bad:
             raise ProfileError(f"rung {name!r}: unknown detector(s) {sorted(bad)}")
 
-        labels = entry.get("labels") or {}
-        if not isinstance(labels, dict):
-            # #R6-2 (PM-reproduced, BLOCKING): unlike `detect` above, `labels`
-            # was never validated as a mapping. A scalar `labels: D0-code`
-            # loaded cleanly and produced a `Rung` whose `labels` was the
-            # *string* `"D0-code"` — downstream, `cli._resolve_d_ceiling`'s
+        labels = entry.get("labels")
+        if labels is None:
+            # Genuinely absent — a rung need not declare any labels. This is
+            # the ONLY case that defaults to an empty mapping.
+            labels = {}
+        elif not isinstance(labels, dict):
+            # #R6-2 / #R7-1 (PM-reproduced, BLOCKING): unlike `detect` above,
+            # `labels` was never validated as a mapping. A scalar
+            # `labels: D0-code` loaded cleanly and produced a `Rung` whose
+            # `labels` was the *string* `"D0-code"`; downstream,
+            # `cli._resolve_d_ceiling`'s
             # `_D_CEILING_LABEL_KEY not in resolution.stage.labels` then ran
             # as a substring test against that string instead of a mapping
             # membership test, silently granting the unrestricted D4-prod
-            # default rather than failing closed. Rejected here, at the LOAD
-            # boundary, so every downstream consumer of `labels` is
-            # protected, not just `_resolve_d_ceiling` — mirroring the
-            # `detect` check immediately above. Absent `labels` is still
-            # valid (a rung need not declare any).
+            # default rather than failing closed.
+            #
+            # #R7-1 is why this MUST test `is None` above rather than the
+            # `entry.get("labels") or {}` idiom the earlier fix used: `or {}`
+            # short-circuits a *present but falsy* non-mapping (`labels: []`,
+            # `labels: ""`, `labels: false`, `labels: 0`) to `{}` BEFORE this
+            # check ever runs, so those malformed values slipped straight
+            # through to the same D4-prod fail-open. Distinguishing absent
+            # (`is None`) from present-falsy closes that whole class: EVERY
+            # present non-mapping — falsy or truthy — is rejected here, at the
+            # LOAD boundary, protecting every downstream consumer of `labels`,
+            # not just `_resolve_d_ceiling` (mirroring the `detect` check
+            # immediately above). A present, legitimately-empty mapping
+            # (`labels: {}`) is a dict and passes — its absent-`d_ceiling`
+            # behavior is correct, not a fail-open.
             raise ProfileError(f"rung {name!r}: 'labels' must be a mapping")
 
         merged = {**default_approvals, **(entry.get("approvals") or {})}
