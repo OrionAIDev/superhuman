@@ -498,3 +498,202 @@ class TestAddEdgeResultShape:
         assert added.edge.src == "A"
         assert added.edge.dst == "B"
         assert added.edge.type == "contends-for"
+
+
+class TestDeriveEdgesSkipsSameNodeIdPairs:
+    """G5 F1: a duplicate node_id must never crash/half-apply derive_edges().
+
+    Two ``SessionGitSnapshot``s that happen to share a ``node_id`` are not a
+    real dependency between two sessions — they're the same session counted
+    twice. Before the fix, ``_canonical_pair(a, a) == (a, a)`` fed straight
+    into ``add_edge(a, ..., a, ...)``, which hits the ``src == dst`` guard
+    and raises ``ValueError`` mid-loop, after any earlier pairs in the same
+    call had already been persisted (non-atomic half-apply).
+    """
+
+    def test_duplicate_node_id_same_branch_produces_no_self_edge_and_does_not_raise(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+        sessions = [
+            SessionGitSnapshot(node_id="node/a", branch="feature/x"),
+            SessionGitSnapshot(node_id="node/a", branch="feature/x"),
+        ]
+
+        results = derive_edges(
+            sessions, project_id=_PROJECT_ID, writer_role=_WRITER_ROLE, log_path=log_path
+        )
+
+        assert all(r.edge.src != r.edge.dst for r in results)
+        assert all(e.src != e.dst for e in resolve_graph(log_path).edges)
+
+    def test_duplicate_node_id_same_worktree_produces_no_self_edge_and_does_not_raise(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+        sessions = [
+            SessionGitSnapshot(node_id="node/a", worktree="/repo/checkout"),
+            SessionGitSnapshot(node_id="node/a", worktree="/repo/checkout"),
+        ]
+
+        results = derive_edges(
+            sessions, project_id=_PROJECT_ID, writer_role=_WRITER_ROLE, log_path=log_path
+        )
+
+        assert all(r.edge.src != r.edge.dst for r in results)
+        assert all(e.src != e.dst for e in resolve_graph(log_path).edges)
+
+    def test_duplicate_node_id_same_merge_base_produces_no_self_feeds_into_edge(
+        self, tmp_path: Path
+    ) -> None:
+        # Distinct registered_at so the pre-existing "no resolvable order"
+        # skip doesn't mask the fix under test — this must be caught by the
+        # new same-node_id guard, not the unrelated equal-timestamp guard.
+        log_path = _log(tmp_path)
+        sessions = [
+            SessionGitSnapshot(
+                node_id="node/a",
+                merge_base="deadbeef",
+                registered_at="2026-08-14T10:00:00.000000Z",
+            ),
+            SessionGitSnapshot(
+                node_id="node/a",
+                merge_base="deadbeef",
+                registered_at="2026-08-14T11:00:00.000000Z",
+            ),
+        ]
+
+        results = derive_edges(
+            sessions, project_id=_PROJECT_ID, writer_role=_WRITER_ROLE, log_path=log_path
+        )
+
+        assert all(r.edge.src != r.edge.dst for r in results)
+        assert all(e.src != e.dst for e in resolve_graph(log_path).edges)
+
+    def test_issue_ref_equal_to_own_node_id_produces_no_self_serves_edge(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+        sessions = [SessionGitSnapshot(node_id="node/a", issue_ref="node/a")]
+
+        results = derive_edges(
+            sessions, project_id=_PROJECT_ID, writer_role=_WRITER_ROLE, log_path=log_path
+        )
+
+        assert all(r.edge.src != r.edge.dst for r in results)
+        assert all(e.src != e.dst for e in resolve_graph(log_path).edges)
+
+
+class TestResolveGraphSkipsInjectedSelfEdge:
+    """G5 F3: a raw self-edge event in the log must never surface as a cycle.
+
+    The read path (``resolve_graph`` / ``_ordering_pairs_from_events``) is
+    documented as defensively skipping malformed edges (unknown edge_type,
+    blank dst, non-dict evidence) — a ``dst == src`` self edge belongs in
+    that same defensive posture. Before the fix, an injected self edge
+    survived into the resolved graph and ``detect_cycles()`` reported it as
+    a (spurious) one-node cycle, contradicting the module's documented
+    "resolved graph never contains a cycle" contract.
+    """
+
+    def test_injected_self_edge_is_excluded_from_resolved_graph_and_no_cycle_detected(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "e1",
+                "idempotency_key": "edge:A:feeds-into:A",
+                "ts": "2026-08-14T12:00:00.000000Z",
+                "type": "edge_declared",
+                "project_id": _PROJECT_ID,
+                "node_id": "A",
+                "writer_role": _WRITER_ROLE,
+                "payload": {"dst": "A", "edge_type": "feeds-into", "evidence": {}},
+            },
+        )
+
+        graph = resolve_graph(log_path)
+
+        assert graph.edges == ()
+        assert graph.detect_cycles() == []
+
+
+class TestDetectCyclesIterativeOnDeepChain:
+    """G5 F5: detect_cycles() must not recurse (RecursionError) on deep chains."""
+
+    def test_long_acyclic_chain_does_not_raise_recursion_error(self) -> None:
+        chain_length = 5000
+        edges = tuple(
+            Edge(src=f"n{i}", type="feeds-into", dst=f"n{i + 1}", source="declared", evidence={})
+            for i in range(chain_length)
+        )
+        graph = DependencyGraph(edges=edges)
+
+        assert graph.detect_cycles() == []
+
+    def test_long_chain_that_closes_into_a_cycle_is_still_detected(self) -> None:
+        chain_length = 5000
+        edges = [
+            Edge(src=f"n{i}", type="feeds-into", dst=f"n{i + 1}", source="declared", evidence={})
+            for i in range(chain_length)
+        ]
+        edges.append(
+            Edge(
+                src=f"n{chain_length}",
+                type="feeds-into",
+                dst="n0",
+                source="declared",
+                evidence={},
+            )
+        )
+        graph = DependencyGraph(edges=tuple(edges))
+
+        cycles = graph.detect_cycles()
+
+        assert len(cycles) == 1
+        assert set(cycles[0]) == {f"n{i}" for i in range(chain_length + 1)}
+
+
+class TestAddEdgeDedupeReturnsPersistedEdge:
+    """G5 F2b: on dedupe, .edge must reflect the persisted edge, not the candidate.
+
+    Before the fix, the deduped branch returned the caller's own candidate
+    (carrying the caller's ``source``/``evidence``) even though those values
+    were never persisted — only the pre-existing event's ``source``/
+    ``evidence`` were stored. That's misleading: callers inspecting
+    ``result.edge`` on a ``deduped`` status would see data that was never
+    actually written.
+    """
+
+    def test_dedupe_returns_persisted_source_and_evidence_not_the_candidates(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+        sessions = [
+            SessionGitSnapshot(node_id="node/a", branch="feature/x"),
+            SessionGitSnapshot(node_id="node/b", branch="feature/x"),
+        ]
+        derive_results = derive_edges(
+            sessions, project_id=_PROJECT_ID, writer_role=_WRITER_ROLE, log_path=log_path
+        )
+        derived = next(r for r in derive_results if r.edge.type == "contends-for")
+        assert derived.status == "added"
+        assert derived.edge.source == "derived"
+
+        result = add_edge(
+            derived.edge.src,
+            "contends-for",
+            derived.edge.dst,
+            source="declared",
+            evidence={"note": "PM override attempt"},
+            project_id=_PROJECT_ID,
+            writer_role=_WRITER_ROLE,
+            log_path=log_path,
+        )
+
+        assert result.status == "deduped"
+        assert result.edge.source == "derived"
+        assert result.edge.evidence == {"branch": "feature/x"}

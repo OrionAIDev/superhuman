@@ -79,7 +79,7 @@ each algorithm, not cached) — stdlib only, no graph library, per Decision B.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -143,8 +143,13 @@ class AddEdgeResult:
             (the candidate would close a cycle on the ordering edge types; a
             `cycle_flagged` event was appended instead and the edge itself
             was never persisted — FR-4).
-        edge: the candidate `Edge`, regardless of status — useful for
-            logging/CLI output either way.
+        edge: for `"added"` and `"cycle_flagged"`, the candidate `Edge`
+            (nothing else was ever persisted for it). For `"deduped"`, the
+            **already-persisted** edge for this `(src, type, dst)` — its
+            `source`/`evidence` are whatever the pre-existing event actually
+            stored, which may differ from the caller's own candidate values
+            (those were never written); the candidate is used only as a
+            fallback if the persisted edge cannot be found (G5 F2b).
     """
 
     status: str
@@ -245,8 +250,10 @@ def _ordering_pairs_from_events(events: Iterable[Event]) -> list[tuple[str, str]
     Returns:
         list[tuple[str, str]]: one `(u, v)` precedence pair per
         `edge_declared`/`edge_derived` event whose `edge_type` is an
-        ordering type. A malformed/unrecognized payload is skipped rather
-        than raised (matching `core.events.read_all`'s own tolerance).
+        ordering type. A malformed/unrecognized payload — including a
+        self edge (`dst == node_id`), which can never be a real
+        dependency — is skipped rather than raised (matching
+        `core.events.read_all`'s own tolerance; G5 F3).
     """
     pairs: list[tuple[str, str]] = []
     for event in events:
@@ -254,8 +261,13 @@ def _ordering_pairs_from_events(events: Iterable[Event]) -> list[tuple[str, str]
             continue
         edge_type = event.payload.get("edge_type")
         dst = event.payload.get("dst")
-        if edge_type not in ORDERING_EDGE_TYPES or not isinstance(dst, str) or not dst:
-            continue
+        if (
+            edge_type not in ORDERING_EDGE_TYPES
+            or not isinstance(dst, str)
+            or not dst
+            or dst == event.node_id
+        ):
+            continue  # malformed/self edge — skip defensively, never raise on read (G5 F3)
         pairs.append(_precedence_pair(edge_type, event.node_id, dst))
     return pairs
 
@@ -356,9 +368,47 @@ def add_edge(
         return AddEdgeResult(status="cycle_flagged", edge=candidate)
 
     if appended is None:
-        return AddEdgeResult(status="deduped", edge=candidate)
+        persisted = _find_persisted_edge(log_path, src, edge_type, dst)
+        return AddEdgeResult(status="deduped", edge=persisted if persisted is not None else candidate)
 
     return AddEdgeResult(status="added", edge=candidate)
+
+
+def _find_persisted_edge(
+    log_path: Path | str, src: str, edge_type: str, dst: str
+) -> Edge | None:
+    """Look up the actually-persisted edge for one `(src, type, dst)` triple.
+
+    Used by `add_edge()`'s dedupe branch (G5 F2b): when `append()` reports
+    an idempotency-key collision, the caller's own candidate `source`/
+    `evidence` were never written — only the pre-existing event's were. This
+    scans the log for that event so the dedupe result can report what was
+    actually persisted.
+
+    Args:
+        log_path: path to the project's event log.
+        src: the edge's source node id.
+        edge_type: one of `EDGE_TYPES`.
+        dst: the edge's destination node id.
+
+    Returns:
+        Edge | None: the persisted edge (`source`/`evidence` taken from the
+        matching event), or `None` if no `edge_declared`/`edge_derived`
+        event with idempotency key `edge:<src>:<type>:<dst>` is found —
+        should not happen on a genuine dedupe, but handled defensively so
+        `add_edge()` can fall back to the candidate rather than raise.
+    """
+    key = f"edge:{src}:{edge_type}:{dst}"
+    for event in read_all(log_path):
+        if event.type not in ("edge_declared", "edge_derived"):
+            continue
+        if event.idempotency_key != key:
+            continue
+        source = "declared" if event.type == "edge_declared" else "derived"
+        raw_evidence = event.payload.get("evidence")
+        evidence = dict(raw_evidence) if isinstance(raw_evidence, dict) else {}
+        return Edge(src=src, type=edge_type, dst=dst, source=source, evidence=evidence)
+    return None
 
 
 def _flag_cycle(
@@ -478,6 +528,13 @@ class DependencyGraph:
         B's algorithm set) against a `DependencyGraph` constructed some
         other way (e.g. a test fixture).
 
+        Implemented as an explicit-stack (iterative) DFS rather than a
+        recursive one, so a long ordering chain (thousands of `feeds-into`
+        edges) cannot blow Python's recursion limit (G5 F5) — the
+        white/gray/black coloring, deterministic sorted node iteration
+        order, and returned cycle shape are otherwise unchanged from the
+        recursive formulation.
+
         Returns:
             list[tuple[str, ...]]: one tuple of node ids per cycle found (the
             cycle's nodes in traversal order, starting and ending at the
@@ -491,21 +548,38 @@ class DependencyGraph:
         cycles: list[tuple[str, ...]] = []
         path: list[str] = []
 
-        def _dfs(node: str) -> None:
-            color[node] = gray
-            path.append(node)
-            for nxt in adjacency.get(node, ()):
-                if color[nxt] == gray:
-                    idx = path.index(nxt)
-                    cycles.append(tuple(path[idx:]))
-                elif color[nxt] == white:
-                    _dfs(nxt)
-            path.pop()
-            color[node] = black
+        for start in sorted(self._nodes()):
+            if color[start] != white:
+                continue
 
-        for node in sorted(self._nodes()):
-            if color[node] == white:
-                _dfs(node)
+            # Each stack frame is (node, iterator over its neighbors),
+            # mirroring one level of the recursive call stack. Breaking out
+            # of the inner `for` after pushing a white neighbor's frame —
+            # then resuming the same (already-partially-consumed) iterator
+            # once that neighbor's subtree finishes — reproduces the exact
+            # depth-first visit order the recursive version had.
+            color[start] = gray
+            path.append(start)
+            stack: list[tuple[str, Iterator[str]]] = [(start, iter(adjacency.get(start, ())))]
+
+            while stack:
+                node, neighbors = stack[-1]
+                descended = False
+                for nxt in neighbors:
+                    if color[nxt] == gray:
+                        idx = path.index(nxt)
+                        cycles.append(tuple(path[idx:]))
+                    elif color[nxt] == white:
+                        color[nxt] = gray
+                        path.append(nxt)
+                        stack.append((nxt, iter(adjacency.get(nxt, ()))))
+                        descended = True
+                        break
+                if not descended:
+                    stack.pop()
+                    path.pop()
+                    color[node] = black
+
         return cycles
 
     def transitive_blockers(self, node: str) -> set[str]:
@@ -628,7 +702,9 @@ def resolve_graph(log_path: Path | str) -> DependencyGraph:
         DependencyGraph: every currently-valid edge, deduplicated by
         `(src, type, dst)` (later duplicate events for the same triple are
         a no-op — `core.events.append`'s idempotency dedupe already prevents
-        them from existing at all under normal operation).
+        them from existing at all under normal operation). A self edge
+        (`dst == node_id`), however it reached the log, is skipped
+        defensively (G5 F3) — never a real dependency.
     """
     edges: dict[tuple[str, str, str], Edge] = {}
     accepted_pairs: list[tuple[str, str]] = []
@@ -638,9 +714,9 @@ def resolve_graph(log_path: Path | str) -> DependencyGraph:
             continue
         edge_type = event.payload.get("edge_type")
         dst = event.payload.get("dst")
-        if edge_type not in EDGE_TYPES or not isinstance(dst, str) or not dst:
-            continue  # malformed/legacy payload — skip defensively, never raise on read
         src = event.node_id
+        if edge_type not in EDGE_TYPES or not isinstance(dst, str) or not dst or dst == src:
+            continue  # malformed/legacy/self-edge payload — skip defensively, never raise on read (G5 F3)
         source = "declared" if event.type == "edge_declared" else "derived"
         raw_evidence = event.payload.get("evidence")
         evidence = dict(raw_evidence) if isinstance(raw_evidence, dict) else {}
@@ -738,6 +814,15 @@ def derive_edges(
     edge. See the module docstring for the exact per-type rule and the
     `serves` schema gap.
 
+    Two snapshots that share the same `node_id` are the same session
+    observed twice (e.g. a stale/duplicate registration), never a real
+    dependency between two sessions — such a pair is skipped defensively
+    for every derivation rule (`contends-for`, `feeds-into`), and a
+    snapshot whose `issue_ref` equals its own `node_id` is likewise skipped
+    for `serves`, rather than reaching `add_edge()`'s `src == dst` guard and
+    raising mid-loop after earlier pairs in the same call were already
+    persisted (G5 F1).
+
     Args:
         sessions: primitive git/phase facts for every session to consider,
             as `SessionGitSnapshot`s (core-local, no adapter import).
@@ -748,13 +833,15 @@ def derive_edges(
     Returns:
         list[AddEdgeResult]: one result per edge this call attempted to
         write (added, deduped, or cycle-flagged) — never includes a
-        non-derivation (a pair that didn't match any rule produces no
-        entry at all).
+        non-derivation (a pair that didn't match any rule, or a same-
+        `node_id` pair/self `serves` reference, produces no entry at all).
     """
     snapshots = list(sessions)
     results: list[AddEdgeResult] = []
 
     for a, b in _unordered_pairs(snapshots):
+        if a.node_id == b.node_id:
+            continue  # same session counted twice — never a real dependency (G5 F1)
         if a.branch and b.branch and a.branch == b.branch:
             src, dst = _canonical_pair(a.node_id, b.node_id)
             results.append(
@@ -785,6 +872,8 @@ def derive_edges(
             )
 
     for a, b in _unordered_pairs(snapshots):
+        if a.node_id == b.node_id:
+            continue  # same session counted twice — never a real dependency (G5 F1)
         if not (a.merge_base and b.merge_base and a.merge_base == b.merge_base):
             continue
         if not a.registered_at or not b.registered_at or a.registered_at == b.registered_at:
@@ -806,6 +895,8 @@ def derive_edges(
         )
 
     for s in snapshots:
+        if s.issue_ref and s.issue_ref == s.node_id:
+            continue  # a session cannot serve its own node id (G5 F1)
         if s.issue_ref:
             results.append(
                 add_edge(
