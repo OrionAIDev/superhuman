@@ -512,6 +512,52 @@ def test_superhuman_template_has_autonomous_sections(skill_root: Path) -> None:
     assert "## Environment:" in text, "needed by the precondition guard's marker check"
 
 
+RESUME_PACKET_FIELDS = [
+    "objective",
+    "immutable constraints",
+    "decisions-locked",
+    "ruled-out paths",
+    "current state",
+    "next-3-actions",
+    "evidence-pointers",
+]
+
+
+def test_resume_packet_section_present_and_ordered(skill_root: Path) -> None:
+    """SUPERHUMAN.md template carries a Resume packet above the volatile logs (FR-1).
+
+    The Resume packet must appear before the append-only log sections (Decisions
+    log, Chunk log, Drift notes, ...) so a resuming session reads the kept-current
+    packet first. All seven labelled fields must be present.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    assert "## Resume packet" in text, "template missing '## Resume packet' section"
+
+    resume_pos = text.find("## Resume packet")
+    for heading in ("## Decisions log", "## Chunk log", "## Drift notes"):
+        heading_pos = text.find(heading)
+        assert heading_pos != -1, f"template missing '{heading}' section"
+        assert resume_pos < heading_pos, (
+            f"'## Resume packet' must appear before '{heading}'"
+        )
+
+    for field in RESUME_PACKET_FIELDS:
+        assert field in text, f"Resume packet missing field label '{field}'"
+
+
+def test_decisions_locked_distinct_from_decisions_log(skill_root: Path) -> None:
+    """'## Decisions locked' is a distinct H2 from the append-only '## Decisions log' (FR-6).
+
+    Both sections must coexist: Decisions locked records what may not be
+    reopened; Decisions log records what happened. One does not replace the
+    other.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    sections = _h2_sections(text)
+    assert "Decisions locked" in sections, "template missing '## Decisions locked' section"
+    assert "Decisions log" in sections, "template missing '## Decisions log' section"
+
+
 def test_skill_md_has_autonomous_progression_rule(skill_root: Path) -> None:
     """SKILL.md must include the autonomous-phase-progression cross-cutting rule.
 
