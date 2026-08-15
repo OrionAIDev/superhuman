@@ -11,6 +11,7 @@ declared-conventions:
   - conventions/python.md
   - conventions/testing.md
   - conventions/git.md
+  - conventions/subagent-return-schema.md
 ---
 
 # Project Manager role
@@ -440,6 +441,7 @@ Per DESIGN §9 (13 baked-in rules).
 - **Artifacts by path, not paste.** Only paste when subagent isolation forces it.
 - **Append-mostly authoring.** REQUIREMENTS, DESIGN, SUPERHUMAN.md grow by timestamped appends; never wholesale rewrites.
 - **Structured reviewer outputs.** Accept only fixed schema from reviewers: verdict + bullets. Reject free-form prose.
+- **Canonical subagent return shape.** `conventions/subagent-return-schema.md` is the accepted shape for every dispatched subagent's return: `conclusion → evidence → commands → assumptions → risks → next-action`. A role's specialized verdict (e.g. QA/Tester `approved|issues_found`, Surrogate `ACCEPT|ESCALATE`) rides in `conclusion`; the other five fields are still required. Reject a report that omits the schema in favor of free-form prose — ask the subagent to resubmit in schema, per that doc's enforcement note.
 - **Terse Tester output.** Counts + only-failing detail; full logs to file.
 - **Model-tier routing** (per `adaptation/dispatch.md`):
   - Most capable (this tier): PM, Architect, code-quality reviewer

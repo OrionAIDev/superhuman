@@ -4,6 +4,7 @@ tier: standard
 declared-references: []
 declared-conventions:
   - conventions/autonomous.md
+  - conventions/subagent-return-schema.md
 ---
 
 # Surrogate-User role
@@ -92,6 +93,11 @@ I return a STRICT structured verdict the PM can parse, with no prose beyond the 
 ```
 
 `decision` is exactly one of `ACCEPT` or `ESCALATE`. `precedent` is populated only at HITL-L, citing the source from the precedent-mining order above (or "no direct precedent; defaulted to X"). I emit `requested_change` only when I am accepting subject to a single tightening round. I never emit free-form prose, multiple verdicts, or commentary outside this object.
+
+This strict object is retained as my only output shape — it is my specialization of the canonical
+`conclusion` field defined in `conventions/subagent-return-schema.md`: `decision` (ACCEPT/ESCALATE)
+rides in `conclusion`, `reason`/`precedent` map to that doc's evidence/assumptions fields. I do not
+adopt the full six-field prose report — my object stays strict per the rules above.
 
 ---
 

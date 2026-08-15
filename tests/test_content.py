@@ -647,6 +647,80 @@ def test_source_cited_convention_wired(skill_root: Path) -> None:
     assert "UNVERIFIED" in conv.read_text(encoding="utf-8"), "source-cited must define the UNVERIFIED flag"
 
 
+# --- C-ROLES: canonical return-schema threaded through all roles ---
+
+CANONICAL_SCHEMA_ROLE_FILES = [
+    "pm.md", "architect.md", "developer.md", "qa.md",
+    "tester.md", "business-expert.md", "surrogate-user.md",
+]
+
+
+@pytest.mark.parametrize("role_file", CANONICAL_SCHEMA_ROLE_FILES)
+def test_role_references_canonical_schema(skill_root: Path, role_file: str) -> None:
+    """Every role points at the canonical six-field return schema by pointer (FR-4)."""
+    text = (skill_root / "roles" / role_file).read_text(encoding="utf-8")
+    assert "conventions/subagent-return-schema.md" in text, (
+        f"{role_file} must reference conventions/subagent-return-schema.md"
+    )
+
+
+def test_verdict_schemas_specialize_canonical_conclusion(skill_root: Path) -> None:
+    """Existing role verdict schemas are retained, reconciled as conclusion specializations (FR-4/A3).
+
+    A3: rip-and-replace is forbidden. QA/Tester keep approved|issues_found, Surrogate keeps
+    ACCEPT|ESCALATE, Architect keeps its option-table output — each must additionally say its
+    verdict rides in / specializes the canonical schema's `conclusion` field.
+    """
+    qa = (skill_root / "roles" / "qa.md").read_text(encoding="utf-8")
+    tester = (skill_root / "roles" / "tester.md").read_text(encoding="utf-8")
+    surrogate = (skill_root / "roles" / "surrogate-user.md").read_text(encoding="utf-8")
+    architect = (skill_root / "roles" / "architect.md").read_text(encoding="utf-8")
+
+    for name, text in (("qa.md", qa), ("tester.md", tester)):
+        assert "approved" in text and "issues_found" in text, (
+            f"{name} must retain its approved|issues_found verdict"
+        )
+        low = text.lower()
+        assert "conclusion" in low or "specializ" in low, (
+            f"{name} must note its verdict rides in / specializes the canonical conclusion field"
+        )
+
+    assert "ACCEPT" in surrogate and "ESCALATE" in surrogate, (
+        "surrogate-user.md must retain its ACCEPT|ESCALATE verdict"
+    )
+    low = surrogate.lower()
+    assert "conclusion" in low or "specializ" in low, (
+        "surrogate-user.md must note its verdict rides in / specializes the canonical conclusion field"
+    )
+
+    assert "option" in architect.lower() and "recommend" in architect.lower(), (
+        "architect.md must retain its option-table output"
+    )
+    low = architect.lower()
+    assert "conclusion" in low or "specializ" in low, (
+        "architect.md must note its recommendation rides in / specializes the canonical conclusion field"
+    )
+
+
+def test_pm_output_discipline_names_canonical_schema(skill_root: Path) -> None:
+    """pm.md Output discipline names the canonical schema and keeps the prose-rejection rule (FR-5)."""
+    text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    sections = _h2_sections(text)
+    assert "Output discipline" in sections, "pm.md missing '## Output discipline' section"
+
+    start = text.find("## Output discipline")
+    end = text.find("\n## ", start + 1)
+    body = text[start:end if end != -1 else len(text)]
+
+    assert "conventions/subagent-return-schema.md" in body, (
+        "pm.md Output discipline must reference conventions/subagent-return-schema.md "
+        "as the accepted shape for subagent returns"
+    )
+    assert "free-form prose" in body.lower() or "free form prose" in body.lower(), (
+        "pm.md Output discipline must keep its existing free-form-prose rejection rule"
+    )
+
+
 def test_orchestration_patterns_catalog(skill_root: Path) -> None:
     """Orchestration catalog has endorsed + anti-patterns, dispatch layer, and the G9 anchor."""
     text = (skill_root / "references" / "orchestration-patterns.md").read_text(encoding="utf-8")

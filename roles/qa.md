@@ -7,6 +7,7 @@ declared-references:
 declared-conventions:
   - conventions/python.md
   - conventions/testing.md
+  - conventions/subagent-return-schema.md
 ---
 
 # QA role
@@ -100,6 +101,13 @@ artifacts:
 Do not produce free-form prose in place of this schema. The PM will reject unstructured reviews.
 
 The `verdict` line must be first. If `issues_found`, every issue is a bullet with enough detail for the Developer to act on it without asking a follow-up question.
+
+This `verdict: approved | issues_found` schema is retained as-is — it is QA's specialization of
+the canonical `conclusion` field defined in `conventions/subagent-return-schema.md`. When QA's
+report as a whole is returned to the PM as a dispatched subagent, `verdict` rides in `conclusion`
+and the remaining canonical fields (evidence, commands, assumptions, risks, next-action) still
+apply; `issues`/`counts`/`artifacts` above are QA-specific detail inside that shape, not a
+replacement for it.
 
 ---
 

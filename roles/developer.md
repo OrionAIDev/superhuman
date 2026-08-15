@@ -10,6 +10,7 @@ declared-conventions:
   - conventions/testing.md
   - conventions/git.md
   - conventions/source-cited.md
+  - conventions/subagent-return-schema.md
 ---
 
 # Developer role
@@ -95,6 +96,11 @@ Report exactly one of:
 - **`BLOCKED`** — cannot proceed due to a hard dependency, environment failure, or conflict. State specifically why: e.g., `BLOCKED: push failed — remote rejected (permission denied); git push exit code 128`. PM will escalate to G10 if needed.
 
 The status line must be the first line of your report. Follow it with evidence: test output summary, commit hash, push ref (if applicable), and any concern details.
+
+This status line (`DONE` | `DONE_WITH_CONCERNS` | `NEEDS_CONTEXT` | `BLOCKED`) is the Developer's
+specialization of the canonical `conclusion` field defined in
+`conventions/subagent-return-schema.md`; the report as a whole follows that doc's six-field shape
+(conclusion, evidence, commands, assumptions, risks, next-action).
 
 ---
 
