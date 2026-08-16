@@ -11,3 +11,16 @@ tests/output/
 Thumbs.db
 .worktrees/
 .publication-tokens
+
+# Per-project superhuman working docs (VISION / REQUIREMENTS / DESIGN / PLAN /
+# TEST / SUPERHUMAN / DECISIONS) stay LOCAL. They record a specific operator's
+# environments, hosts, and internal vocabulary as a matter of course, and this
+# repo is published, so they must never become tracked files. The publication
+# guard in tests/test_content.py scans `git ls-files`, which means an untracked
+# doc is invisible to it by construction — this rule is what keeps it that way.
+#
+# Anchored with a leading slash so the synthetic-bug fixture under
+# tests/smoke/.../docs/superhuman/ is unaffected.
+/docs/superhuman/*/
+# Deliberately published, and scrubbed of operator specifics before they were:
+!/docs/superhuman/specs/
