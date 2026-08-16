@@ -1083,13 +1083,19 @@ class TestSelfRegisterEdgeCases:
                 branch=None,
             )
 
-    def test_exact_match_with_no_fragment_on_disk_returns_not_found(
+    def test_exact_match_with_no_fragment_on_disk_recovers_and_launches(
         self, git_repo: Path, fleet_dir: tuple[Path, Path]
     ) -> None:
-        # The `handoff_emitted` event exists (so the exact-id lookup
-        # succeeds), but the fragment file itself is gone — an edge case
-        # (e.g. a corrupt/deleted fragment) `self_register` must not crash
-        # on.
+        """GPT-5 round-9 preflight, BLOCKING, PM-reproduced: the
+        `handoff_emitted` event exists (so the exact-id lookup succeeds and
+        `node_id` is resolved from the log), but the fragment file itself is
+        merely ABSENT (e.g. externally deleted) rather than corrupt. Pre-fix,
+        the `if current is None` branch returned `not_found` without ever
+        consulting the log-backed truth — contradicting the log-as-truth /
+        fragments-are-a-rebuildable-cache contract this module honors on
+        every other read path (the G6 "decision-driving reads recover, never
+        guess" sweep). Post-fix: a single bounded `rebuild()` retry recovers
+        the fragment from the log and the launch still flips to active."""
         log_path, sessions_dir = fleet_dir
         emission = _emit(git_repo, fleet_dir)
         fragment_path(emission.node_id, sessions_dir).unlink()
@@ -1100,8 +1106,12 @@ class TestSelfRegisterEdgeCases:
             writer_role="session",
             handoff_id=emission.handoff_id,
         )
-        assert result.status == "not_found"
+        assert result.status == "launched"
         assert result.node_id == emission.node_id
+        assert result.match_method == "exact"
+
+        sessions = list_sessions(sessions_dir, project_id="proj-abc123")
+        assert sessions[0].lifecycle == "active"
 
     def test_open_awaiting_launch_rows_skips_events_for_closed_or_other_handoffs(
         self, git_repo: Path, fleet_dir: tuple[Path, Path]
@@ -1416,6 +1426,40 @@ class TestCorruptCachedFragmentRecovery:
         assert fragment.lifecycle == "cancelled"
         events = read_all(log_path)
         assert len([e for e in events if e.type == "handoff_cancelled"]) == 1
+
+    def test_exact_id_self_register_rebuilds_at_most_once_for_a_persistently_absent_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT-5 round-9 preflight follow-up: the absent-fragment recovery
+        must be a single bounded retry, not a loop. Simulate a fragment that
+        stays absent even after `rebuild()` (e.g. a write that never lands)
+        and assert `rebuild()` is invoked exactly once before `self_register`
+        concludes `not_found` — never re-rebuilding indefinitely."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, handoff_id="hid-persistently-absent")
+        fragment_path(emission.node_id, sessions_dir).unlink()
+
+        rebuild_calls = {"n": 0}
+        real_rebuild = handoff.rebuild
+
+        def _counting_rebuild(*args: object, **kwargs: object) -> object:
+            rebuild_calls["n"] += 1
+            return real_rebuild(*args, **kwargs)
+
+        monkeypatch.setattr(handoff, "rebuild", _counting_rebuild)
+        # Force every read to report "absent" regardless of what rebuild()
+        # just wrote, so the persistently-absent scenario is exercised.
+        monkeypatch.setattr(handoff, "read_fragment", lambda *a, **k: None)
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=emission.handoff_id,
+        )
+
+        assert result.status == "not_found"
+        assert rebuild_calls["n"] == 1
 
     def test_genuinely_absent_fragment_still_returns_not_found_exact_id(
         self, git_repo: Path, fleet_dir: tuple[Path, Path]

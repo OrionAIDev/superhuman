@@ -52,6 +52,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ..core.errors import SessionIdentityUnresolved
 from ..core.nodes import make_node_id
 from .base import GitFacts, SessionAdapter, SessionInfo, format_handoff_line, workspace_component
 from .portable import collect_git_facts
@@ -115,23 +116,42 @@ class ClaudeAdapter(SessionAdapter):
     def current_session(self) -> SessionInfo:
         """Return this session's identity from the orchestrator-supplied id.
 
+        Fails closed (GPT-5 round-9 preflight, BLOCKING, PM-reproduced)
+        rather than fabricating an id: `id(self)` is a per-object memory
+        address, so two adapters minted for one real session (each
+        constructed without `current_session_id`) used to resolve to two
+        different node_ids — duplicate `session_registered` rows for the
+        same session, breaking NFR-1 idempotency on the primary harness.
+
         Returns:
-            SessionInfo: `origination="unknown"` if `current_session_id` was
-            never supplied at construction — this adapter does not guess.
+            SessionInfo: always `origination="relayed"` — reaching this
+            point proves `current_session_id` was supplied.
+
+        Raises:
+            SessionIdentityUnresolved: if `current_session_id` was never
+                supplied at construction. The caller must supply the real
+                id (`--session-id` on the CLI, or `current_session_id=` on
+                the constructor) — this adapter does not guess.
         """
+        if self._current_session_id is None:
+            raise SessionIdentityUnresolved(
+                "ClaudeAdapter has no current_session_id to register with — "
+                "supply the real Claude session id via --session-id (CLI) "
+                "or current_session_id= (constructor); it cannot be "
+                "determined automatically on the Claude harness."
+            )
         facts = self.git_facts()
-        local_id = self._current_session_id or f"unknown-session-{id(self)}"
+        local_id = self._current_session_id
         node_id = make_node_id(
             "claude", workspace_component(self.workspace), self.slug, local_id
         )
-        origination = "unknown" if self._current_session_id is None else "relayed"
         return SessionInfo(
             node_id=node_id,
             harness="claude",
             workspace=str(self.workspace),
             local_id=local_id,
             branch=facts.branch,
-            origination=origination,
+            origination="relayed",
             raw={"current_session_id": self._current_session_id},
         )
 

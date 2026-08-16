@@ -93,6 +93,33 @@ class TestValidateEventRejectsMalformed:
             validate_event(data)
         assert list(tmp_path.iterdir()) == []
 
+    def test_schema_version_2_is_rejected(self, tmp_path) -> None:
+        """9th-round preflight, BLOCKING, PM-reproduced: an otherwise
+        well-formed v1-shaped event whose `schema_version` is `2` must be
+        rejected, not accepted and treated as valid v1 manifest truth on
+        replay — the field was previously only type-checked (any int
+        passed), never pinned to the one version this module actually
+        knows how to interpret."""
+        data = _valid_event()
+        data["schema_version"] = 2
+        with pytest.raises(ValidationError):
+            validate_event(data)
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("bad_version", ["1", 1.5, None])
+    def test_non_int_schema_version_is_still_rejected(self, bad_version, tmp_path) -> None:
+        data = _valid_event()
+        data["schema_version"] = bad_version
+        with pytest.raises(ValidationError):
+            validate_event(data)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_schema_version_1_is_still_accepted(self) -> None:
+        data = _valid_event()
+        data["schema_version"] = 1
+        event = validate_event(data)
+        assert event.schema_version == 1
+
 
 class TestFiveDecomposedStatusFields:
     """TC-2 (FR-5): the five fields are orthogonal; collapsing them is rejected."""

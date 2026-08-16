@@ -17,6 +17,7 @@ import pytest
 
 from scripts.fleet.adapter.base import GitFacts, SessionAdapter, SessionInfo
 from scripts.fleet.adapter.claude import ClaudeAdapter
+from scripts.fleet.core.errors import SessionIdentityUnresolved
 
 
 class TestClaudeAdapterIsASessionAdapter:
@@ -44,13 +45,31 @@ class TestClaudeAdapterCurrentSession:
         assert session.local_id == "relayed-abc123"
         assert session.node_id.endswith("/relayed-abc123")
 
-    def test_current_session_without_orchestrator_supplied_id_is_unknown(
+    def test_current_session_without_orchestrator_supplied_id_fails_closed(
         self, tmp_path: Path
     ) -> None:
+        """GPT-5 round-9 preflight, BLOCKING, PM-reproduced: `id(self)` is a
+        per-object memory address, so two adapters for ONE real session
+        (each constructed without `current_session_id`) used to mint two
+        different `unknown-session-...` local ids — different node_ids and
+        idempotency keys, i.e. duplicate manifest rows for the same session,
+        breaking NFR-1 idempotency on the primary harness. `current_session()`
+        must now fail closed with a typed, actionable error instead of
+        synthesizing a phantom id."""
         adapter = ClaudeAdapter(tmp_path, "demo-slug")
-        session = adapter.current_session()
-        assert session.origination == "unknown"
-        assert session.local_id  # still non-empty; never a fabricated real id
+        with pytest.raises(SessionIdentityUnresolved):
+            adapter.current_session()
+
+    def test_current_session_node_id_is_stable_across_two_adapter_instances(
+        self, tmp_path: Path
+    ) -> None:
+        """With a real id supplied, two independently constructed adapters
+        for the same session must resolve to the identical node_id — the
+        whole point of fixing the `id(self)` fallback."""
+        first = ClaudeAdapter(tmp_path, "demo-slug", current_session_id="stable-session-1")
+        second = ClaudeAdapter(tmp_path, "demo-slug", current_session_id="stable-session-1")
+
+        assert first.current_session().node_id == second.current_session().node_id
 
 
 class TestClaudeAdapterEnumerateSessions:

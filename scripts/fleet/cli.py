@@ -33,6 +33,7 @@ from .core.errors import (
     FragmentCorrupt,
     LockTimeoutError,
     OwnershipError,
+    SessionIdentityUnresolved,
     ValidationError,
 )
 from .core.events import append
@@ -347,6 +348,9 @@ def _cmd_register(args: argparse.Namespace) -> int:
         )
     except LockTimeoutError as exc:
         print(f"fleet register: could not acquire the manifest lock: {exc}", file=sys.stderr)
+        return 1
+    except SessionIdentityUnresolved as exc:
+        print(f"fleet register: rejected: {exc}", file=sys.stderr)
         return 1
     except (ValidationError, OwnershipError, ValueError) as exc:
         print(f"fleet register: rejected: {exc}", file=sys.stderr)

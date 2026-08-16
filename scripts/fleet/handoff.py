@@ -592,6 +592,7 @@ def self_register(
         handoff_id = candidates[0].handoff_id
         match_method = "fuzzy"
 
+    already_rebuilt = False
     try:
         current = read_fragment(node_id, sessions_dir)
     except FragmentCorrupt:
@@ -603,6 +604,22 @@ def self_register(
         # rebuild is unscoped — it replays every project sharing this
         # log/sessions pair, which is correct, just broader than strictly
         # necessary.
+        rebuild(log_path, sessions_dir)
+        already_rebuilt = True
+        current = read_fragment(node_id, sessions_dir)
+    if current is None and match_method == "exact" and not already_rebuilt:
+        # GPT-5 round-9 preflight, BLOCKING, PM-reproduced: on the exact-id
+        # path, a cached fragment that is merely ABSENT (e.g. externally
+        # deleted) — not corrupt — must recover the same way the corrupt
+        # branch above does: `node_id` is already resolved from the log
+        # (the source of truth), so an absent fragment is just an
+        # unrebuilt cache, never a reason to give up. Bounded to a single
+        # retry (`already_rebuilt` guards against rebuilding twice when the
+        # corrupt branch already ran) — if the fragment is still absent
+        # after a full rebuild, there really is no log-backed row for this
+        # node and `not_found` is correct. The fuzzy path is intentionally
+        # left alone here: its candidates are already sourced from
+        # `_open_awaiting_launch_rows`, which reads fragments itself.
         rebuild(log_path, sessions_dir)
         current = read_fragment(node_id, sessions_dir)
     if current is None:

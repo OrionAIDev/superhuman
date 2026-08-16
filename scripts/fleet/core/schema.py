@@ -32,6 +32,16 @@ REQUIRED_EVENT_FIELDS: Final[frozenset[str]] = frozenset(
 #: All event-line keys the schema recognizes; anything else is rejected.
 _ALLOWED_EVENT_FIELDS: Final[frozenset[str]] = REQUIRED_EVENT_FIELDS | {"payload"}
 
+#: The only `schema_version` this module knows how to interpret as valid v1
+#: manifest truth. 9th-round preflight, BLOCKING, PM-reproduced:
+#: `validate_event` previously only type-checked `schema_version` (any int
+#: passed), so an otherwise-well-formed event carrying `schema_version=2`
+#: was accepted and replayed as valid v1 data. Pinned here so a future v2
+#: schema is an explicit, deliberate change to this constant (and to the
+#: validation/projection logic that interprets it), never an accidental
+#: silent acceptance.
+SCHEMA_VERSION_V1: Final[int] = 1
+
 #: The full event-type vocabulary (DESIGN "Decision F" — event types).
 EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
@@ -246,8 +256,13 @@ def validate_event(data: dict[str, Any]) -> Event:
         if not isinstance(data[key], str) or not data[key]:
             raise ValidationError(f"{key} must be a non-empty string")
 
-    if not isinstance(data["schema_version"], int):
-        raise ValidationError("schema_version must be an int")
+    schema_version = data["schema_version"]
+    if not isinstance(schema_version, int):
+        raise ValidationError(f"schema_version must be an int, got {schema_version!r}")
+    if schema_version != SCHEMA_VERSION_V1:
+        raise ValidationError(
+            f"schema_version must be {SCHEMA_VERSION_V1}, got {schema_version!r}"
+        )
 
     payload = data.get("payload", {})
     if not isinstance(payload, dict):

@@ -69,6 +69,23 @@ class FragmentCorrupt(FleetError):
     """
 
 
+class SessionIdentityUnresolved(FleetError):
+    """A `SessionAdapter` was asked for `current_session()` with no way to
+    know which real session it is.
+
+    Raised by `adapter.claude.ClaudeAdapter.current_session()` when
+    `current_session_id` was never supplied at construction. The Claude
+    harness has no Python-accessible source for "which session am I" (see
+    `adapter/claude.py`'s module docstring) — fabricating an id (e.g. from
+    a per-object memory address) is not a fallback, it is a distinct
+    phantom identity on every process, which breaks NFR-1 idempotency by
+    minting duplicate `session_registered` events/node_ids for one real
+    session (GPT-5 round-9 preflight, BLOCKING, PM-reproduced). This fails
+    closed instead: the caller must supply the real id (`--session-id` on
+    the CLI, or `current_session_id=` on the constructor).
+    """
+
+
 class DonePolicyError(FleetError):
     """A ``done_level`` advance was rejected by policy, not malformed input.
 

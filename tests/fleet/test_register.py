@@ -296,6 +296,43 @@ class TestCliRegisterSubcommand:
         assert len(events) == 1
         assert events[0].type == "session_registered"
 
+    def test_claude_harness_register_without_session_id_fails_closed_via_cli(
+        self, git_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """GPT-5 round-9 preflight, BLOCKING, PM-reproduced: `--harness
+        claude` with no `--session-id` and no `--target-session-id` used to
+        fall through to `current_session()`'s `id(self)` fallback, minting a
+        non-deterministic phantom id. Now `current_session()` fails closed
+        with `SessionIdentityUnresolved`, and the CLI must render that as a
+        clean nonzero exit with an actionable stderr message — never an
+        unhandled traceback."""
+        fleet_dir = tmp_path / "fleet"
+        exit_code = main(
+            [
+                "register",
+                "--project-id",
+                "proj-abc123",
+                "--slug",
+                "demo-slug",
+                "--workspace",
+                str(git_repo),
+                "--harness",
+                "claude",
+                "--origination",
+                "relayed",
+                "--writer-role",
+                "session",
+                "--fleet-dir",
+                str(fleet_dir),
+            ]
+        )
+
+        assert exit_code != 0
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.err
+        assert "session-id" in captured.err
+        assert not (fleet_dir / "events.jsonl").exists()
+
     def test_main_returns_nonzero_on_lock_timeout(
         self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
