@@ -116,7 +116,11 @@
 **RESOLVED 2026-08-15:**
 - Blockers 1 (Critical atomicity), 2 (Major column-0 comment), + should-fixes (ValueError guard, Windows newline preservation): fixed in `f330a93` (write_models_block now temp-renders → validates → `os.replace`; span terminates on any column-0 line; newline-preserving IO; 5 new tests; 100% line/branch on the write path).
 - Blocker 3 (Major surrogate schema contradiction): resolved via ADR-8 — explicit recorded carve-out across `conventions/subagent-return-schema.md`, `roles/surrogate-user.md`, and `DECISIONS.md`; added regression test `test_surrogate_schema_exception_is_recorded` (closes the presence-only-test gap the lens exploited).
-- Re-run of the correctness + design-conformance lenses PENDING → then GO.
+- Re-run of the correctness + design-conformance lenses COMPLETE — both **GO**. Correctness lens repro-confirmed all 4 fixes (atomicity, comment-span, ValueError guard, newline preservation); design-conformance lens confirmed ADR-8 closes the FR-4 gap with no vendor leak. 276 tests pass.
+
+### FINAL PREFLIGHT VERDICT: **GO** (2026-08-15, HEAD 185ca7d)
+All three lenses clear: correctness ✓, security ✓ (clean from first pass — no secrets, YAML-injection-resistant, hook unset safe, no new dep), design-conformance ✓.
+**Acknowledged residuals (non-blocking, accepted):** (1) `write_models_block` leaks its `.tmp` sibling only if `load_profile` raised a non-`ProfileError` (e.g. OSError) — original file stays intact; tracked as a follow-up polish (`finally` cleanup). (2) The regenerated `models:` block is LF even inside a CRLF file (untouched regions are preserved byte-for-byte as promised; the rewritten block is YAML-valid). (3) `.tmp` name is fixed, not randomized — fine for single-threaded onboarding. None affect correctness, security, or the immutable constraint.
 
 ## Archive log
 <!-- Append-only. Format: [<ISO timestamp>] archived <chunk> to archive/<dir>/; reason: <reason> -->
