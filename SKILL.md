@@ -153,10 +153,23 @@ Project state lives entirely in `SUPERHUMAN.md` — the orchestrator is stateles
 
 **Read-packet-first.** On every resume (see HARD-GATE step 1 above), the PM reads `## Resume
 packet` FIRST, before reconstructing from `## Decisions log` / `## Chunk log` / `## Drift notes` —
-it is the single always-current entry point, not one append-only source among several. Only when
-the packet is absent (a pre-existing SUPERHUMAN.md from before this section existed) does the PM
-fall back to reconstructing from the logs directly; absence is treated as empty, never as
-corruption, and resume proceeds without error.
+it is the single always-current entry point, not one append-only source among several.
+
+**Absence is version-gated, not always legitimate.** When `## Resume packet` and/or
+`## Decisions locked` are missing, what that means depends on the SUPERHUMAN.md's declared
+`Superhuman-version:` (§Version below) — the section was only ever guaranteed to exist starting
+at v1.1.0 (the release that introduced it; see `CHANGELOG.md`):
+
+- **`Superhuman-version` < 1.1.0, or no version declared at all** — the file predates these
+  sections; their absence is legitimate legacy. The PM falls back to reconstructing from
+  `## Decisions log` / `## Chunk log` / `## Drift notes` directly. Absence here is treated as empty,
+  never as corruption, and resume proceeds without error.
+- **`Superhuman-version` >= 1.1.0** — the file was written after these sections shipped, so a
+  missing one is unexpected: it may indicate truncation, corruption, or a silently dropped locked
+  decision, and losing a `## Decisions locked` entry silently would itself be a fidelity failure.
+  Do NOT treat the absence as empty. Surface it via G6 as stale state (same three options as the
+  HARD-GATE step 1 INVALID path: archive-and-restart, treat-as-legacy-import, abandon) before
+  proceeding — never guess and never silently fall back to the logs.
 
 **Refresh-at-each-gate, kept-current.** The `## Resume packet` is kept-current, not append-only:
 the PM refreshes it at every gate (not only at the ones that touch its fields) so a fresh session

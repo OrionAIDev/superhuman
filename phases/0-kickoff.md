@@ -97,14 +97,24 @@ consulted: [business-expert]
        "skip for now"). This must never block kickoff — proceed regardless of how many tiers were
        answered.
      - **Write, don't hand-write.** Elicitation is inference (this recipe); writing the profile is
-       code (dev-principle #5). Call the deterministic writer, never author the YAML by hand:
-       `scripts/superhuman_profile.py`'s `write_models_block(profile_path, answers, decline=...)`
-       (`<dispatch:bash>`). Pass the answered tiers in `answers` (`{tier: {"primary": ..., "fallback":
-       ...}}`); pass the declined/deferred tier names (or `decline=True` for all) in `decline=`. A
-       declined or deferred tier — and any tier the operator never reaches — is written by the
-       helper as the neutral `PROMPT_ME` placeholder, never a vendor assumption: this **fails safe**
-       and the operator is prompted again on a later first run once the profile still shows
-       placeholders.
+       code (dev-principle #5). Call the deterministic writer's CLI entry point — `models set`,
+       which wraps `write_models_block(profile_path, answers, decline=...)` — never author the YAML
+       by hand and never call `write_models_block` directly as Python (it has no `<dispatch:bash>`
+       seam):
+       ```
+       python scripts/superhuman_profile.py models set --profile <profile-path> \
+         --answers-json '{"most_capable": {"primary": "...", "fallback": "..."}, ...}' \
+         --decline "<comma-separated declined/deferred tier names>"
+       ```
+       (`<dispatch:bash>`). `--answers-json` carries the answered tiers as a JSON object (`{tier:
+       {"primary": ..., "fallback": ...}}`); `--decline` carries the declined/deferred tier names
+       (omit it, or pass all three tier names, to defer everything). A declined or deferred tier —
+       and any tier the operator never reaches — is written by the command as the neutral
+       `PROMPT_ME` placeholder, never a vendor assumption: this **fails safe** and the operator is
+       prompted again on a later first run once the profile still shows placeholders. A malformed
+       `--answers-json` or an unrecognized tier name exits non-zero with a `ProfileError` message,
+       never a silent no-op or a traceback — treat a non-zero exit here as a kickoff blocker, same
+       as any other failed `<dispatch:bash>` step.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On

@@ -723,3 +723,252 @@ def test_decline_specific_tiers_only(tmp_path: Path) -> None:
     assert profile.models["most_capable"]["primary"] == "vendor-a/big"
     assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
     assert profile.models["cheap"]["fallback"] == sp.MODEL_PLACEHOLDER
+
+
+# --------------------------------------------------------------------------- #
+# models: generator — post-review hardening (#139/#165)
+# --------------------------------------------------------------------------- #
+
+
+def test_models_set_cli_round_trip(tmp_path: Path) -> None:
+    """FIX 1: `models set` is the CLI seam for write_models_block.
+
+    Before this subcommand existed, phases/0-kickoff.md Step 3 told the PM to
+    call `write_models_block(...)` via `<dispatch:bash>` — impossible for a
+    bare Python function. The CLI round-trip must actually persist to
+    profile.yaml.
+    """
+    dest = tmp_path / "profile.yaml"
+    answers_json = (
+        '{"most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"}}'
+    )
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json", answers_json,
+         "--decline", "standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+    assert "wrote" in result.stdout
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"] == {
+        "primary": "vendor-a/big", "fallback": "vendor-b/big"
+    }
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+    assert profile.models["cheap"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_set_cli_decline_all_writes_placeholder(tmp_path: Path) -> None:
+    """FIX 1: the decline path (no answers at all) still round-trips through the CLI."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(
+        ["models", "set", "--profile", str(dest),
+         "--decline", "most_capable,standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+    profile = sp.load_profile(dest)
+    for tier in sp.MODEL_TIERS:
+        assert profile.models[tier]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_set_cli_bad_json_exits_nonzero_with_profileerror(tmp_path: Path) -> None:
+    """FIX 1: malformed --answers-json fails loud with a ProfileError message, not a traceback."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(["models", "set", "--profile", str(dest), "--answers-json", "{not json"])
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "superhuman-profile:" in result.stderr
+    assert "invalid JSON" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_unknown_tier_exits_nonzero(tmp_path: Path) -> None:
+    """FIX 1: an unrecognized tier name in --answers-json fails loud, not silently."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(
+        ["models", "set", "--profile", str(dest),
+         "--answers-json", '{"fastest": {"primary": "vendor-a/big"}}']
+    )
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "unknown tier" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not dest.exists()
+
+
+def test_write_models_block_updates_symlink_target_not_the_link(tmp_path: Path) -> None:
+    """FIX 2: a symlinked profile.yaml must have its REAL target updated, not be
+    clobbered by `os.replace` swapping in a plain file where the symlink was.
+
+    `os.replace(tmp, profile_path)` on a symlinked `profile_path` replaces the
+    symlink's own directory entry, destroying the link and leaving the real
+    (shared) target stale. The writer must resolve through the symlink and
+    swap the RESOLVED target instead.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    real_profile = real / "profile.yaml"
+    real_profile.write_text(
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n", encoding="utf-8"
+    )
+    link = tmp_path / "profile.yaml"
+    try:
+        link.symlink_to(real_profile)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable in this environment: {exc}")
+
+    sp.write_models_block(link, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    assert link.is_symlink(), "the symlink itself must survive the write, not be replaced by a plain file"
+    assert os.path.realpath(str(link)) == os.path.realpath(str(real_profile)), (
+        "the symlink must still point at the same real file"
+    )
+    assert "models:" in real_profile.read_text(encoding="utf-8"), (
+        "the REAL target must carry the new models: block"
+    )
+    profile = sp.load_profile(link)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+
+
+def test_write_models_block_resolves_symlink_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX 2, environment-independent variant: exercises the resolve-before-replace path
+    without requiring OS symlink-creation privilege (unavailable in some CI/sandbox
+    environments, including this one — `SeCreateSymbolicLinkPrivilege` on Windows
+    without Developer Mode/admin). Simulates a symlinked `profile_path` by
+    monkeypatching `Path.is_symlink`/`Path.resolve` for just this one path, then
+    asserts the write landed on the RESOLVED target rather than at `profile_path`
+    (which, for a real symlink, is the link's own directory entry). This variant
+    only exercises resolve-before-replace targeting, not the read/merge-with-
+    existing-content path (`profile_path.is_file()` correctly reports `False` for
+    the never-created `link_path`); the full read+write round-trip through a real
+    OS symlink is covered by
+    `test_write_models_block_updates_symlink_target_not_the_link` above, which
+    skips (rather than fails) where symlink creation is unprivileged.
+    """
+    link_path = tmp_path / "profile.yaml"
+    real_path = tmp_path / "real-profile.yaml"
+    real_path.write_text(
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n", encoding="utf-8"
+    )
+
+    real_is_symlink = Path.is_symlink
+    real_resolve = Path.resolve
+
+    def fake_is_symlink(self: Path) -> bool:
+        if self == link_path:
+            return True
+        return real_is_symlink(self)
+
+    def fake_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if self == link_path:
+            return real_path
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    sp.write_models_block(link_path, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    assert not link_path.exists(), (
+        "the write must never create a plain file at the symlink's own path"
+    )
+    assert "models:" in real_path.read_text(encoding="utf-8"), (
+        "the resolved (real) target must carry the new models: block"
+    )
+    profile = sp.load_profile(real_path)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+
+
+def test_write_models_block_rejects_duplicate_top_level_models_key(tmp_path: Path) -> None:
+    """FIX 3: two top-level `models:` blocks must fail loud, not silently mis-write.
+
+    `yaml.safe_load` keeps only the LAST of two top-level `models:` keys
+    (PyYAML does not reject duplicate mapping keys), while
+    `_find_models_span`/`_splice_models_block` locate and replace only the
+    FIRST. Left unchecked, a write against such a malformed profile would
+    silently patch the wrong (shadowed) block.
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+        "models:\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_preserves_indented_tier_after_column0_comment_inside_block(
+    tmp_path: Path,
+) -> None:
+    """FIX 4: a column-0 comment BETWEEN two indented tier entries is still inside the block.
+
+    Unlike the BLOCKER-2 comment (`test_write_models_block_preserves_column0_comment_after_models_block`),
+    which documents the NEXT top-level key, this comment sits between
+    `most_capable:` and `standard:` — both still children of the `models:`
+    mapping. Before the FIX-4 lookahead, `_find_models_span` truncated the
+    span at this comment, leaving `standard:` un-replaced and — because it
+    stayed indented directly below the freshly spliced-in block — silently
+    re-absorbed as a duplicate/stale key inside the NEW `models:` mapping.
+    """
+    original = (
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        "# a note about the standard tier below\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n"
+        "\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+    )
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, {"cheap": {"primary": "vendor-a/small", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert new_text.count("models:") == 1, "must not end up with a duplicated models: key"
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid", (
+        "the tier after the in-block comment must survive untouched, not be orphaned"
+    )
+    assert profile.models["cheap"]["primary"] == "vendor-a/small"
+    assert [r.name for r in profile.ladder] == ["a"], "content after the models: span must survive"
+
+
+def test_find_models_span_stops_at_comment_before_next_top_level_key(tmp_path: Path) -> None:
+    """FIX 4 regression guard: the original BLOCKER-2 shape is unaffected by the lookahead.
+
+    A column-0 comment immediately followed (after only blanks/comments) by a
+    column-0 KEY still ends the span at the comment — this is the case the
+    lookahead must NOT change.
+    """
+    lines = (
+        "models:\n"
+        "  standard:\n"
+        "    primary: x\n"
+        "# documents the next key\n"
+        "ladder:\n"
+        "  - name: a\n"
+    ).splitlines(keepends=True)
+    span = sp._find_models_span(lines)
+    assert span == (0, 3), "span must end before the comment, unchanged from BLOCKER-2 behavior"

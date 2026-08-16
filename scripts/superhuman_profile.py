@@ -1682,6 +1682,20 @@ def _find_models_span(lines: list[str]) -> tuple[int, int] | None:
     write. Only an *indented* comment — one that is visually a child of the
     ``models:`` mapping — is still absorbed into the span.
 
+    A column-0 comment does **not** always mean "the next key starts here",
+    though (post-review FIX 4): a comment can sit *between two indented tier
+    entries*, still inside the block (e.g. a note above ``standard:``). To
+    tell the two cases apart, a column-0 comment triggers a lookahead past
+    itself (and any further blank lines / column-0 comments) to the next
+    substantive line: if that line is indented, the comment (and everything
+    skipped to reach it) is a child of the ``models:`` mapping and the scan
+    continues; if it is a column-0 key, or the file ends, the comment
+    documents whatever comes next and the span stops before it — unchanged
+    from the BLOCKER-2 behavior above. Without this lookahead, a comment
+    between two indented tiers would truncate the span early, leaving the
+    later tier un-replaced and orphaned as a stray duplicate key after the
+    splice (roadmap #165 post-review FIX 4).
+
     Args:
         lines: File content split with ``str.splitlines(keepends=True)``.
 
@@ -1698,13 +1712,27 @@ def _find_models_span(lines: list[str]) -> tuple[int, int] | None:
         return None
 
     end = len(lines)
-    for i in range(start + 1, len(lines)):
+    i = start + 1
+    while i < len(lines):
         line = lines[i]
         if line.strip() == "":
+            i += 1
             continue  # blank line — still inside/around the block
         if line[:1] in (" ", "\t"):
+            i += 1
             continue  # indented — a child of the models: mapping
-        end = i  # column-0, non-blank: the next key, or a comment for it
+        # Column-0, non-blank: either a comment or the next top-level key.
+        if line.lstrip().startswith("#"):
+            j = i + 1
+            while j < len(lines) and (
+                lines[j].strip() == ""
+                or (lines[j][:1] not in (" ", "\t") and lines[j].lstrip().startswith("#"))
+            ):
+                j += 1  # skip blank lines and further column-0 comments
+            if j < len(lines) and lines[j][:1] in (" ", "\t"):
+                i += 1  # more block content follows — the comment is a child
+                continue
+        end = i  # column-0 key, or a comment with nothing but a key/EOF after it
         break
     return start, end
 
@@ -1839,10 +1867,11 @@ def write_models_block(
     Raises:
         ProfileError: If ``answers``/``decline`` name a tier outside
             :data:`MODEL_TIERS`; if ``profile_path`` exists but is not valid
-            YAML, its top level is not a mapping, or its existing ``models:``
-            value is not itself a mapping; or if the patched result fails to
-            load back. In every failure case the original file (if any) is
-            left byte-untouched — see "The write itself" above.
+            YAML, its top level is not a mapping, its existing ``models:``
+            value is not itself a mapping, or the file declares more than one
+            top-level ``models:`` key; or if the patched result fails to load
+            back. In every failure case the original file (if any) is left
+            byte-untouched — see "The write itself" above.
     """
     answers = answers or {}
     declined = set(MODEL_TIERS) if decline is True else (set() if decline is False else set(decline))
@@ -1862,6 +1891,22 @@ def write_models_block(
     else:
         text = ""
         existing = {}
+
+    # Post-review FIX 3: `yaml.safe_load` silently keeps only the LAST of two
+    # top-level `models:` keys (PyYAML does not reject duplicate mapping
+    # keys), while `_find_models_span`/`_splice_models_block` locate and
+    # replace only the FIRST. Left unchecked, that mismatch makes a write
+    # against a malformed two-`models:` profile silently ineffective — the
+    # visible (first) block gets patched, the shadowed (last, actually-read)
+    # one does not. Fail loud instead of guessing which block the operator
+    # meant.
+    model_key_count = sum(1 for line in text.splitlines(keepends=True) if _MODELS_KEY_RE.match(line))
+    if model_key_count > 1:
+        raise ProfileError(
+            f"{profile_path}: {model_key_count} top-level 'models:' keys found — malformed "
+            "profile (YAML would silently keep only the last while this writer patches only "
+            "the first); remove the duplicate before writing"
+        )
 
     raw_models = existing.get("models")
     if raw_models is not None and not isinstance(raw_models, dict):
@@ -1892,13 +1937,26 @@ def write_models_block(
     if "version" not in existing:
         new_text = f"version: {SCHEMA_VERSION}\n\n" + new_text
 
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    # Post-review FIX 2: if `profile_path` is itself a symlink (a common setup
+    # for sharing one real profile.yaml across worktrees/checkouts),
+    # `os.replace(tmp, profile_path)` would replace the symlink's directory
+    # entry with a plain file — destroying the link and leaving the real,
+    # shared target stale and un-updated. Resolve through the symlink first
+    # and write/replace against the RESOLVED target instead, so the symlink
+    # itself is left completely untouched and the shared file it points at is
+    # the one that actually changes. A non-symlink path resolves to itself,
+    # so this is a no-op for the common case.
+    target_path = profile_path.resolve() if profile_path.is_symlink() else profile_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Validate-then-swap (preflight BLOCKER 1): write to a temp sibling in the
     # same directory, validate THAT file, and only on success replace the
     # real target — atomically, since os.replace() is a same-filesystem
     # rename. A failure anywhere in the write/validate/replace never touches
-    # profile_path, so a previously-valid file can never be left broken.
+    # profile_path, so a previously-valid file can never be left broken. The
+    # temp sibling lives beside `target_path` (not `profile_path`) so the
+    # rename in the symlink case stays a same-filesystem, atomic swap of the
+    # resolved target rather than a cross-filesystem copy.
     #
     # tempfile.mkstemp gives a process/thread-unique sibling name so two
     # concurrent invocations cannot collide on a shared ".tmp" file, and the
@@ -1907,9 +1965,9 @@ def write_models_block(
     # non-ProfileError raised by the write (e.g. OSError) or by validation
     # would otherwise leak a stray ".tmp" beside the profile (preflight
     # correctness residual). On success the temp no longer exists — it has
-    # been renamed over profile_path — so `finally` leaves it alone.
+    # been renamed over target_path — so `finally` leaves it alone.
     fd, tmp_name = tempfile.mkstemp(
-        dir=str(profile_path.parent), prefix=f".{profile_path.name}.", suffix=".tmp"
+        dir=str(target_path.parent), prefix=f".{target_path.name}.", suffix=".tmp"
     )
     os.close(fd)
     tmp = Path(tmp_name)
@@ -1917,12 +1975,76 @@ def write_models_block(
     try:
         _write_profile_text(tmp, new_text)
         load_profile(tmp)
-        os.replace(tmp, profile_path)
+        os.replace(tmp, target_path)
         replaced = True
     finally:
         if not replaced:
             tmp.unlink(missing_ok=True)
     return profile_path
+
+
+def cmd_models_set(args: argparse.Namespace) -> int:
+    """Write/merge the ``models:`` block of a profile from CLI-supplied JSON.
+
+    This is the CLI seam for :func:`write_models_block` (post-review FIX 1):
+    before this subcommand existed, the writer was a bare Python function with
+    no way to invoke it from a dispatched shell command, so
+    ``phases/0-kickoff.md`` Step 3 could describe calling it but nothing could
+    actually do so. Config generation stays code (dev-principle #5); this is
+    that code's process boundary.
+
+    Args:
+        args: Parsed CLI arguments. ``--answers-json`` is a JSON object
+            mapping tier name -> ``{"primary": <alias>, "fallback": <alias>}``
+            (``fallback`` may be omitted or ``null``); ``--decline`` is an
+            optional comma-separated list of tier names to write as
+            :data:`MODEL_PLACEHOLDER`; ``--profile`` defaults to
+            ``~/.superhuman/profile.yaml``, the same default destination
+            :func:`cmd_init` uses for the operator's profile.
+
+    Returns:
+        Process exit code (0 on success).
+
+    Raises:
+        ProfileError: If ``--answers-json`` is not valid JSON, is not a JSON
+            object, or its value for a tier is not an object; or if
+            :func:`write_models_block` rejects the tier names or the existing
+            profile. Caught by :func:`main`, which prints the message and
+            exits 2 — never a raw traceback.
+    """
+    dest = Path(args.profile) if args.profile else (Path.home() / ".superhuman" / "profile.yaml")
+
+    try:
+        parsed = json.loads(args.answers_json)
+    except json.JSONDecodeError as exc:
+        raise ProfileError(f"--answers-json: invalid JSON — {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ProfileError("--answers-json: must be a JSON object of tier -> {primary, fallback}")
+
+    answers: dict[str, dict[str, str | None]] = {}
+    for tier, entry in parsed.items():
+        if not isinstance(entry, dict):
+            raise ProfileError(f"--answers-json.{tier}: must be an object with 'primary'/'fallback'")
+        answers[tier] = {"primary": entry.get("primary"), "fallback": entry.get("fallback")}
+
+    decline = {tok.strip() for tok in (args.decline or "").split(",") if tok.strip()}
+
+    # write_models_block validates tier names against MODEL_TIERS and raises
+    # ProfileError for anything unknown — no need to duplicate that check here.
+    write_models_block(dest, answers, decline=decline)
+
+    profile = load_profile(dest)
+    print(f"superhuman-profile: wrote {dest.as_posix()}")
+    for tier in MODEL_TIERS:
+        entry = profile.models.get(tier, {})
+        primary = entry.get("primary")
+        if primary == MODEL_PLACEHOLDER or primary is None:
+            print(f"  {tier:<14} {MODEL_PLACEHOLDER}")
+        else:
+            fallback = entry.get("fallback")
+            suffix = f" fallback={fallback}" if fallback else ""
+            print(f"  {tier:<14} primary={primary}{suffix}")
+    return EXIT_OK
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -2145,6 +2267,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     check.set_defaults(func=cmd_check)
+
+    models = subs.add_parser("models", help="manage the models: block of a profile")
+    models_subs = models.add_subparsers(dest="models_cmd", required=True)
+    models_set = models_subs.add_parser(
+        "set", help="write/merge the models: block from elicited per-tier answers"
+    )
+    models_set.add_argument(
+        "--profile",
+        default=None,
+        help="destination profile.yaml (default: ~/.superhuman/profile.yaml, same as `init`)",
+    )
+    models_set.add_argument(
+        "--answers-json",
+        default="{}",
+        help='JSON object: {"<tier>": {"primary": "...", "fallback": "..."}, ...}',
+    )
+    models_set.add_argument(
+        "--decline",
+        default=None,
+        help="comma-separated tier names to decline (written as the neutral placeholder)",
+    )
+    models_set.set_defaults(func=cmd_models_set)
+
     return parser
 
 

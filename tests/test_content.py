@@ -650,6 +650,33 @@ def test_backward_compat_fixture_resumes_without_error(skill_root: Path) -> None
     )
 
 
+def test_resume_absence_version_gate_documented(skill_root: Path) -> None:
+    """Post-review FIX 5: absence of Resume packet/Decisions locked is version-gated.
+
+    A missing '## Resume packet' or '## Decisions locked' means something
+    different depending on when the SUPERHUMAN.md was written. For a file
+    declaring `Superhuman-version:` 1.1.0 or later (the release that
+    introduced these sections — see CHANGELOG.md), absence is unexpected and
+    must be surfaced as stale state via G6, never silently treated as empty.
+    Only a pre-1.1.0 (or version-undeclared) file gets the legacy
+    fall-back-to-logs treatment covered by NFR-2
+    (`test_backward_compat_fixture_resumes_without_error`).
+    """
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined_lower = (skill_text + "\n" + pm_text).lower()
+
+    assert "1.1.0" in combined_lower, (
+        "must name the version (1.1.0) at which Resume packet / Decisions locked were introduced"
+    )
+    assert "superhuman-version" in combined_lower, (
+        "must key the gate off the declared Superhuman-version field"
+    )
+    assert "stale state" in combined_lower or "stale-state" in combined_lower, (
+        "a missing section on a >=1.1.0 file must be surfaced as stale state, not treated as empty"
+    )
+
+
 def test_skill_md_has_autonomous_progression_rule(skill_root: Path) -> None:
     """SKILL.md must include the autonomous-phase-progression cross-cutting rule.
 
