@@ -599,6 +599,35 @@ def test_write_models_block_leaves_original_untouched_on_validation_failure(
     assert not leftovers, f"no temp file should be left behind: {leftovers}"
 
 
+def test_write_models_block_cleans_up_temp_on_non_profileerror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preflight correctness residual: cleanup must cover EVERY failure path.
+
+    The earlier writer only unlinked the temp sibling inside `except
+    ProfileError`. A non-ProfileError raised while validating the temp file
+    (an OSError, say) escaped that handler and leaked a stray `.tmp` beside
+    the profile — cosmetic (the original stays intact) but untidy. The write/
+    validate/replace is now wrapped so the temp is removed on any failure.
+    """
+    dest = tmp_path / "profile.yaml"
+    original = "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+    dest.write_text(original, encoding="utf-8")
+
+    # Force a non-ProfileError from validation, after the temp file exists.
+    def _boom(_path: Path) -> None:
+        raise OSError("disk gremlins during validation")
+
+    monkeypatch.setattr(sp, "load_profile", _boom)
+
+    with pytest.raises(OSError, match="disk gremlins"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original, "original file must be byte-untouched on failure"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "profile.yaml"]
+    assert not leftovers, f"no temp file should be left behind on a non-ProfileError: {leftovers}"
+
+
 def test_write_models_block_preserves_column0_comment_after_models_block(tmp_path: Path) -> None:
     """BLOCKER 2 (preflight): a column-0 comment after `models:` belongs to what follows it.
 

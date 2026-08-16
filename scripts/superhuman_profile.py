@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, NamedTuple, Sequence
@@ -1812,12 +1813,14 @@ def write_models_block(
     authoring-rule commentary the shipped presets carry.
 
     The write itself is validate-then-swap, never write-then-validate
-    (preflight BLOCKER 1): the patched text is written to a temp sibling
-    file, that temp file is loaded through :func:`load_profile` to confirm it
-    is valid, and only then is it atomically renamed over ``profile_path``.
-    If validation fails, the temp file is discarded and the original —  if
-    one existed — is left completely untouched; a previously-valid
-    ``profile.yaml`` is never at risk of being overwritten by a broken write.
+    (preflight BLOCKER 1): the patched text is written to a uniquely-named
+    temp sibling file, that temp file is loaded through :func:`load_profile`
+    to confirm it is valid, and only then is it atomically renamed over
+    ``profile_path``. If anything fails — the write, the validation, or the
+    rename — the temp file is discarded and the original, if one existed, is
+    left completely untouched; a previously-valid ``profile.yaml`` is never
+    at risk of being overwritten by a broken write, and no stray ``.tmp``
+    sibling is left behind on any failure path.
 
     Args:
         profile_path: Destination ``profile.yaml``.
@@ -1894,16 +1897,31 @@ def write_models_block(
     # Validate-then-swap (preflight BLOCKER 1): write to a temp sibling in the
     # same directory, validate THAT file, and only on success replace the
     # real target — atomically, since os.replace() is a same-filesystem
-    # rename. A validation failure discards the temp file and never touches
+    # rename. A failure anywhere in the write/validate/replace never touches
     # profile_path, so a previously-valid file can never be left broken.
-    tmp = profile_path.with_name(profile_path.name + ".tmp")
+    #
+    # tempfile.mkstemp gives a process/thread-unique sibling name so two
+    # concurrent invocations cannot collide on a shared ".tmp" file, and the
+    # cleanup is in a `finally` keyed on whether the replace succeeded: the
+    # temp is removed on EVERY failure path, not only ProfileError. A
+    # non-ProfileError raised by the write (e.g. OSError) or by validation
+    # would otherwise leak a stray ".tmp" beside the profile (preflight
+    # correctness residual). On success the temp no longer exists — it has
+    # been renamed over profile_path — so `finally` leaves it alone.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(profile_path.parent), prefix=f".{profile_path.name}.", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    replaced = False
     try:
         _write_profile_text(tmp, new_text)
         load_profile(tmp)
-    except ProfileError:
-        tmp.unlink(missing_ok=True)
-        raise
-    os.replace(tmp, profile_path)
+        os.replace(tmp, profile_path)
+        replaced = True
+    finally:
+        if not replaced:
+            tmp.unlink(missing_ok=True)
     return profile_path
 
 
