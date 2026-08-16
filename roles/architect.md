@@ -7,6 +7,7 @@ declared-references:
 declared-conventions:
   - conventions/python.md
   - conventions/testing.md
+  - conventions/subagent-return-schema.md
 ---
 
 # Architect role
@@ -125,6 +126,7 @@ Apply these unconditionally on every Architect dispatch (per DESIGN §5):
   ```
 - **Artifact pointers, not paste.** Reference `REQUIREMENTS.md §<section>` rather than quoting inline. Paste only when the subagent isolation requires it.
 - **ARCHITECTURE.md trigger ruling** stated explicitly at G3 even when ARCHITECTURE.md is not required: *"ARCHITECTURE.md not required — no multiple deployable units, external-API integration, or cross-process IPC."*
+- **Status-report return shape.** When reporting back to PM as a dispatched subagent, follow `conventions/subagent-return-schema.md`'s six fields. The Architect's option table (and its named recommendation) is a specialization riding in `conclusion` — the comparison table itself is evidence, not a replacement for the schema.
 
 ---
 

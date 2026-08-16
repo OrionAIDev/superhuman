@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, NamedTuple, Sequence
@@ -61,6 +62,21 @@ DETECTOR_TIERS: dict[str, int] = {
 }
 
 ACTION_CLASSES = ("promote_into", "act_unattended")
+
+#: Capability tiers the ``models:`` block declares (spec/DESIGN §Component C-PROF).
+#: Order is display order only; lookup is by name.
+MODEL_TIERS: tuple[str, ...] = ("most_capable", "standard", "cheap")
+
+#: Neutral, vendor-free placeholder written for a declined/deferred tier (FR-10).
+#: Self-documenting on purpose — never a concrete vendor/model name — so the
+#: dispatch layer can warn (C-DISP) instead of silently assuming a provider.
+MODEL_PLACEHOLDER = "PROMPT_ME"
+
+_MODEL_ENTRY_KEYS = {"primary", "fallback"}
+
+#: Matches a top-level (column-0) `models:` key line, with or without trailing
+#: inline content (flow mapping) or a trailing comment.
+_MODELS_KEY_RE = re.compile(r"^models:(?:\s|$)")
 
 _APPROVER_RE = re.compile(r"^(human|self|human:[\w.-]+|agent:[\w.-]+)$")
 _STABLE_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
@@ -257,7 +273,12 @@ class Profile:
         require_profile: In-file equivalent of ``SUPERHUMAN_REQUIRE_PROFILE``.
         ladder: Ordered rungs.
         conventions: Convention pack names or overlay paths.
-        models: Tier -> model id/alias.
+        models: Tier -> ``{"primary": <alias>, "fallback": <alias> | None}``.
+            Normalized at load time (ADR-6): a legacy bare-string tier value
+            (``most_capable: opus``) is read as ``{"primary": "opus", "fallback":
+            None}``; an already-mapping value passes through unchanged. Every
+            downstream reader sees the mapping form regardless of which shape
+            the file was written in.
         path: Source file, or ``None`` for the built-in ladder.
         digest: Hash over declared cells only (spec §5, decision D-12).
     """
@@ -267,7 +288,7 @@ class Profile:
     require_profile: bool
     ladder: tuple[Rung, ...]
     conventions: tuple[str, ...]
-    models: dict[str, str]
+    models: dict[str, dict[str, str | None]]
     path: Path | None
     digest: str
 
@@ -381,6 +402,67 @@ def _digest(declared: Any) -> str:
     """
     blob = json.dumps(declared, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _normalize_model_entry(value: Any, where: str) -> dict[str, str | None]:
+    """Normalize one ``models:`` tier value to the canonical mapping form.
+
+    Per ADR-6, a legacy bare string is the primary with no fallback; an
+    already-mapping value is validated and taken as-is. Any other shape fails
+    loud rather than being silently coerced (spec §Error handling).
+
+    Args:
+        value: The raw YAML value for one tier (``str`` or a mapping).
+        where: Dotted path used in error messages.
+
+    Returns:
+        A mapping with exactly ``primary`` and ``fallback`` keys.
+
+    Raises:
+        ProfileError: If ``value`` is neither a non-empty string nor a mapping
+            with a valid ``primary``/``fallback`` shape.
+    """
+    if isinstance(value, str):
+        if not value:
+            raise ProfileError(f"{where}: model alias must not be empty")
+        return {"primary": value, "fallback": None}
+    if isinstance(value, dict):
+        extra = set(value) - _MODEL_ENTRY_KEYS
+        if extra:
+            raise ProfileError(f"{where}: unknown key(s) {sorted(extra)}")
+        primary = value.get("primary")
+        if not isinstance(primary, str) or not primary:
+            raise ProfileError(f"{where}: 'primary' is required and must be a non-empty string")
+        fallback = value.get("fallback")
+        if fallback is not None and not isinstance(fallback, str):
+            raise ProfileError(f"{where}: 'fallback' must be a string or null")
+        return {"primary": primary, "fallback": fallback}
+    raise ProfileError(f"{where}: must be a string or a {{primary, fallback}} mapping, got {value!r}")
+
+
+def _normalize_models(raw_models: Any, where: str) -> dict[str, dict[str, str | None]]:
+    """Normalize the whole ``models:`` block to the canonical per-tier mapping.
+
+    Args:
+        raw_models: The raw YAML value of the ``models:`` key, or ``None``.
+        where: Dotted path used in error messages.
+
+    Returns:
+        Tier name -> normalized ``{primary, fallback}`` mapping. Empty when
+        ``raw_models`` is ``None`` (FR-9: an absent block is not an error).
+
+    Raises:
+        ProfileError: If ``raw_models`` is present but not a mapping, or any
+            tier value fails :func:`_normalize_model_entry`.
+    """
+    if raw_models is None:
+        return {}
+    if not isinstance(raw_models, dict):
+        raise ProfileError(f"{where}: must be a mapping")
+    return {
+        tier: _normalize_model_entry(value, f"{where}.{tier}")
+        for tier, value in raw_models.items()
+    }
 
 
 def load_profile(path: Path | None) -> Profile:
@@ -521,7 +603,7 @@ def load_profile(path: Path | None) -> Profile:
         require_profile=bool(raw.get("require_profile", False)),
         ladder=tuple(rungs),
         conventions=tuple(raw.get("conventions") or ()),
-        models=raw.get("models") or {},
+        models=_normalize_models(raw.get("models"), "models"),
         path=path,
         digest=_digest(declared),
     )
@@ -1614,6 +1696,492 @@ def render_profile(ladder: list[dict[str, Any]], disc: "Discovery | None" = None
     return "\n".join(out).rstrip() + "\n"
 
 
+def _find_models_span(lines: list[str]) -> tuple[int, int] | None:
+    """Find the line-index span of a top-level ``models:`` block in raw YAML text.
+
+    YAML top-level keys sit at column 0 (the authoring convention every
+    profile in this repo follows). The span starts at the ``models:`` line
+    and extends through every following line that is blank or indented (a
+    child of the mapping) — ending at the next column-0, non-blank line, or
+    end of file. This lets the caller replace only that span and leave every
+    other byte of the file — comments included — untouched.
+
+    A column-0 comment terminates the span exactly like a column-0 key does
+    (preflight BLOCKER 2): a comment sitting between ``models:`` and the next
+    top-level key documents *that* key, not ``models:``, so treating it as
+    part of the mapping being replaced would silently delete it on every
+    write. Only an *indented* comment — one that is visually a child of the
+    ``models:`` mapping — is still absorbed into the span.
+
+    A column-0 comment does **not** always mean "the next key starts here",
+    though (post-review FIX 4): a comment can sit *between two indented tier
+    entries*, still inside the block (e.g. a note above ``standard:``). To
+    tell the two cases apart, a column-0 comment triggers a lookahead past
+    itself (and any further blank lines / column-0 comments) to the next
+    substantive line: if that line is indented, the comment (and everything
+    skipped to reach it) is a child of the ``models:`` mapping and the scan
+    continues; if it is a column-0 key, or the file ends, the comment
+    documents whatever comes next and the span stops before it — unchanged
+    from the BLOCKER-2 behavior above. Without this lookahead, a comment
+    between two indented tiers would truncate the span early, leaving the
+    later tier un-replaced and orphaned as a stray duplicate key after the
+    splice (roadmap #165 post-review FIX 4).
+
+    Args:
+        lines: File content split with ``str.splitlines(keepends=True)``.
+
+    Returns:
+        ``(start, end)`` line indices with ``end`` exclusive, or ``None`` if
+        no top-level ``models:`` line is present.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if _MODELS_KEY_RE.match(line):
+            start = i
+            break
+    if start is None:
+        return None
+
+    end = len(lines)
+    i = start + 1
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == "":
+            i += 1
+            continue  # blank line — still inside/around the block
+        if line[:1] in (" ", "\t"):
+            i += 1
+            continue  # indented — a child of the models: mapping
+        # Column-0, non-blank: either a comment or the next top-level key.
+        if line.lstrip().startswith("#"):
+            j = i + 1
+            while j < len(lines) and (
+                lines[j].strip() == ""
+                or (lines[j][:1] not in (" ", "\t") and lines[j].lstrip().startswith("#"))
+            ):
+                j += 1  # skip blank lines and further column-0 comments
+            if j < len(lines) and lines[j][:1] in (" ", "\t"):
+                i += 1  # more block content follows — the comment is a child
+                continue
+        end = i  # column-0 key, or a comment with nothing but a key/EOF after it
+        break
+    return start, end
+
+
+def _splice_models_block(text: str, rendered_block: str) -> str:
+    """Replace or append the top-level ``models:`` block in raw profile text.
+
+    This is the targeted-patch primitive behind :func:`write_models_block`
+    (#139 G6 follow-up): every other line — comments, blank lines, ``ladder:``,
+    ``version:``, anything else — passes through byte-identical. Only the
+    ``models:`` key's own span (per :func:`_find_models_span`) is replaced.
+    When no ``models:`` key exists yet, ``rendered_block`` is appended after a
+    blank-line separator so it never fuses onto a preceding comment or the
+    last line of an existing mapping.
+
+    Args:
+        text: The original file content (``""`` for a brand-new file).
+        rendered_block: The freshly rendered ``models:\\n  ...`` block text,
+            trailing newline included.
+
+    Returns:
+        The full document text with only the ``models:`` span touched.
+    """
+    lines = text.splitlines(keepends=True)
+    span = _find_models_span(lines)
+    if span is None:
+        prefix = text
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        if prefix and not prefix.endswith("\n\n"):
+            prefix += "\n"
+        return prefix + rendered_block
+
+    start, end = span
+    return "".join(lines[:start]) + rendered_block + "".join(lines[end:])
+
+
+def _read_profile_text(path: Path) -> str:
+    """Read a profile file's text, preserving its original line-ending bytes.
+
+    Per the ``open()`` builtin's newline-translation contract (Python
+    stdlib): https://docs.python.org/3/library/functions.html#open —
+    ``newline=""`` disables universal-newline translation on read, so
+    ``\\r\\n``/``\\r``/``\\n`` line endings come through exactly as written
+    rather than all being collapsed to ``\\n``. Pairs with
+    :func:`_write_profile_text` so an untouched region of the file round-trips
+    byte-for-byte (preflight SHOULD-FIX 4).
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The file's text, with original line-ending bytes intact.
+    """
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _write_profile_text(path: Path, text: str) -> None:
+    """Write text to a profile file without line-ending translation.
+
+    See :func:`_read_profile_text`: ``newline=""`` also disables write-side
+    translation, so a ``\\n`` already embedded in ``text`` — e.g. inside an
+    untouched CRLF region carried through unmodified from the original file
+    — is written as-is rather than being expanded to ``os.linesep`` (which
+    would silently flip an LF-authored file to CRLF on Windows, or vice
+    versa on a CRLF-authored file elsewhere).
+
+    Args:
+        path: Destination file.
+        text: Text to write, verbatim.
+    """
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
+def _semantic_top_level_models_key_count(text: str, profile_path: Path) -> int:
+    """Count top-level ``models`` keys the way ``yaml.safe_load`` actually sees them.
+
+    The column-0 ``^models:`` regex (:data:`_MODELS_KEY_RE`) only recognises the
+    one canonical spelling this writer's targeted splice can edit. YAML itself
+    is far more permissive: a quoted ``"models":`` or ``'models':`` key is a
+    perfectly ordinary mapping key that resolves to the same scalar value
+    ``"models"`` and therefore collides with a canonical ``models:`` key under
+    ``yaml.safe_load``'s last-key-wins duplicate handling — a collision the
+    regex-only count cannot see (post-review FIX D, round 3.5).
+
+    This walks the document's parse tree with ``yaml.compose`` (which builds
+    nodes without resolving Python objects, so it is cheap and side-effect
+    free) rather than re-parsing with regex, and counts key nodes at the root
+    mapping whose scalar value is exactly ``"models"`` — catching every
+    YAML-equivalent spelling, not just the ones a regex happens to anticipate.
+
+    Args:
+        text: The raw profile YAML text.
+        profile_path: Source file, used only to build error messages.
+
+    Returns:
+        The number of top-level mapping keys that resolve to ``"models"``.
+        ``0`` for an empty document or a non-mapping root (both are guarded
+        elsewhere; this helper simply has nothing to count in those cases).
+
+    Raises:
+        ProfileError: If ``text`` is not parseable YAML at all.
+    """
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise ProfileError(f"{profile_path}: invalid YAML — {exc}") from exc
+    if root is None or not isinstance(root, yaml.MappingNode):
+        return 0
+    return sum(
+        1
+        for key_node, _value_node in root.value
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == "models"
+    )
+
+
+def write_models_block(
+    profile_path: Path,
+    answers: dict[str, dict[str, str | None]] | None = None,
+    *,
+    decline: bool | Iterable[str] = False,
+) -> Path:
+    """Deterministically write/merge the ``models:`` block of a profile.yaml.
+
+    This is C-PROF's writer (FR-9): the elicitation sub-flow (Chunk 6, C-KICK)
+    collects per-tier primary/fallback answers and hands them here — config
+    generation stays code, never LLM free-text, per dev-principle #5. Creates
+    ``profile_path`` (and its parent directories) if absent, and creates the
+    ``models:`` section if the file exists but lacks one. Existing top-level
+    keys (``ladder``, ``conventions``, …) and tiers not touched by this call
+    are preserved — a second call for one tier must not clobber another
+    tier's prior answer.
+
+    Every one of :data:`MODEL_TIERS` ends up populated after this call: a
+    tier that is neither answered nor explicitly declined, and was not
+    already present in the file, still gets :data:`MODEL_PLACEHOLDER` rather
+    than being left absent — fail safe, not fail silent (FR-10).
+
+    This is a **targeted patch**, not a full-document re-dump (#139 G6): only
+    the ``models:`` key's own text span is replaced (or appended if absent).
+    Comments, formatting, line endings, and every other top-level key —
+    ``ladder:``, ``citation:``, an operator's own annotations — pass through
+    byte-identical. A prior implementation round-tripped the whole file
+    through ``yaml.safe_load``/``yaml.safe_dump``, which silently discarded
+    every comment in the file, including the ~40 lines of load-bearing
+    authoring-rule commentary the shipped presets carry.
+
+    The write itself is validate-then-swap, never write-then-validate
+    (preflight BLOCKER 1): the patched text is written to a uniquely-named
+    temp sibling file, that temp file is loaded through :func:`load_profile`
+    to confirm it is valid, and only then is it atomically renamed over
+    ``profile_path``. If anything fails — the write, the validation, or the
+    rename — the temp file is discarded and the original, if one existed, is
+    left completely untouched; a previously-valid ``profile.yaml`` is never
+    at risk of being overwritten by a broken write, and no stray ``.tmp``
+    sibling is left behind on any failure path.
+
+    Args:
+        profile_path: Destination ``profile.yaml``.
+        answers: Tier -> ``{"primary": <alias>, "fallback": <alias> | None}``
+            for tiers the operator answered. ``None`` (the default) answers
+            none.
+        decline: ``True`` to decline every tier in :data:`MODEL_TIERS`, or an
+            iterable of tier names to decline individually. A declined tier
+            is written with :data:`MODEL_PLACEHOLDER` for both ``primary`` and
+            ``fallback`` — never a concrete vendor/model name (FR-10, the
+            provider-agnostic immutable constraint).
+
+    Returns:
+        ``profile_path``, for chaining.
+
+    Raises:
+        ProfileError: If ``answers``/``decline`` name a tier outside
+            :data:`MODEL_TIERS`; if ``profile_path`` exists but is not valid
+            YAML, its top level is not a mapping, its existing ``models:``
+            value is not itself a mapping, or the file declares more than one
+            top-level ``models:`` key; or if the patched result fails to load
+            back. In every failure case the original file (if any) is left
+            byte-untouched — see "The write itself" above.
+    """
+    answers = answers or {}
+    declined = set(MODEL_TIERS) if decline is True else (set() if decline is False else set(decline))
+
+    unknown = (set(answers) | declined) - set(MODEL_TIERS)
+    if unknown:
+        raise ProfileError(f"models: unknown tier(s) {sorted(unknown)}")
+
+    if profile_path.is_file():
+        text = _read_profile_text(profile_path)
+        try:
+            existing: Any = yaml.safe_load(text) or {}
+        except yaml.YAMLError as exc:
+            raise ProfileError(f"{profile_path}: invalid YAML — {exc}") from exc
+        if not isinstance(existing, dict):
+            raise ProfileError(f"{profile_path}: top level must be a mapping")
+    else:
+        text = ""
+        existing = {}
+
+    # Post-review FIX 3 / FIX C (round 3), unified into one semantic check
+    # (round 3.5): a regex-only count of the canonical `^models:` spelling
+    # cannot see a YAML-equivalent duplicate — e.g. one canonical `models:`
+    # plus one quoted `"models":` — because `yaml.safe_load` resolves both to
+    # the SAME key (`"models"`) and keeps only the last, while the regex count
+    # stays at 1 and the old guard passed. The writer would then patch the
+    # canonical (first, now-shadowed) block and leave the quoted duplicate
+    # untouched, silently producing a profile whose `models:` the loader and
+    # the file on disk disagree about.
+    #
+    # `model_key_count` (the canonical, EDITABLE span count) and
+    # `semantic_count` (every top-level key that YAML resolves to `"models"`,
+    # any spelling) must both be exactly 1, or both be 0 (no `models:` key at
+    # all — nothing to guard). Any other combination — two canonical keys, a
+    # canonical key shadowed by a quoted one, or a quoted-only key with no
+    # canonical span to splice into — means the targeted patch below cannot
+    # safely edit this file, so fail loud rather than guess.
+    #
+    # `raw_models` is computed FIRST and the guard is gated on it (round 3.6
+    # FIX Y) because `yaml.safe_load` can populate a top-level `models` key
+    # WITHOUT any `models` scalar node existing at the document root at
+    # all — a top-level YAML merge key (`<<: *anchor`) merges a `models:`
+    # mapping from the anchored document into the root. `yaml.compose` (used
+    # by `_semantic_top_level_models_key_count`) does not resolve merge keys,
+    # so it sees no `models` key node and reports `semantic_count == 0`; the
+    # regex-only `model_key_count` also stays 0. The old guard treated
+    # `(0, 0)` as always safe and let the splice below APPEND a second
+    # `models:` block underneath the merge-derived one, which `yaml.safe_load`
+    # would then silently prefer over the merge (last-key-wins) — a second,
+    # invisible-to-the-regex `models:` block, not a fail-loud error. Gating on
+    # `raw_models` closes that: whenever the loader actually sees a `models`
+    # value (merge key or otherwise), the canonical/semantic span count must
+    # be exactly `(1, 1)` or this is not a file the targeted patch can safely
+    # edit.
+    raw_models = existing.get("models")
+    if raw_models is not None and not isinstance(raw_models, dict):
+        raise ProfileError(f"{profile_path}: 'models:' must be a mapping")
+
+    model_key_count = sum(1 for line in text.splitlines(keepends=True) if _MODELS_KEY_RE.match(line))
+    semantic_count = _semantic_top_level_models_key_count(text, profile_path)
+    required = (1, 1) if raw_models is not None else (0, 0)
+    if (semantic_count, model_key_count) != required:
+        raise ProfileError(
+            f"{profile_path}: expected exactly one top-level 'models:' key, found "
+            f"{semantic_count} that YAML resolves to 'models' (any spelling) and "
+            f"{model_key_count} in the canonical, unquoted 'models:' spelling this writer's "
+            "targeted patch can edit — remove the duplicate, or rewrite the key as a plain, "
+            "unquoted 'models:', before writing"
+        )
+
+    models_block: dict[str, Any] = dict(raw_models or {})
+    for tier in MODEL_TIERS:
+        if tier in declined:
+            models_block[tier] = {"primary": MODEL_PLACEHOLDER, "fallback": MODEL_PLACEHOLDER}
+        elif tier in answers:
+            entry = answers[tier]
+            models_block[tier] = {
+                "primary": entry.get("primary") or MODEL_PLACEHOLDER,
+                "fallback": entry.get("fallback"),
+            }
+        elif tier not in models_block:
+            models_block[tier] = {"primary": MODEL_PLACEHOLDER, "fallback": MODEL_PLACEHOLDER}
+
+    # yaml.safe_dump(data, default_flow_style=False, sort_keys=False):
+    # https://pyyaml.org/wiki/PyYAMLDocumentation (PyYAML 6.0.3, installed version)
+    # — block style, insertion order preserved, no Python-specific tags. Only
+    # the small {"models": ...} sub-document is dumped; it is spliced into the
+    # original text rather than replacing it, so nothing else gets re-dumped.
+    rendered = yaml.safe_dump(
+        {"models": models_block}, default_flow_style=False, sort_keys=False, allow_unicode=True
+    )
+    new_text = _splice_models_block(text, rendered)
+    if "version" not in existing:
+        new_text = f"version: {SCHEMA_VERSION}\n\n" + new_text
+
+    # Post-review FIX 2: if `profile_path` is itself a symlink (a common setup
+    # for sharing one real profile.yaml across worktrees/checkouts),
+    # `os.replace(tmp, profile_path)` would replace the symlink's directory
+    # entry with a plain file — destroying the link and leaving the real,
+    # shared target stale and un-updated. Resolve through the symlink first
+    # and write/replace against the RESOLVED target instead, so the symlink
+    # itself is left completely untouched and the shared file it points at is
+    # the one that actually changes. A non-symlink path resolves to itself,
+    # so this is a no-op for the common case.
+    target_path = profile_path.resolve() if profile_path.is_symlink() else profile_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Validate-then-swap (preflight BLOCKER 1): write to a temp sibling in the
+    # same directory, validate THAT file, and only on success replace the
+    # real target — atomically, since os.replace() is a same-filesystem
+    # rename. A failure anywhere in the write/validate/replace never touches
+    # profile_path, so a previously-valid file can never be left broken. The
+    # temp sibling lives beside `target_path` (not `profile_path`) so the
+    # rename in the symlink case stays a same-filesystem, atomic swap of the
+    # resolved target rather than a cross-filesystem copy.
+    #
+    # tempfile.mkstemp gives a process/thread-unique sibling name so two
+    # concurrent invocations cannot collide on a shared ".tmp" file, and the
+    # cleanup is in a `finally` keyed on whether the replace succeeded: the
+    # temp is removed on EVERY failure path, not only ProfileError. A
+    # non-ProfileError raised by the write (e.g. OSError) or by validation
+    # would otherwise leak a stray ".tmp" beside the profile (preflight
+    # correctness residual). On success the temp no longer exists — it has
+    # been renamed over target_path — so `finally` leaves it alone.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target_path.parent), prefix=f".{target_path.name}.", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    replaced = False
+    try:
+        _write_profile_text(tmp, new_text)
+        load_profile(tmp)
+        os.replace(tmp, target_path)
+        replaced = True
+    finally:
+        if not replaced:
+            tmp.unlink(missing_ok=True)
+    return profile_path
+
+
+def cmd_models_set(args: argparse.Namespace) -> int:
+    """Write/merge the ``models:`` block of a profile from CLI-supplied JSON.
+
+    This is the CLI seam for :func:`write_models_block` (post-review FIX 1):
+    before this subcommand existed, the writer was a bare Python function with
+    no way to invoke it from a dispatched shell command, so
+    ``phases/0-kickoff.md`` Step 3 could describe calling it but nothing could
+    actually do so. Config generation stays code (dev-principle #5); this is
+    that code's process boundary.
+
+    Args:
+        args: Parsed CLI arguments. ``--answers-json`` is a JSON object
+            mapping tier name -> ``{"primary": <alias>, "fallback": <alias>}``
+            (``fallback`` may be omitted or ``null``), given inline on the
+            command line. ``--answers-json-file`` is the same JSON object,
+            but read from a file (or from stdin, when the path is ``-``)
+            instead of being interpolated into a shell word — the
+            injection-proof path ``phases/0-kickoff.md`` Step 3 uses, since
+            an operator alias or elicited answer may itself contain a quote,
+            ``$``, or backtick (dev-principle #5: no LLM-marshalled data into
+            a shell word). Exactly one of ``--answers-json`` /
+            ``--answers-json-file`` may be given unless ``--decline`` alone
+            supplies everything there is to do. ``--decline`` is an optional
+            comma-separated list of tier names to write as
+            :data:`MODEL_PLACEHOLDER`; ``--profile`` defaults to
+            ``~/.superhuman/profile.yaml``, the same default destination
+            :func:`cmd_init` uses for the operator's profile.
+
+    Returns:
+        Process exit code (0 on success).
+
+    Raises:
+        ProfileError: If both ``--answers-json`` and ``--answers-json-file``
+            are given; if neither is given and ``--decline`` is also empty
+            (nothing for the command to do); if ``--answers-json-file``
+            names a file that cannot be read; if the resulting JSON is not
+            valid, is not a JSON object, or its value for a tier is not an
+            object; or if :func:`write_models_block` rejects the tier names
+            or the existing profile. Caught by :func:`main`, which prints
+            the message and exits 2 — never a raw traceback.
+    """
+    dest = Path(args.profile) if args.profile else (Path.home() / ".superhuman" / "profile.yaml")
+    decline = {tok.strip() for tok in (args.decline or "").split(",") if tok.strip()}
+
+    if args.answers_json is not None and args.answers_json_file is not None:
+        raise ProfileError(
+            "--answers-json and --answers-json-file are mutually exclusive — pass only one"
+        )
+    if args.answers_json_file is not None:
+        if args.answers_json_file == "-":
+            raw_json = sys.stdin.read()
+        else:
+            try:
+                raw_json = Path(args.answers_json_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ProfileError(f"--answers-json-file: {exc}") from exc
+    elif args.answers_json is not None:
+        raw_json = args.answers_json
+    elif decline:
+        raw_json = "{}"
+    else:
+        raise ProfileError(
+            "models set: nothing to do — pass --answers-json, --answers-json-file, or --decline"
+        )
+
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ProfileError(f"--answers-json: invalid JSON — {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ProfileError("--answers-json: must be a JSON object of tier -> {primary, fallback}")
+
+    answers: dict[str, dict[str, str | None]] = {}
+    for tier, entry in parsed.items():
+        if not isinstance(entry, dict):
+            raise ProfileError(f"--answers-json.{tier}: must be an object with 'primary'/'fallback'")
+        answers[tier] = {"primary": entry.get("primary"), "fallback": entry.get("fallback")}
+
+    # write_models_block validates tier names against MODEL_TIERS and raises
+    # ProfileError for anything unknown — no need to duplicate that check here.
+    write_models_block(dest, answers, decline=decline)
+
+    profile = load_profile(dest)
+    print(f"superhuman-profile: wrote {dest.as_posix()}")
+    for tier in MODEL_TIERS:
+        entry = profile.models.get(tier, {})
+        primary = entry.get("primary")
+        if primary == MODEL_PLACEHOLDER or primary is None:
+            print(f"  {tier:<14} {MODEL_PLACEHOLDER}")
+        else:
+            fallback = entry.get("fallback")
+            suffix = f" fallback={fallback}" if fallback else ""
+            print(f"  {tier:<14} primary={primary}{suffix}")
+    return EXIT_OK
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Propose, and optionally write, a profile.
 
@@ -1834,6 +2402,44 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     check.set_defaults(func=cmd_check)
+
+    models = subs.add_parser("models", help="manage the models: block of a profile")
+    models_subs = models.add_subparsers(dest="models_cmd", required=True)
+    models_set = models_subs.add_parser(
+        "set", help="write/merge the models: block from elicited per-tier answers"
+    )
+    models_set.add_argument(
+        "--profile",
+        default=None,
+        help="destination profile.yaml (default: ~/.superhuman/profile.yaml, same as `init`)",
+    )
+    models_set.add_argument(
+        "--answers-json",
+        default=None,
+        help=(
+            'JSON object: {"<tier>": {"primary": "...", "fallback": "..."}, ...} — given '
+            "inline. Prefer --answers-json-file when any value is not a fixed literal "
+            "(operator aliases, elicited answers): inline JSON is interpolated into a shell "
+            "word and an alias containing a quote, $, or backtick can break the quoting or "
+            "inject shell."
+        ),
+    )
+    models_set.add_argument(
+        "--answers-json-file",
+        default=None,
+        help=(
+            "same JSON object as --answers-json, read from PATH instead (PATH may be '-' to "
+            "read from stdin). Mutually exclusive with --answers-json; this is the "
+            "injection-proof form phases/0-kickoff.md Step 3 uses."
+        ),
+    )
+    models_set.add_argument(
+        "--decline",
+        default=None,
+        help="comma-separated tier names to decline (written as the neutral placeholder)",
+    )
+    models_set.set_defaults(func=cmd_models_set)
+
     return parser
 
 

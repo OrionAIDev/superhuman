@@ -17,7 +17,7 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
    - **Does not exist** → start Phase 0. Read `phases/0-kickoff.md` and follow its steps.
    - **Exists** → check whether it represents a **valid superhuman session**:
      - VALID iff it has a `## Decisions log` section AND that section contains at least one entry matching `G<digit>` with a `user decision:` field (e.g., `[<timestamp>] G2: REQUIREMENTS approved; user decision: approve`).
-     - VALID → resume. Identify the highest-numbered gate logged with a `user decision:` field; the NEXT gate (and every gate after it) MUST still fire with HITL in this session. "Resume" means "pick up at the next gate", NOT "skip remaining gates because work appears done".
+     - VALID → resume. **Read the `## Resume packet` FIRST** — it is the single always-current entry point — then follow its pointers into `## Decisions locked` and `## Chunk log`/`## Decisions log` before reconstructing anything else. **If `## Resume packet` (and/or `## Decisions locked`) is absent, the handling is version-gated on `Superhuman-version:`, not unconditional** — see `## Resume packet and locked decisions` below for the full rule: below `1.1.0` (or undeclared), the file predates these sections, treat the absence as empty, never as corruption, and reconstruct context from `## Decisions log` and `## Chunk log` exactly as before these sections existed — resume proceeds without error. At `1.1.0` or above the sections were guaranteed to exist, so a missing one is unexpected — treat it as stale state and surface it via G6 (same three options as the INVALID path below) rather than silently falling back to the logs. Identify the highest-numbered gate logged with a `user decision:` field; the NEXT gate (and every gate after it) MUST still fire with HITL in this session. "Resume" means "pick up at the next gate", NOT "skip remaining gates because work appears done".
      - INVALID (file exists but lacks a structured Decisions log, or contains only unstructured notes) → treat as stale state. Surface to the user via G6 with three options: (a) archive-and-restart (run `scripts/cleanup-project.sh <project>` and start Phase 0 fresh), (b) treat-as-legacy-import (keep the existing files as reference, but still run all 8 gates in this session), (c) abandon (stop). DO NOT resume; DO NOT backfill artifacts as documentation.
    - **Also check for pre-existing implementation code outside the superhuman flow** (e.g., `src/`, `tests/`, `pyproject.toml` at project root with no corresponding `## Chunk log` entries in SUPERHUMAN.md). If found, treat as a drift event (G6) regardless of SUPERHUMAN.md validity. Same three options as above.
 2. Phase 0 MUST present G0 (vision elicitation) and G1 (workflow preferences) to the user via chat (`<dispatch:ask>` or the platform-degraded equivalent — a numbered-list chat message). Even if the user pre-answered some prefs in the invocation message, you MUST still present the gate. Pre-answers reduce the number of questions; they do not authorize skipping the gate.
@@ -70,17 +70,20 @@ The PM orchestrator role is `tier: most-capable` (see `roles/pm.md` and `adaptat
 
 **Reference by alias, not by version.** Concrete model names (gpt-5.5, claude-opus-4-7, gemini-2.5-pro) go stale as providers ship newer versions. Reference by **alias** — your environment's stable name for "the current best model of family X" — so this skill keeps working without doc churn whenever the underlying model is upgraded.
 
-**Where the mapping lives.** Tier → model is account-specific, so it belongs in your profile, not in this skill:
+**Where the mapping lives.** Tier → model is account-specific, so it belongs in your profile, not in this skill. Each tier carries both a primary and a fallback alias (ADR-6); a legacy bare-string tier value still loads and is normalized to this shape at read time:
 
 ```yaml
 # ~/.superhuman/profile.yaml
 models:
-  most_capable: opus      # or your harness's alias for "current best"
-  standard:     sonnet
-  cheap:        haiku
+  most_capable: { primary: <your-most-capable-alias>, fallback: <your-fallback-alias> }
+  standard:     { primary: <your-standard-alias>,     fallback: <your-fallback-alias> }
+  cheap:        { primary: <your-cheap-alias>,         fallback: <your-fallback-alias> }
 ```
 
-`adaptation/dispatch.md` supplies a per-harness default when the profile declares none.
+On first run, `phases/0-kickoff.md` Step 3 elicits these per-tier primary/fallback aliases and
+writes this block for you via `scripts/superhuman_profile.py`; declining leaves a neutral
+`PROMPT_ME` placeholder rather than assuming a provider. `adaptation/dispatch.md` supplies a
+per-harness default when the profile declares none.
 
 **Acceptable** for the PM thread: any alias resolving to a current top-tier model of any provider.
 
@@ -145,6 +148,41 @@ At every invocation, read `<project-root>/docs/superhuman/<slug>/SUPERHUMAN.md` 
 Multi-project sessions: identify the active project from the user's message context (project name, slug, or directory mentioned). When ambiguous, ask: "Which project — \<list known slugs\> — or a new one?"
 
 Project state lives entirely in `SUPERHUMAN.md` — the orchestrator is stateless between sessions. Every dispatch reads SUPERHUMAN.md to reconstruct context; never rely on in-memory state.
+
+## Resume packet and locked decisions
+
+**Read-packet-first.** On every resume (see HARD-GATE step 1 above), the PM reads `## Resume
+packet` FIRST, before reconstructing from `## Decisions log` / `## Chunk log` / `## Drift notes` —
+it is the single always-current entry point, not one append-only source among several.
+
+**Absence is version-gated, not always legitimate.** When `## Resume packet` and/or
+`## Decisions locked` are missing, what that means depends on the SUPERHUMAN.md's declared
+`Superhuman-version:` (§Version below) — the section was only ever guaranteed to exist starting
+at v1.1.0 (the release that introduced it; see `CHANGELOG.md`):
+
+- **`Superhuman-version` < 1.1.0, or no version declared at all** — the file predates these
+  sections; their absence is legitimate legacy. The PM falls back to reconstructing from
+  `## Decisions log` / `## Chunk log` / `## Drift notes` directly. Absence here is treated as empty,
+  never as corruption, and resume proceeds without error.
+- **`Superhuman-version` >= 1.1.0** — the file was written after these sections shipped, so a
+  missing one is unexpected: it may indicate truncation, corruption, or a silently dropped locked
+  decision, and losing a `## Decisions locked` entry silently would itself be a fidelity failure.
+  Do NOT treat the absence as empty. Surface it via G6 as stale state (same three options as the
+  HARD-GATE step 1 INVALID path: archive-and-restart, treat-as-legacy-import, abandon) before
+  proceeding — never guess and never silently fall back to the logs.
+
+**Refresh-at-each-gate, kept-current.** The `## Resume packet` is kept-current, not append-only:
+the PM refreshes it at every gate (not only at the ones that touch its fields) so a fresh session
+can always resume from one read. This is unlike `## Decisions log`, `## Chunk log`, and the other
+append-only sections, which only ever grow.
+
+**Locked decisions are not relitigated.** A decision recorded in `## Decisions locked` is settled;
+resuming the project does NOT reopen or relitigate it — the PM proceeds as if it were still true
+without re-asking. Changing a locked decision is never a silent edit: it requires an explicit
+surfaced action — either a gate (e.g., G6) or a drift entry — so the change is visible in the audit
+trail the same way any other decision is. `## Decisions locked` is distinct from the append-only
+`## Decisions log`: the log records what happened over time; the locked block records what may not
+be silently changed.
 
 ## Phase progression
 

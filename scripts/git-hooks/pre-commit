@@ -17,6 +17,14 @@
 
 set -euo pipefail
 
+# Git exports GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE / GIT_PREFIX /
+# GIT_OBJECT_DIRECTORY into a hook's environment, all pointing at the repo being
+# committed. Tests that shell out to git in a throwaway tmp repo would otherwise
+# inherit these and operate on THIS repo instead (e.g. `git remote add origin`
+# failing with "remote origin already exists"). Clear them so the suite runs
+# against its own fixtures, exactly as it does outside the hook.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY
+
 # Nothing to check if there is no test suite.
 if [ ! -d tests ]; then
     exit 0
