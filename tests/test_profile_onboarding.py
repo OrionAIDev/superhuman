@@ -568,6 +568,120 @@ def test_write_models_block_rejects_non_mapping_top_level(tmp_path: Path) -> Non
         sp.write_models_block(dest, decline=True)
 
 
+# --------------------------------------------------------------------------- #
+# models: generator — preflight-review follow-up fixes
+# --------------------------------------------------------------------------- #
+
+
+def test_write_models_block_leaves_original_untouched_on_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKER 1 (preflight): a bad splice must never overwrite a valid file.
+
+    The prior implementation wrote the patched text to `profile_path` and
+    validated afterwards — so an invalid splice result had already clobbered
+    a previously-valid profile.yaml by the time the error was raised, with no
+    way back. The writer must validate a temp file FIRST and only atomically
+    swap it in on success, leaving the original byte-untouched on failure.
+    """
+    dest = tmp_path / "profile.yaml"
+    original = "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+    dest.write_text(original, encoding="utf-8")
+
+    # Force the splice to produce YAML that cannot possibly parse.
+    monkeypatch.setattr(sp, "_splice_models_block", lambda text, rendered: "models: [unterminated\n")
+
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original, "original file must be byte-untouched on failure"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "profile.yaml"]
+    assert not leftovers, f"no temp file should be left behind: {leftovers}"
+
+
+def test_write_models_block_preserves_column0_comment_after_models_block(tmp_path: Path) -> None:
+    """BLOCKER 2 (preflight): a column-0 comment after `models:` belongs to what follows it.
+
+    `_find_models_span` used to treat a column-0 comment line as still part of
+    the `models:` mapping, so it got silently absorbed into the replaced span
+    and deleted — exactly the comment loss the targeted-patch rewrite was
+    supposed to prevent. The comment must survive, because it documents the
+    NEXT key (`ladder:`), not `models:`.
+    """
+    original = (
+        "version: 1\n"
+        "models:\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n"
+        "\n"  # a blank line still belongs to the models: span, not the comment after it
+        "# Ladder rules: narrower rungs first, deny before allow.\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+    )
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert "# Ladder rules: narrower rungs first, deny before allow.\n" in new_text
+    assert new_text.endswith(
+        "# Ladder rules: narrower rungs first, deny before allow.\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+    ), "everything from the comment onward must survive verbatim, in order"
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+    assert [r.name for r in profile.ladder] == ["a"]
+
+
+def test_write_models_block_rejects_non_mapping_models_value(tmp_path: Path) -> None:
+    """SHOULD-FIX 3 (preflight): a scalar `models:` value fails loud with ProfileError.
+
+    `dict(existing.get("models") or {})` raises an uncaught `ValueError` on a
+    non-mapping `models:` value (e.g. a bare scalar) instead of the
+    `ProfileError` the docstring promises every other malformed-input path.
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\nmodels: opus\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_write_models_block_preserves_original_line_endings(tmp_path: Path, eol: bytes) -> None:
+    """SHOULD-FIX 4 (preflight): untouched lines keep their exact original EOL bytes.
+
+    `Path.read_text`/`write_text` do universal-newline translation on read and
+    OS-default translation on write, so an untouched region's line endings
+    could silently flip (e.g. a CRLF-authored file collapsing to LF, or — on
+    this Windows dev box — an LF-authored file being rewritten to CRLF) even
+    though no content changed. That breaks the "byte-identical untouched
+    region" contract the targeted-patch rewrite exists to guarantee.
+    """
+    lines = [
+        b"version: 1", b'citation: "Release policy"', b"",
+        b"ladder:", b"  - name: a", b"    detect: {default: true}",
+    ]
+    original_bytes = eol.join(lines) + eol
+    dest = tmp_path / "profile.yaml"
+    dest.write_bytes(original_bytes)
+
+    sp.write_models_block(dest, decline=True)
+
+    new_bytes = dest.read_bytes()
+    assert new_bytes.startswith(original_bytes), (
+        f"untouched region must keep its original {eol!r} line endings byte-for-byte"
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
 def test_decline_specific_tiers_only(tmp_path: Path) -> None:
     """A per-tier decline list leaves answered tiers alone."""
     dest = tmp_path / "profile.yaml"

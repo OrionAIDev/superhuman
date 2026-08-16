@@ -1669,11 +1669,17 @@ def _find_models_span(lines: list[str]) -> tuple[int, int] | None:
 
     YAML top-level keys sit at column 0 (the authoring convention every
     profile in this repo follows). The span starts at the ``models:`` line
-    and extends through every following line that is blank, a column-0
-    comment, or indented (a child of the mapping) — ending at the next
-    column-0, non-blank, non-comment line (the next top-level key), or end of
-    file. This lets the caller replace only that span and leave every other
-    byte of the file — comments included — untouched.
+    and extends through every following line that is blank or indented (a
+    child of the mapping) — ending at the next column-0, non-blank line, or
+    end of file. This lets the caller replace only that span and leave every
+    other byte of the file — comments included — untouched.
+
+    A column-0 comment terminates the span exactly like a column-0 key does
+    (preflight BLOCKER 2): a comment sitting between ``models:`` and the next
+    top-level key documents *that* key, not ``models:``, so treating it as
+    part of the mapping being replaced would silently delete it on every
+    write. Only an *indented* comment — one that is visually a child of the
+    ``models:`` mapping — is still absorbed into the span.
 
     Args:
         lines: File content split with ``str.splitlines(keepends=True)``.
@@ -1693,10 +1699,11 @@ def _find_models_span(lines: list[str]) -> tuple[int, int] | None:
     end = len(lines)
     for i in range(start + 1, len(lines)):
         line = lines[i]
-        first = line[:1]
-        if line.strip() == "" or first in (" ", "\t") or first == "#":
-            continue  # blank, indented (mapping child), or a column-0 comment
-        end = i
+        if line.strip() == "":
+            continue  # blank line — still inside/around the block
+        if line[:1] in (" ", "\t"):
+            continue  # indented — a child of the models: mapping
+        end = i  # column-0, non-blank: the next key, or a comment for it
         break
     return start, end
 
@@ -1734,6 +1741,45 @@ def _splice_models_block(text: str, rendered_block: str) -> str:
     return "".join(lines[:start]) + rendered_block + "".join(lines[end:])
 
 
+def _read_profile_text(path: Path) -> str:
+    """Read a profile file's text, preserving its original line-ending bytes.
+
+    Per the ``open()`` builtin's newline-translation contract (Python
+    stdlib): https://docs.python.org/3/library/functions.html#open —
+    ``newline=""`` disables universal-newline translation on read, so
+    ``\\r\\n``/``\\r``/``\\n`` line endings come through exactly as written
+    rather than all being collapsed to ``\\n``. Pairs with
+    :func:`_write_profile_text` so an untouched region of the file round-trips
+    byte-for-byte (preflight SHOULD-FIX 4).
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The file's text, with original line-ending bytes intact.
+    """
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _write_profile_text(path: Path, text: str) -> None:
+    """Write text to a profile file without line-ending translation.
+
+    See :func:`_read_profile_text`: ``newline=""`` also disables write-side
+    translation, so a ``\\n`` already embedded in ``text`` — e.g. inside an
+    untouched CRLF region carried through unmodified from the original file
+    — is written as-is rather than being expanded to ``os.linesep`` (which
+    would silently flip an LF-authored file to CRLF on Windows, or vice
+    versa on a CRLF-authored file elsewhere).
+
+    Args:
+        path: Destination file.
+        text: Text to write, verbatim.
+    """
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+
+
 def write_models_block(
     profile_path: Path,
     answers: dict[str, dict[str, str | None]] | None = None,
@@ -1758,12 +1804,20 @@ def write_models_block(
 
     This is a **targeted patch**, not a full-document re-dump (#139 G6): only
     the ``models:`` key's own text span is replaced (or appended if absent).
-    Comments, formatting, and every other top-level key — ``ladder:``,
-    ``citation:``, an operator's own annotations — pass through
+    Comments, formatting, line endings, and every other top-level key —
+    ``ladder:``, ``citation:``, an operator's own annotations — pass through
     byte-identical. A prior implementation round-tripped the whole file
     through ``yaml.safe_load``/``yaml.safe_dump``, which silently discarded
     every comment in the file, including the ~40 lines of load-bearing
     authoring-rule commentary the shipped presets carry.
+
+    The write itself is validate-then-swap, never write-then-validate
+    (preflight BLOCKER 1): the patched text is written to a temp sibling
+    file, that temp file is loaded through :func:`load_profile` to confirm it
+    is valid, and only then is it atomically renamed over ``profile_path``.
+    If validation fails, the temp file is discarded and the original —  if
+    one existed — is left completely untouched; a previously-valid
+    ``profile.yaml`` is never at risk of being overwritten by a broken write.
 
     Args:
         profile_path: Destination ``profile.yaml``.
@@ -1781,8 +1835,11 @@ def write_models_block(
 
     Raises:
         ProfileError: If ``answers``/``decline`` name a tier outside
-            :data:`MODEL_TIERS`, if ``profile_path`` exists but is not valid
-            YAML, or if the patched result fails to load back.
+            :data:`MODEL_TIERS`; if ``profile_path`` exists but is not valid
+            YAML, its top level is not a mapping, or its existing ``models:``
+            value is not itself a mapping; or if the patched result fails to
+            load back. In every failure case the original file (if any) is
+            left byte-untouched — see "The write itself" above.
     """
     answers = answers or {}
     declined = set(MODEL_TIERS) if decline is True else (set() if decline is False else set(decline))
@@ -1792,7 +1849,7 @@ def write_models_block(
         raise ProfileError(f"models: unknown tier(s) {sorted(unknown)}")
 
     if profile_path.is_file():
-        text = profile_path.read_text(encoding="utf-8")
+        text = _read_profile_text(profile_path)
         try:
             existing: Any = yaml.safe_load(text) or {}
         except yaml.YAMLError as exc:
@@ -1803,7 +1860,11 @@ def write_models_block(
         text = ""
         existing = {}
 
-    models_block: dict[str, Any] = dict(existing.get("models") or {})
+    raw_models = existing.get("models")
+    if raw_models is not None and not isinstance(raw_models, dict):
+        raise ProfileError(f"{profile_path}: 'models:' must be a mapping")
+
+    models_block: dict[str, Any] = dict(raw_models or {})
     for tier in MODEL_TIERS:
         if tier in declined:
             models_block[tier] = {"primary": MODEL_PLACEHOLDER, "fallback": MODEL_PLACEHOLDER}
@@ -1829,9 +1890,20 @@ def write_models_block(
         new_text = f"version: {SCHEMA_VERSION}\n\n" + new_text
 
     profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text(new_text, encoding="utf-8")
 
-    load_profile(profile_path)  # validate what was just written before handing it back
+    # Validate-then-swap (preflight BLOCKER 1): write to a temp sibling in the
+    # same directory, validate THAT file, and only on success replace the
+    # real target — atomically, since os.replace() is a same-filesystem
+    # rename. A validation failure discards the temp file and never touches
+    # profile_path, so a previously-valid file can never be left broken.
+    tmp = profile_path.with_name(profile_path.name + ".tmp")
+    try:
+        _write_profile_text(tmp, new_text)
+        load_profile(tmp)
+    except ProfileError:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, profile_path)
     return profile_path
 
 
