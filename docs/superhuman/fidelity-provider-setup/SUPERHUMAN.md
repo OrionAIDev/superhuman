@@ -59,6 +59,8 @@
 [2026-08-15] G4: TEST.md approved (18 TC / all FR-NFR traced; git-as-backup; inference-eval ruled out; TC-17 vendor-grep gate); user decision: approve & proceed to implementation.
 [2026-08-15] G5 (on-divergence, Type B): chunks 1-4/8 landed — C-RS (361331e), C-TPL (9542ee9), C-ROLES (08b3e5f), C-ORCH (79ad783); each ✓ spec ✓ quality ✓ full-suite-green ✓ pushed; no drift. Chunk 4 (SKILL.md orchestrator semantics) PM-adversarially reviewed: HARD-GATE validity rule byte-for-byte intact, backward-compat handled in the resume path. Autonomous progression — no pause.
 [2026-08-15] Session-limit interruption during first Chunk-3 dispatch (no changes made, clean working tree); re-dispatched cleanly. Recovery is why this project's own SUPERHUMAN.md now carries a Resume packet (dogfood + cold-restart resilience).
+[2026-08-15] G5 (Chunk 5/8): C-PROF landed (c42d7ec) — write_models_block + {primary,fallback} normalization + PROMPT_ME placeholder; 100% branch on new fns; 258 tests pass; pushed.
+[2026-08-15] G6 (moderate drift): write_models_block strips comments from an existing profile.yaml via full YAML round-trip; PM recommended Option A (targeted patch, safe primitive, no new dep); user decision: Option A. Fix dispatched as a follow-up to Chunk 5.
 [2026-08-15] Foundation decision: role schema references (C3/C-ROLES) — rework if standalone would be significant because every role would reference a schema doc that does not yet exist. Decision: C1 (C-RS schema doc) precedes.
 [2026-08-15] Foundation decision: read-packet-first semantics (C4/C-ORCH) — rework if standalone would be significant because the semantics describe template sections that must exist to be read. Decision: C2 (C-TPL template sections) precedes.
 [2026-08-15] Foundation decision: #139 elicitation wiring (C6/C-KICK) — rework if standalone would be significant because the phase recipe invokes the deterministic generator; eliciting into LLM-written YAML would violate dev-principle #5. Decision: C5 (C-PROF generator) precedes.
@@ -72,13 +74,16 @@
 | 2 | Resume packet + Decisions-locked template sections (C-TPL) | templates/SUPERHUMAN.md.tpl, tests/test_content.py | sonnet | done (9542ee9) | 2026-08-15 | 2026-08-15 |
 | 3 | Thread canonical schema through all roles (C-ROLES) | roles/*.md (7), tests/test_content.py | sonnet | done (08b3e5f) | 2026-08-15 | 2026-08-15 |
 | 4 | Orchestration semantics + backward-compat (C-ORCH) | SKILL.md, roles/pm.md, tests/test_content.py, tests/fixtures/superhuman_legacy_no_resume_packet.md | sonnet | done (79ad783) | 2026-08-15 | 2026-08-15 |
-| 5 | Profile models: generator + schema normalization (C-PROF) | scripts/superhuman_profile.py | _tbd_ | pending | | |
+| 5 | Profile models: generator + schema normalization (C-PROF) | scripts/superhuman_profile.py, tests/test_profile_onboarding.py, tests/fixtures/profile_with_comments_and_models.yaml | sonnet | done (c42d7ec; G6 fix 7b41d8d) | 2026-08-15 | 2026-08-15 |
 | 6 | Phase-0 #139 elicitation sub-flow (C-KICK) | phases/0-kickoff.md, roles/pm.md | _tbd_ | pending | | |
 | 7 | Dispatch-time placeholder warning (C-DISP) | adaptation/dispatch.md, roles/pm.md | _tbd_ | pending | | |
 | 8 | Hygiene: VERSION + CHANGELOG + README (C-HYG) | VERSION, CHANGELOG.md, README.md | _tbd_ | pending | | |
 
 ## Drift notes
 <!-- Append-only. Format: [<ISO timestamp>] Chunk <n>: <severity> — <one-line trigger>; action: <taken> -->
+
+## Drift notes
+[2026-08-15] Chunk 5: MODERATE — `write_models_block` (c42d7ec) full-round-trips profile.yaml via yaml.safe_dump, silently stripping ALL comments from an existing operator profile (incl. the ladder's load-bearing preset comments). Real regression risk for #139 setup on a pre-existing commented profile; against superhuman's fidelity ethos. Surfaced as G6 — decision pending (targeted-patch vs ruamel vs caller-guard). Chunk 6 (C-KICK) blocked on this decision. RESOLVED (7b41d8d): rewrote write_models_block as a targeted line-span splice; comments/ladder preserved byte-identical; 11 new tests incl. preservation against the real classic-3tier preset; 100% branch on write path. Chunk 6 unblocked.
 
 ## Archive log
 <!-- Append-only. Format: [<ISO timestamp>] archived <chunk> to archive/<dir>/; reason: <reason> -->
@@ -90,3 +95,4 @@
 <!-- Append-only. Format: [<ISO timestamp>] G<n>: <observation about user pattern>; bias adjustment: <going-forward note> -->
 [2026-08-15] G0/G1/G2: user approved PM recommendation as-is three times running (incl. the one flagged scope choice, taking the recommended option); bias adjustment: user trusts crisp recommend-first framing — keep gates tight, lead with a clear recommendation, avoid padding options the user is unlikely to want. Do not infer they want fewer gates (HITL-H is locked) — only fewer/tighter questions per gate.
 [2026-08-15] G3: user approved the full design package + both flagged extras (DECISIONS.md, light README) as recommended (4th consecutive as-is approval); bias adjustment: pattern holds — continue leading with the recommended option and surfacing only genuine sub-choices. Watch for over-asking; the user has not overridden once.
+[2026-08-15] G4/G6: user again took the PM recommendation (approve TEST.md; G6 Option A). 6 gates, 0 overrides. Bias adjustment holds — but the G6 surface was CORRECT to raise despite the streak: it was a real data-integrity fork, not a rubber-stamp candidate. Lesson: the no-override streak is not a signal to stop surfacing genuine moderate+ drift; it's a signal the recommendations are well-calibrated. Keep surfacing real forks; keep trimming trivial ones.
