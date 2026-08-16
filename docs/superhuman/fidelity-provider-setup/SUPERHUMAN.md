@@ -35,8 +35,8 @@
 - **immutable constraints:** LD-1 provider/harness-agnostic (no vendor defaults in shipped files); OrionTest deployment ceiling (no UAT/R8); role-not-AI attribution in commits/PR/docs. See `## Decisions locked`.
 - **decisions-locked:** see `## Decisions locked` below (LD-1..LD-5).
 - **ruled-out paths:** rip-and-replace of role verdict schemas (FR-4 requires *specialize*, not replace); a machine parser for the return schema (OQ-1 chose advisory-at-PM-boundary); LLM-written profile YAML (dev-principle #5 → deterministic code writer); baking a vendor default into #139 (LD-1).
-- **current state:** Phase 3 implementation — chunks 1-4 of 8 DONE (C-RS return-schema doc, C-TPL template sections, C-ROLES role reconciliation, C-ORCH orchestration semantics). See `## Chunk log` (latest rows) and the G4 + G5 entries in `## Decisions log`. Branch `feat/superhuman-fidelity-provider-setup`, HEAD `79ad783`, pushed. Fast-test gate green.
-- **next-3-actions:** (1) Chunk 5 — C-PROF: `models:` generator + `{primary,fallback}` normalization in `scripts/superhuman_profile.py` (the one real code chunk); (2) Chunk 6 — C-KICK: #139 elicitation sub-flow in `phases/0-kickoff.md`; (3) Chunks 7-8 (C-DISP dispatch warning, C-HYG VERSION/CHANGELOG/README) → Phase 3.2 docs-sync → 3.3 preflight → G7 → G8.
+- **current state:** Phase 3 implementation COMPLETE — all 8 chunks DONE (C-RS, C-TPL, C-ROLES, C-ORCH, C-PROF+G6-fix, C-KICK, C-DISP, C-HYG). VERSION bumped to 1.1.0. One G6 (comment-preserving writer) and one DONE_WITH_CONCERNS (orphaned test) both resolved. See `## Chunk log` + G5/G6 entries in `## Decisions log`. Branch `feat/superhuman-fidelity-provider-setup`, HEAD `bca25bb`, pushed. Fast-test gate green (267 pass, 1 skip).
+- **next-3-actions:** (1) Phase 3.2 docs-sync — verify every declared artifact exists + reflects implemented state → G7; (2) Phase 3.3 preflight adversarial review (GO/NO-GO); (3) Phase 4 acceptance → G8, then PR into main (ceiling OrionTest).
 - **evidence-pointers:** `docs/superhuman/fidelity-provider-setup/{DESIGN,PLAN,TEST,DECISIONS}.md`; this file's `## Decisions log` + `## Chunk log`; `conventions/subagent-return-schema.md`.
 
 ## Decisions locked — do not relitigate
@@ -61,6 +61,8 @@
 [2026-08-15] Session-limit interruption during first Chunk-3 dispatch (no changes made, clean working tree); re-dispatched cleanly. Recovery is why this project's own SUPERHUMAN.md now carries a Resume packet (dogfood + cold-restart resilience).
 [2026-08-15] G5 (Chunk 5/8): C-PROF landed (c42d7ec) — write_models_block + {primary,fallback} normalization + PROMPT_ME placeholder; 100% branch on new fns; 258 tests pass; pushed.
 [2026-08-15] G6 (moderate drift): write_models_block strips comments from an existing profile.yaml via full YAML round-trip; PM recommended Option A (targeted patch, safe primitive, no new dep); user decision: Option A. Fix dispatched as a follow-up to Chunk 5.
+[2026-08-15] G5 (Chunks 6-8/8): C-KICK (6d8b325 — first-run provider-neutral tier elicitation wired to write_models_block), C-DISP (64b3fa5 — one-line non-blocking placeholder warning), C-HYG (a09cb3d — VERSION 1.1.0, CHANGELOG [1.1.0], vendor-free doc snippets, TC-17/TC-18). All ✓ spec ✓ full-suite-green ✓ pushed; no drift. Phase 3 implementation COMPLETE.
+[2026-08-15] DONE_WITH_CONCERNS (Chunk 8): PM found chunk 7 (64b3fa5) had accidentally deleted the def line of test_license_and_notice_present, silently absorbing its LICENSE/NOTICE assertions into test_dispatch_documents_placeholder_warning. PM restored it as an independent test (bca25bb). Audit-integrity fix — the exact silent-corruption class this project exists to prevent.
 [2026-08-15] Foundation decision: role schema references (C3/C-ROLES) — rework if standalone would be significant because every role would reference a schema doc that does not yet exist. Decision: C1 (C-RS schema doc) precedes.
 [2026-08-15] Foundation decision: read-packet-first semantics (C4/C-ORCH) — rework if standalone would be significant because the semantics describe template sections that must exist to be read. Decision: C2 (C-TPL template sections) precedes.
 [2026-08-15] Foundation decision: #139 elicitation wiring (C6/C-KICK) — rework if standalone would be significant because the phase recipe invokes the deterministic generator; eliciting into LLM-written YAML would violate dev-principle #5. Decision: C5 (C-PROF generator) precedes.
@@ -75,9 +77,9 @@
 | 3 | Thread canonical schema through all roles (C-ROLES) | roles/*.md (7), tests/test_content.py | sonnet | done (08b3e5f) | 2026-08-15 | 2026-08-15 |
 | 4 | Orchestration semantics + backward-compat (C-ORCH) | SKILL.md, roles/pm.md, tests/test_content.py, tests/fixtures/superhuman_legacy_no_resume_packet.md | sonnet | done (79ad783) | 2026-08-15 | 2026-08-15 |
 | 5 | Profile models: generator + schema normalization (C-PROF) | scripts/superhuman_profile.py, tests/test_profile_onboarding.py, tests/fixtures/profile_with_comments_and_models.yaml | sonnet | done (c42d7ec; G6 fix 7b41d8d) | 2026-08-15 | 2026-08-15 |
-| 6 | Phase-0 #139 elicitation sub-flow (C-KICK) | phases/0-kickoff.md, roles/pm.md | _tbd_ | pending | | |
-| 7 | Dispatch-time placeholder warning (C-DISP) | adaptation/dispatch.md, roles/pm.md | _tbd_ | pending | | |
-| 8 | Hygiene: VERSION + CHANGELOG + README (C-HYG) | VERSION, CHANGELOG.md, README.md | _tbd_ | pending | | |
+| 6 | Phase-0 #139 elicitation sub-flow (C-KICK) | phases/0-kickoff.md, roles/pm.md, tests/test_content.py | sonnet | done (6d8b325) | 2026-08-15 | 2026-08-15 |
+| 7 | Dispatch-time placeholder warning (C-DISP) | adaptation/dispatch.md, roles/pm.md, tests/test_content.py | sonnet | done (64b3fa5) | 2026-08-15 | 2026-08-15 |
+| 8 | Hygiene: VERSION + CHANGELOG + README + SKILL snippet (C-HYG) | VERSION (1.1.0), CHANGELOG.md, README.md, SKILL.md, tests/test_content.py | sonnet | done (a09cb3d); DONE_WITH_CONCERNS resolved by test-fix (bca25bb) | 2026-08-15 | 2026-08-15 |
 
 ## Drift notes
 <!-- Append-only. Format: [<ISO timestamp>] Chunk <n>: <severity> — <one-line trigger>; action: <taken> -->
