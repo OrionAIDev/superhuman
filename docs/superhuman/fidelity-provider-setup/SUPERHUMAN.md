@@ -63,6 +63,8 @@
 [2026-08-15] G6 (moderate drift): write_models_block strips comments from an existing profile.yaml via full YAML round-trip; PM recommended Option A (targeted patch, safe primitive, no new dep); user decision: Option A. Fix dispatched as a follow-up to Chunk 5.
 [2026-08-15] G5 (Chunks 6-8/8): C-KICK (6d8b325 — first-run provider-neutral tier elicitation wired to write_models_block), C-DISP (64b3fa5 — one-line non-blocking placeholder warning), C-HYG (a09cb3d — VERSION 1.1.0, CHANGELOG [1.1.0], vendor-free doc snippets, TC-17/TC-18). All ✓ spec ✓ full-suite-green ✓ pushed; no drift. Phase 3 implementation COMPLETE.
 [2026-08-15] DONE_WITH_CONCERNS (Chunk 8): PM found chunk 7 (64b3fa5) had accidentally deleted the def line of test_license_and_notice_present, silently absorbing its LICENSE/NOTICE assertions into test_dispatch_documents_placeholder_warning. PM restored it as an independent test (bca25bb). Audit-integrity fix — the exact silent-corruption class this project exists to prevent.
+[2026-08-15] Phase 3.2 docs-sync: all 8 declared artifacts present + current; DECISIONS.md gained ADR-7 (G6 writer); PLAN marked complete; README verified. Committed 6b29ccb.
+[2026-08-15] G7: final docs review approved (declared-artifacts ✓ all present and current); user decision: approve & proceed to preflight + acceptance.
 [2026-08-15] Foundation decision: role schema references (C3/C-ROLES) — rework if standalone would be significant because every role would reference a schema doc that does not yet exist. Decision: C1 (C-RS schema doc) precedes.
 [2026-08-15] Foundation decision: read-packet-first semantics (C4/C-ORCH) — rework if standalone would be significant because the semantics describe template sections that must exist to be read. Decision: C2 (C-TPL template sections) precedes.
 [2026-08-15] Foundation decision: #139 elicitation wiring (C6/C-KICK) — rework if standalone would be significant because the phase recipe invokes the deterministic generator; eliciting into LLM-written YAML would violate dev-principle #5. Decision: C5 (C-PROF generator) precedes.
@@ -86,6 +88,35 @@
 
 ## Drift notes
 [2026-08-15] Chunk 5: MODERATE — `write_models_block` (c42d7ec) full-round-trips profile.yaml via yaml.safe_dump, silently stripping ALL comments from an existing operator profile (incl. the ladder's load-bearing preset comments). Real regression risk for #139 setup on a pre-existing commented profile; against superhuman's fidelity ethos. Surfaced as G6 — decision pending (targeted-patch vs ruamel vs caller-guard). Chunk 6 (C-KICK) blocked on this decision. RESOLVED (7b41d8d): rewrote write_models_block as a targeted line-span splice; comments/ladder preserved byte-identical; 11 new tests incl. preservation against the real classic-3tier preset; 100% branch on write path. Chunk 6 unblocked.
+
+## Preflight decision (Phase 3.3) — 2026-08-15
+
+**Verdict: NO-GO** (resolved by fixes below; re-run pending). Three-lens adversarial fan-out over the delivered substrate (HEAD 6b29ccb).
+
+### Blockers (must fix before acceptance)
+- **[correctness] Critical — write-before-validate, non-atomic, no backup.** `write_models_block` (`scripts/superhuman_profile.py:1832`) writes the user's `profile.yaml` to disk, THEN `load_profile()` validates at :1834 — so a splice yielding invalid YAML corrupts a previously-valid config with no recovery (repro-confirmed). The exact fidelity-loss class this project exists to prevent. Fix: temp-render → validate → atomic `os.replace` (mirror `cmd_init`); optional `.bak`.
+- **[correctness] Major — silent column-0 comment deletion.** `_find_models_span` (`:1697`) absorbs a column-0 comment sitting between the `models:` block and the next key into the replaced span and deletes it, violating ADR-7's byte-identical contract (repro-confirmed; realistic — presets comment before each section). Fix: terminate the span at the first column-0 comment.
+- **[design-conformance] Major — surrogate-user.md contradicts the schema it references.** `roles/surrogate-user.md:97-99` states it does NOT emit the six-field report, dropping commands/risks/next-action — contradicts FR-4 ("no role silently omits it") and the schema doc's "do not drop fields." Not caught by presence-only tests. Fix: reconcile its strict verdict as the `conclusion` specialization emitting all six fields (design intent per FR-4).
+
+### Recommended fixes (should fix)
+- **[correctness] Minor** — uncaught `ValueError` on a non-mapping `models:` scalar (`:1806`); guard and raise `ProfileError` per the docstring.
+- **[correctness] FYI/Windows** — `read_text`/`write_text` normalize newlines, so "byte-identical" fails on CRLF/mixed files; read/write with `newline=""` for true preservation (relevant: we author on Windows).
+
+### Acknowledged risks (no action)
+- **[security] FYI** — a `PROMPT_ME` tier degrades to the harness default with a non-blocking warning (intended FR-10 fail-safe). `_MODELS_KEY_RE` mis-anchor needs a self-inflicted malformed local file (not reachable from elicitation).
+- Security lens overall: **GO** — no secrets, YAML-injection-resistant (empirically verified), hook `unset` doesn't weaken the gate, no new dependency.
+
+### Rollback plan
+- Trigger: a fix regresses the suite or the re-run lens still finds a Critical.
+- Procedure: `git revert` the offending fix commit(s) on `feat/superhuman-fidelity-provider-setup`; the branch is unmerged, so `main` is untouched. Per-chunk commits isolate each change.
+- Recovery objective: branch back to green (267 pass) at worst; `main` never affected (ceiling OrionTest, PR not yet opened).
+
+### Resolution: fix the 3 blockers + 2 recommended (code/prose fixes to already-approved design — NOT design drift, so no G6), then re-run the correctness + design-conformance lenses. GO only after the re-run is clean.
+
+**RESOLVED 2026-08-15:**
+- Blockers 1 (Critical atomicity), 2 (Major column-0 comment), + should-fixes (ValueError guard, Windows newline preservation): fixed in `f330a93` (write_models_block now temp-renders → validates → `os.replace`; span terminates on any column-0 line; newline-preserving IO; 5 new tests; 100% line/branch on the write path).
+- Blocker 3 (Major surrogate schema contradiction): resolved via ADR-8 — explicit recorded carve-out across `conventions/subagent-return-schema.md`, `roles/surrogate-user.md`, and `DECISIONS.md`; added regression test `test_surrogate_schema_exception_is_recorded` (closes the presence-only-test gap the lens exploited).
+- Re-run of the correctness + design-conformance lenses PENDING → then GO.
 
 ## Archive log
 <!-- Append-only. Format: [<ISO timestamp>] archived <chunk> to archive/<dir>/; reason: <reason> -->

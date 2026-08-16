@@ -26,6 +26,17 @@ still emits all six fields; it just puts its own verdict vocabulary in the first
 the other five fields to make room for a specialized verdict, and do not invent a parallel
 "role schema" alongside this one.
 
+### The one recorded exception: strict machine-parsed verdict roles
+
+Exactly one role is exempt, and only because its output is not a work-report a human reads: the
+**Surrogate-User** (`roles/surrogate-user.md`). Its return is a strict object the PM parses
+programmatically to drive autonomous progression (ACCEPT/ESCALATE), so it emits its verdict as its
+`conclusion` specialization, maps `reason`/`precedent` onto evidence/assumptions, and carries only
+the fields meaningful to a gate decision. This is an **explicit, recorded** carve-out (see
+`DECISIONS.md` ADR-8), never a silent omission — it is the sole role exempt from emitting all six
+prose fields, precisely because a gate verdict is machine-consumed, not human-read. No other role
+may claim this exemption.
+
 ## Provider- and role-neutral
 
 This schema names no harness, vendor, or model. Every role, on every supported harness, emits the

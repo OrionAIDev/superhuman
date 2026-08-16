@@ -175,3 +175,31 @@ required value. No Anthropic-first (or any-vendor-first) assumption in shipped f
   warranted for one block. C leave the writer and guard in the caller (only write when `models:` absent,
   warn before overwrite) — rejected: still strips the ladder's comments on any real update and pushes
   safety onto the caller rather than the primitive (weaker per dev-principle #5).
+
+## ADR-8: Surrogate-User is the one recorded exception to the six-field return schema
+
+- **Status:** accepted (Phase 3.3 preflight, 2026-08-15)
+- **Date:** 2026-08-15
+- **Context:** The Phase 3.3 preflight design-conformance lens found `roles/surrogate-user.md` pointed
+  to the canonical return schema (`conventions/subagent-return-schema.md`) but then stated it did NOT
+  emit the six-field report — a self-contradiction against FR-4 ("no role silently omits it") and the
+  schema doc's own "do not drop the other five fields." The surrogate is genuinely different from every
+  other role: its output is not a work-report a human reads but a strict object the PM parses
+  programmatically (ACCEPT/ESCALATE) to drive autonomous progression. Forcing prose fields
+  (commands/risks/next-action) onto a gate verdict would bloat the parseable contract autonomous mode
+  depends on, without adding signal.
+- **Decision:** Record the Surrogate-User as the SINGLE explicit exception to the schema. Its strict
+  verdict object is its specialization of `conclusion`; `reason`/`precedent` map to
+  evidence/assumptions; it carries only the fields meaningful to a gate decision. Because the exception
+  is now **explicit and recorded** in three places (the schema doc, this ADR, and the role file), FR-4's
+  "no role *silently* omits it" is satisfied — the omission is documented, not silent. No other role may
+  claim this exemption.
+- **Consequences:** (+) Resolves the FR-4 conformance contradiction without weakening the surrogate's
+  machine-parseable contract that autonomous mode depends on. (+) Makes the carve-out discoverable, so a
+  future reader does not misread it as unreconciled drift. (−) The canonical schema now has one named
+  exception rather than being strictly universal — acceptable, bounded to a single justified role.
+- **Alternatives considered:** B force the surrogate to emit all six prose fields with terse/empty
+  commands/risks/next-action — rejected: bloats the strict object the PM parses to drive flow, risks the
+  autonomous-mode parsing, and adds no signal for a gate decision. The delivered design (FR-4) intended
+  reconciliation, and an explicit recorded exception is the faithful reconciliation for a
+  machine-consumed verdict.

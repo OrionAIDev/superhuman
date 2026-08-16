@@ -794,6 +794,30 @@ def test_verdict_schemas_specialize_canonical_conclusion(skill_root: Path) -> No
     )
 
 
+def test_surrogate_schema_exception_is_recorded(skill_root: Path) -> None:
+    """Surrogate's exemption from the six-field schema is an explicit, recorded carve-out — not a
+    silent or self-contradictory omission (FR-4; Phase 3.3 preflight finding, DECISIONS ADR-8).
+
+    The presence-only reconciliation test above missed a self-contradiction where surrogate-user.md
+    pointed to the canonical schema but then flatly said it did not use it. This guard asserts the
+    omission is framed as the one recorded exception, and that the schema doc itself documents it.
+    """
+    schema = (skill_root / "conventions" / "subagent-return-schema.md").read_text(encoding="utf-8").lower()
+    surrogate = (skill_root / "roles" / "surrogate-user.md").read_text(encoding="utf-8").lower()
+
+    assert "exception" in schema and "surrogate" in schema, (
+        "subagent-return-schema.md must document the surrogate as the one recorded exception"
+    )
+    assert "adr-8" in schema, "the schema doc must point at where the exception is recorded (DECISIONS.md ADR-8)"
+
+    assert "adr-8" in surrogate or "recorded exception" in surrogate, (
+        "surrogate-user.md must reference the recorded exception (ADR-8), not silently drop the schema"
+    )
+    assert "not a silent omission" in surrogate or "documented carve-out" in surrogate, (
+        "surrogate-user.md must frame its exemption as explicit/documented, per FR-4 ('no role silently omits')"
+    )
+
+
 def test_pm_output_discipline_names_canonical_schema(skill_root: Path) -> None:
     """pm.md Output discipline names the canonical schema and keeps the prose-rejection rule (FR-5)."""
     text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
