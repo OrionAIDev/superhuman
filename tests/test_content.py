@@ -1097,6 +1097,8 @@ def test_dispatch_documents_placeholder_warning(skill_root: Path) -> None:
             f"{label} must state the warning does not pause or gate autonomous progression"
         )
 
+
+def test_license_and_notice_present(skill_root: Path) -> None:
     """A publishable repo must carry both a LICENSE and upstream attribution."""
     licence = skill_root / "LICENSE"
     notice = skill_root / "NOTICE.md"
