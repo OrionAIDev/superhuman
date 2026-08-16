@@ -100,21 +100,34 @@ consulted: [business-expert]
        code (dev-principle #5). Call the deterministic writer's CLI entry point — `models set`,
        which wraps `write_models_block(profile_path, answers, decline=...)` — never author the YAML
        by hand and never call `write_models_block` directly as Python (it has no `<dispatch:bash>`
-       seam):
+       seam). Never interpolate an operator alias or an elicited answer directly into a shell word
+       (dev-principle #5) — a value containing a quote, `$`, or a backtick would break the quoting
+       or inject shell. Instead, write the answers JSON to a temp file through a QUOTED heredoc (a
+       quoted delimiter disables all shell expansion inside it) and pass that file's path to
+       `--answers-json-file`, with the profile path itself quoted too:
        ```
-       python scripts/superhuman_profile.py models set --profile <profile-path> \
-         --answers-json '{"most_capable": {"primary": "...", "fallback": "..."}, ...}' \
+       tmp="$(mktemp)"
+       cat > "$tmp" <<'JSON'
+       {"most_capable": {"primary": "...", "fallback": "..."}, ...}
+       JSON
+       PY="$(command -v python || command -v python3 || true)"  # Windows may only have `python`
+       "$PY" scripts/superhuman_profile.py models set --profile "<profile-path>" \
+         --answers-json-file "$tmp" \
          --decline "<comma-separated declined/deferred tier names>"
        ```
-       (`<dispatch:bash>`). `--answers-json` carries the answered tiers as a JSON object (`{tier:
-       {"primary": ..., "fallback": ...}}`); `--decline` carries the declined/deferred tier names
-       (omit it, or pass all three tier names, to defer everything). A declined or deferred tier —
-       and any tier the operator never reaches — is written by the command as the neutral
-       `PROMPT_ME` placeholder, never a vendor assumption: this **fails safe** and the operator is
-       prompted again on a later first run once the profile still shows placeholders. A malformed
-       `--answers-json` or an unrecognized tier name exits non-zero with a `ProfileError` message,
-       never a silent no-op or a traceback — treat a non-zero exit here as a kickoff blocker, same
-       as any other failed `<dispatch:bash>` step.
+       (`<dispatch:bash>`). No operator string is ever interpolated into a shell word — the answers
+       travel through the quoted-heredoc file, and the CLI reads them from there via
+       `--answers-json-file` (path may be `-` to read from stdin instead). `--answers-json-file`
+       carries the answered tiers as a JSON object (`{tier: {"primary": ..., "fallback": ...}}`);
+       `--decline` carries the declined/deferred tier names (omit it, or pass all three tier names,
+       to defer everything — if every tier is declined and none are answered, the heredoc/temp file
+       may be skipped and `--decline` alone is enough). A declined or deferred tier — and any tier
+       the operator never reaches — is written by the command as the neutral `PROMPT_ME`
+       placeholder, never a vendor assumption: this **fails safe** and the operator is prompted
+       again on a later first run once the profile still shows placeholders. A malformed answers
+       JSON or an unrecognized tier name exits non-zero with a `ProfileError` message, never a
+       silent no-op or a traceback — treat a non-zero exit here as a kickoff blocker, same as any
+       other failed `<dispatch:bash>` step.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On

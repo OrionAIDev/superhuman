@@ -1373,3 +1373,84 @@ def test_changelog_entry_names_165_and_139(skill_root: Path) -> None:
             f"CHANGELOG #165/#139 entry must carry no AI/model/provider attribution "
             f"(NFR-6) — found {forbidden!r}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# review round 3 (#139/#165 post-review hardening)
+# --------------------------------------------------------------------------- #
+
+
+def test_hard_gate_resume_bullet_is_version_gated(skill_root: Path) -> None:
+    """FIX A: the HARD-GATE step-1 VALID→resume bullet must not treat absence of
+    '## Resume packet'/'## Decisions locked' as unconditionally empty.
+
+    Before this fix, SKILL.md's HARD-GATE bullet said absence of these sections
+    is "never as corruption" with no qualification, which contradicts the later
+    '## Resume packet and locked decisions' section (and roles/pm.md), which
+    correctly version-gates that rule on `Superhuman-version:` — below 1.1.0 (or
+    undeclared) is legitimate legacy-empty, but 1.1.0+ treats a missing section
+    as stale state surfaced via G6. A PM following the HARD-GATE bullet literally
+    would silently swallow a corrupted >=1.1.0 file's missing sections — the
+    exact fidelity hole the version-gate exists to close. The HARD-GATE bullet
+    itself must reference the version gate (1.1.0) near the resume-absence
+    wording, not just the later section that most readers skim past.
+    """
+    text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+
+    hard_gate_match = re.search(r"<HARD-GATE>.*?</HARD-GATE>", text, re.DOTALL)
+    assert hard_gate_match, "SKILL.md missing the HARD-GATE block"
+    hard_gate_text = hard_gate_match.group(0)
+
+    bullet_match = re.search(
+        r"VALID → resume\..*?(?=\n\s*- INVALID)", hard_gate_text, re.DOTALL
+    )
+    assert bullet_match, "HARD-GATE missing the 'VALID → resume' bullet"
+    bullet_text = bullet_match.group(0)
+
+    assert "Resume packet" in bullet_text and "absent" in bullet_text, (
+        "HARD-GATE VALID→resume bullet must still address absence of "
+        "'## Resume packet'/'## Decisions locked'"
+    )
+    assert "1.1.0" in bullet_text, (
+        "HARD-GATE VALID→resume bullet must version-gate the resume-absence "
+        "handling on 'Superhuman-version: 1.1.0' (not treat absence as "
+        "unconditionally empty) — see the fuller "
+        "'## Resume packet and locked decisions' section"
+    )
+    assert "G6" in bullet_text, (
+        "HARD-GATE VALID→resume bullet must say a missing section at >=1.1.0 "
+        "is surfaced via G6, not silently treated as empty"
+    )
+    # The VALIDITY condition itself (unchanged by this fix) must still be intact
+    # elsewhere in the HARD-GATE block.
+    assert "## Decisions log" in hard_gate_text and "user decision:" in hard_gate_text
+
+
+def test_kickoff_models_set_invocation_is_injection_proof(skill_root: Path) -> None:
+    """FIX B: phases/0-kickoff.md Step 3 must not interpolate elicited/operator
+    JSON directly into a single-quoted shell word.
+
+    Before this fix, the recipe built `--answers-json '{...}'` with the JSON
+    payload written straight into a quoted shell argument — an operator alias
+    or elicited answer containing a quote, `$`, or backtick would break the
+    quoting or inject shell (dev-principle #5: no LLM-marshalled data into a
+    shell word). The fix routes the JSON through a quoted heredoc to a temp
+    file and passes that file via `--answers-json-file`, and quotes the
+    profile path.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+
+    assert "--answers-json '" not in text, (
+        "kickoff recipe must not interpolate --answers-json with an inline "
+        "single-quoted JSON literal containing operator/elicited values"
+    )
+    assert "--answers-json-file" in text, (
+        "kickoff recipe must use --answers-json-file to avoid shell interpolation"
+    )
+    assert "<<'JSON'" in text or "<<'EOF'" in text, (
+        "kickoff recipe must write the answers JSON via a QUOTED heredoc "
+        "(quoted delimiter disables shell expansion inside it)"
+    )
+    assert '--profile "<profile-path>"' in text, (
+        "kickoff recipe must quote the profile path passed to `models set`"
+    )

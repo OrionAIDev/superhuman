@@ -1912,6 +1912,23 @@ def write_models_block(
     if raw_models is not None and not isinstance(raw_models, dict):
         raise ProfileError(f"{profile_path}: 'models:' must be a mapping")
 
+    # Post-review FIX C (round 3): `yaml.safe_load` accepts YAML-equivalent
+    # spellings of the key — e.g. a quoted `"models":` — that the targeted,
+    # column-0 `^models:` regex above does not match. In that case
+    # `raw_models` is non-None (safe_load found the mapping) but
+    # `model_key_count` is 0, so `_splice_models_block` cannot find a span to
+    # replace and instead APPENDS a second, canonical `models:` block —
+    # silently producing the exact two-top-level-keys shape the check above
+    # exists to reject. Fail loud instead: the loaded profile has a
+    # `models:` key in a form this targeted splice cannot safely edit.
+    if raw_models is not None and model_key_count != 1:
+        raise ProfileError(
+            f"{profile_path}: 'models:' key found by the YAML loader but not in the exact "
+            "'models:' column-0 spelling this writer can target (found "
+            f"{model_key_count} matching span(s)) — rewrite the key as a plain, unquoted "
+            "'models:' before writing"
+        )
+
     models_block: dict[str, Any] = dict(raw_models or {})
     for tier in MODEL_TIERS:
         if tier in declined:
@@ -1996,8 +2013,17 @@ def cmd_models_set(args: argparse.Namespace) -> int:
     Args:
         args: Parsed CLI arguments. ``--answers-json`` is a JSON object
             mapping tier name -> ``{"primary": <alias>, "fallback": <alias>}``
-            (``fallback`` may be omitted or ``null``); ``--decline`` is an
-            optional comma-separated list of tier names to write as
+            (``fallback`` may be omitted or ``null``), given inline on the
+            command line. ``--answers-json-file`` is the same JSON object,
+            but read from a file (or from stdin, when the path is ``-``)
+            instead of being interpolated into a shell word — the
+            injection-proof path ``phases/0-kickoff.md`` Step 3 uses, since
+            an operator alias or elicited answer may itself contain a quote,
+            ``$``, or backtick (dev-principle #5: no LLM-marshalled data into
+            a shell word). Exactly one of ``--answers-json`` /
+            ``--answers-json-file`` may be given unless ``--decline`` alone
+            supplies everything there is to do. ``--decline`` is an optional
+            comma-separated list of tier names to write as
             :data:`MODEL_PLACEHOLDER`; ``--profile`` defaults to
             ``~/.superhuman/profile.yaml``, the same default destination
             :func:`cmd_init` uses for the operator's profile.
@@ -2006,16 +2032,41 @@ def cmd_models_set(args: argparse.Namespace) -> int:
         Process exit code (0 on success).
 
     Raises:
-        ProfileError: If ``--answers-json`` is not valid JSON, is not a JSON
-            object, or its value for a tier is not an object; or if
-            :func:`write_models_block` rejects the tier names or the existing
-            profile. Caught by :func:`main`, which prints the message and
-            exits 2 — never a raw traceback.
+        ProfileError: If both ``--answers-json`` and ``--answers-json-file``
+            are given; if neither is given and ``--decline`` is also empty
+            (nothing for the command to do); if ``--answers-json-file``
+            names a file that cannot be read; if the resulting JSON is not
+            valid, is not a JSON object, or its value for a tier is not an
+            object; or if :func:`write_models_block` rejects the tier names
+            or the existing profile. Caught by :func:`main`, which prints
+            the message and exits 2 — never a raw traceback.
     """
     dest = Path(args.profile) if args.profile else (Path.home() / ".superhuman" / "profile.yaml")
+    decline = {tok.strip() for tok in (args.decline or "").split(",") if tok.strip()}
+
+    if args.answers_json is not None and args.answers_json_file is not None:
+        raise ProfileError(
+            "--answers-json and --answers-json-file are mutually exclusive — pass only one"
+        )
+    if args.answers_json_file is not None:
+        if args.answers_json_file == "-":
+            raw_json = sys.stdin.read()
+        else:
+            try:
+                raw_json = Path(args.answers_json_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ProfileError(f"--answers-json-file: {exc}") from exc
+    elif args.answers_json is not None:
+        raw_json = args.answers_json
+    elif decline:
+        raw_json = "{}"
+    else:
+        raise ProfileError(
+            "models set: nothing to do — pass --answers-json, --answers-json-file, or --decline"
+        )
 
     try:
-        parsed = json.loads(args.answers_json)
+        parsed = json.loads(raw_json)
     except json.JSONDecodeError as exc:
         raise ProfileError(f"--answers-json: invalid JSON — {exc}") from exc
     if not isinstance(parsed, dict):
@@ -2026,8 +2077,6 @@ def cmd_models_set(args: argparse.Namespace) -> int:
         if not isinstance(entry, dict):
             raise ProfileError(f"--answers-json.{tier}: must be an object with 'primary'/'fallback'")
         answers[tier] = {"primary": entry.get("primary"), "fallback": entry.get("fallback")}
-
-    decline = {tok.strip() for tok in (args.decline or "").split(",") if tok.strip()}
 
     # write_models_block validates tier names against MODEL_TIERS and raises
     # ProfileError for anything unknown — no need to duplicate that check here.
@@ -2280,8 +2329,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models_set.add_argument(
         "--answers-json",
-        default="{}",
-        help='JSON object: {"<tier>": {"primary": "...", "fallback": "..."}, ...}',
+        default=None,
+        help=(
+            'JSON object: {"<tier>": {"primary": "...", "fallback": "..."}, ...} — given '
+            "inline. Prefer --answers-json-file when any value is not a fixed literal "
+            "(operator aliases, elicited answers): inline JSON is interpolated into a shell "
+            "word and an alias containing a quote, $, or backtick can break the quoting or "
+            "inject shell."
+        ),
+    )
+    models_set.add_argument(
+        "--answers-json-file",
+        default=None,
+        help=(
+            "same JSON object as --answers-json, read from PATH instead (PATH may be '-' to "
+            "read from stdin). Mutually exclusive with --answers-json; this is the "
+            "injection-proof form phases/0-kickoff.md Step 3 uses."
+        ),
     )
     models_set.add_argument(
         "--decline",

@@ -8,6 +8,7 @@ safe ladder into a permissive one without any visible symptom.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -796,6 +797,101 @@ def test_models_set_cli_unknown_tier_exits_nonzero(tmp_path: Path) -> None:
     assert not dest.exists()
 
 
+def test_models_set_cli_answers_json_file_round_trip(tmp_path: Path) -> None:
+    """FIX B (round 3): --answers-json-file reads the same JSON shape from a file.
+
+    Injection-proofing: an operator alias or an elicited answer can contain a
+    quote, `$`, or a backtick — interpolating it into a single-quoted
+    `--answers-json '...'` shell word can break the quoting or inject shell
+    (dev-principle #5). Routing the same JSON through a file sidesteps shell
+    interpolation entirely; the resulting profile must be identical to the
+    inline-JSON path.
+    """
+    dest = tmp_path / "profile.yaml"
+    answers_file = tmp_path / "answers.json"
+    answers_file.write_text(
+        '{"most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"}}',
+        encoding="utf-8",
+    )
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json-file", str(answers_file),
+         "--decline", "standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+    assert "wrote" in result.stdout
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"] == {
+        "primary": "vendor-a/big", "fallback": "vendor-b/big"
+    }
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+    assert profile.models["cheap"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_set_cli_answers_json_file_stdin(tmp_path: Path) -> None:
+    """FIX B (round 3): '-' reads the answers JSON from stdin instead of a file."""
+    dest = tmp_path / "profile.yaml"
+    answers_json = '{"most_capable": {"primary": "vendor-a/big"}}'
+    result = subprocess.run(
+        [sys.executable, str(RESOLVER), "models", "set", "--profile", str(dest),
+         "--answers-json-file", "-", "--decline", "standard,cheap"],
+        input=answers_json, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+
+
+def test_models_set_cli_both_answers_sources_exits_nonzero(tmp_path: Path) -> None:
+    """FIX B (round 3): --answers-json and --answers-json-file are mutually exclusive."""
+    dest = tmp_path / "profile.yaml"
+    answers_file = tmp_path / "answers.json"
+    answers_file.write_text("{}", encoding="utf-8")
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json", "{}",
+         "--answers-json-file", str(answers_file)]
+    )
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "mutually exclusive" in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_neither_answers_source_nor_decline_exits_nonzero(tmp_path: Path) -> None:
+    """FIX B (round 3): with no JSON source and no --decline, there is nothing to do."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(["models", "set", "--profile", str(dest)])
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "nothing to do" in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_answers_json_file_survives_shell_metacharacters(tmp_path: Path) -> None:
+    """FIX B (round 3): a value containing a quote/`$` survives untouched via the file path.
+
+    This is the regression anchor for the injection concern: a single-quoted
+    `--answers-json '{...}'` shell word would break (or worse, expand `$…`) on
+    an alias like `vendor's-$pecial/model`. Going through a file means the
+    value never passes through shell word-splitting/expansion at all.
+    """
+    dest = tmp_path / "profile.yaml"
+    tricky_alias = "vendor's-$pecial/model`with-backtick"
+    answers_file = tmp_path / "answers.json"
+    answers_file.write_text(
+        json.dumps({"most_capable": {"primary": tricky_alias}}), encoding="utf-8"
+    )
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json-file", str(answers_file),
+         "--decline", "standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == tricky_alias
+
+
 def test_write_models_block_updates_symlink_target_not_the_link(tmp_path: Path) -> None:
     """FIX 2: a symlinked profile.yaml must have its REAL target updated, not be
     clobbered by `os.replace` swapping in a plain file where the symlink was.
@@ -908,6 +1004,41 @@ def test_write_models_block_rejects_duplicate_top_level_models_key(tmp_path: Pat
     )
     with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
         sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_rejects_yaml_equivalent_quoted_models_key(tmp_path: Path) -> None:
+    """FIX C (round 3): a YAML-equivalent spelling of `models:` must fail loud, not append.
+
+    `yaml.safe_load` accepts quoted-key spellings like `"models":` as
+    equivalent to the canonical `models:` — so `raw_models` (from safe_load)
+    is non-None even though the column-0 `^models:` regex the targeted splice
+    depends on matches zero spans. Before this fix, `_splice_models_block`
+    would then find no span to replace and instead APPEND a second, canonical
+    `models:` block underneath the existing quoted-key one — silently
+    producing the same duplicate-key shape the count>1 guard above exists to
+    reject. This must fail loud instead.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        '"models":\n'
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    with pytest.raises(sp.ProfileError, match="models:"):
+        sp.write_models_block(dest, decline=True)
+
+    # Confirm the guard actually prevented a silent append: the file must be
+    # byte-untouched (validate-then-swap never wrote a temp/replacement), and
+    # in particular must NOT have gained a second, canonical `models:` block.
+    text_after = dest.read_text(encoding="utf-8")
+    assert text_after == original_text, (
+        "a failed write must leave the profile byte-untouched, not append a "
+        "second canonical 'models:' block alongside the quoted-key one"
+    )
 
 
 def test_write_models_block_preserves_indented_tier_after_column0_comment_inside_block(
