@@ -4,6 +4,12 @@
 > per chunk (foundation-first order), with a review checkpoint (Phase 3.1) between chunks.
 > **Architect-drafted at G3; PM-finalized (2026-08-15).** Each chunk is TDD (failing test first) and
 > ends with a commit that must pass the fast-test pre-commit gate.
+>
+> **STATUS — all 8 chunks COMPLETE (2026-08-15).** Commits: C1 `361331e`, C2 `9542ee9`, C3 `08b3e5f`,
+> C4 `79ad783`, C5 `c42d7ec` (+G6 comment-preserve fix `7b41d8d`), C6 `6d8b325`, C7 `64b3fa5`,
+> C8 `a09cb3d` (+test-restore `bca25bb`). VERSION → 1.1.0. Fast-test gate green (267 pass, 1 skip).
+> The unchecked `[ ]` step boxes below are the original plan-of-record; each chunk's completion and
+> commit is tracked authoritatively in `SUPERHUMAN.md` `## Chunk log`.
 
 **Goal:** Harden superhuman's own substrate for cross-session fidelity (#165) and provider-agnostic
 first-run setup (#139) via document/template/role/phase edits plus one deterministic profile-script

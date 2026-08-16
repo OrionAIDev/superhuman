@@ -141,3 +141,37 @@ required value. No Anthropic-first (or any-vendor-first) assumption in shipped f
   `[primary, fallback]` — rejected: terser but positionally opaque and less self-documenting than a
   named mapping. See `DESIGN.md` §Open issues ("`models:` schema extension is a public-shape
   change") and §Component C-PROF.
+
+## ADR-7: `write_models_block` preserves comments via a targeted line-span splice, not a full YAML round-trip
+
+- **Status:** accepted (G6, 2026-08-15)
+- **Date:** 2026-08-15
+- **Context:** Raised as a moderate drift event (G6) during Chunk 5 implementation. The first
+  `write_models_block` implementation read the whole `profile.yaml` with `yaml.safe_load` and rewrote
+  it with `yaml.safe_dump`, which discards ALL comments in the file. The shipped presets
+  (`profiles/presets/*.yaml`) are ~40 lines of load-bearing comments (ladder-ordering rationale,
+  install steps) and their own text instructs operators to hand-edit, so real operators do comment
+  their profiles. On a #139 first-run write against a pre-existing commented profile, those comments —
+  including the `ladder:` documentation — would vanish silently. That is the exact silent-corruption
+  class this project (#165 fidelity) exists to prevent; leaving it would have contradicted the
+  charter and dev-principle #5 (config-writing is a safety-relevant path → safety in code).
+- **Decision:** Option A — make the writer safe by construction. `write_models_block` performs a
+  **targeted line-span splice**: it locates the top-level `models:` key's own text span (`_find_models_span`)
+  and replaces/inserts only that span (`_splice_models_block`), leaving every other byte —
+  comments, `ladder:`, `version:`, blank lines — untouched. No full-document re-serialization. Reading
+  still uses `yaml.safe_load` (parsing strips nothing); only the write path changed. Kept PyYAML — no
+  new dependency.
+- **Consequences:**
+  - (+) An operator's hand-authored comments and unrelated config survive a #139 write byte-identical;
+    safety lives in the primitive, independent of how the caller (C-KICK) invokes it.
+  - (+) No third-party dependency added (ruamel.yaml was the alternative).
+  - (−) Line-span detection carries edge-case assumptions (a column-0 comment block between `models:`
+    and the next key is absorbed into the span; a file lacking `version:` gets it prepended) — untested
+    territory with no trigger in any shipped preset; documented in the Chunk-5 fix report.
+  - Fix landed as commit `7b41d8d`; 11 new tests incl. comment-preservation against the real
+    `classic-3tier.yaml` preset; 100% line/branch on the rewritten write path.
+- **Alternatives considered:** B adopt `ruamel.yaml` for round-trip comment preservation — rejected:
+  robust but adds a third-party dependency across every environment superhuman runs, heavier than
+  warranted for one block. C leave the writer and guard in the caller (only write when `models:` absent,
+  warn before overwrite) — rejected: still strips the ladder's comments on any real update and pushes
+  safety onto the caller rather than the primitive (weaker per dev-principle #5).
