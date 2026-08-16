@@ -9,6 +9,7 @@ safe ladder into a permissive one without any visible symptom.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import superhuman_profile as sp  # noqa: E402
 
 RESOLVER = Path(__file__).resolve().parents[1] / "scripts" / "superhuman_profile.py"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+PRESETS = Path(__file__).resolve().parents[1] / "profiles" / "presets"
 
 
 @pytest.fixture()
@@ -437,6 +440,132 @@ def test_decline_path_writes_neutral_placeholder(tmp_path: Path) -> None:
         # Vendor-free: the placeholder is a self-documenting token, not a model alias.
         for vendor_hint in ("opus", "sonnet", "haiku", "gpt", "gemini", "claude"):
             assert vendor_hint not in entry["primary"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# models: generator — targeted-patch comment preservation (#139 G6)
+# --------------------------------------------------------------------------- #
+
+
+def test_write_models_block_preserves_comments_and_ladder(tmp_path: Path) -> None:
+    """Writing one tier must not disturb any other byte of a hand-edited file.
+
+    G6 follow-up: the writer used to `yaml.safe_load`/`yaml.safe_dump` the
+    whole document, silently stripping every comment. It must now splice only
+    the `models:` span, leaving header comments, `ladder:`, and an
+    already-answered tier verbatim.
+    """
+    original = (FIXTURES / "profile_with_comments_and_models.yaml").read_text(encoding="utf-8")
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    match = re.search(r"(?m)^models:", original)
+    assert match, "fixture must contain a top-level models: key"
+    header = original[: match.start()]
+
+    assert new_text.startswith(header), "everything before the models: key must be byte-identical"
+    for line in header.splitlines():
+        if line.strip().startswith("#"):
+            assert line in new_text, f"comment line lost: {line!r}"
+
+    profile = sp.load_profile(dest)
+    assert [r.name for r in profile.ladder] == ["production", "dev", "workstation"]
+    assert profile.models["most_capable"] == {"primary": "vendor-a/big", "fallback": None}
+    assert profile.models["standard"] == {"primary": "vendor-a/mid", "fallback": "vendor-b/mid"}
+    assert profile.models["cheap"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_inserts_without_disturbing_commented_profile(tmp_path: Path) -> None:
+    """A commented profile with a ladder but no models: block gets one appended.
+
+    Uses the shipped `classic-3tier` preset, which has ~40 lines of
+    load-bearing comments and no `models:` key at all.
+    """
+    original = (PRESETS / "classic-3tier.yaml").read_text(encoding="utf-8")
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, decline=True)
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert new_text.startswith(original), "existing content must survive untouched, with only an append"
+    assert "models:" in new_text
+
+    profile = sp.load_profile(dest)
+    assert [r.name for r in profile.ladder] == [
+        "production", "staging", "dev", "workstation-trunk", "workstation",
+    ]
+    for tier in sp.MODEL_TIERS:
+        assert profile.models[tier]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_second_write_patches_only_its_own_span(tmp_path: Path) -> None:
+    """Two successive writer calls must not compound damage to the models: span."""
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+    text_after_first = dest.read_text(encoding="utf-8")
+    assert text_after_first.count("models:") == 1, "must not duplicate the models: key"
+
+    sp.write_models_block(dest, {"standard": {"primary": "vendor-a/mid", "fallback": None}})
+    text_after_second = dest.read_text(encoding="utf-8")
+    assert text_after_second.count("models:") == 1
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+
+
+def test_write_models_block_span_ends_at_next_top_level_key(tmp_path: Path) -> None:
+    """A `models:` block followed by another top-level key stops there, not at EOF."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable: opus\n"  # legacy bare-string form, test data only per LD-1
+        "conventions:\n"
+        "  - python\n",
+        encoding="utf-8",
+    )
+
+    sp.write_models_block(dest, {"standard": {"primary": "vendor-a/mid", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert "conventions:\n  - python" in new_text, "content after the models: span must survive"
+    profile = sp.load_profile(dest)
+    assert profile.conventions == ("python",)
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+
+
+def test_write_models_block_insert_adds_newline_when_file_lacks_one(tmp_path: Path) -> None:
+    """A file with no trailing newline still gets a clean, valid append."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\nladder:\n  - name: a\n    detect: {default: true}", encoding="utf-8")
+
+    sp.write_models_block(dest, decline=True)
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert "detect: {default: true}\n\nmodels:" in new_text
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_rejects_invalid_existing_yaml(tmp_path: Path) -> None:
+    """A pre-existing file that is not valid YAML fails loud, not silently."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("models: [unterminated\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_rejects_non_mapping_top_level(tmp_path: Path) -> None:
+    """A pre-existing file whose top level is not a mapping fails loud."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
 
 
 def test_decline_specific_tiers_only(tmp_path: Path) -> None:

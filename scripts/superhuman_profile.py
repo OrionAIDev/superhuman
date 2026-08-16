@@ -73,6 +73,10 @@ MODEL_PLACEHOLDER = "PROMPT_ME"
 
 _MODEL_ENTRY_KEYS = {"primary", "fallback"}
 
+#: Matches a top-level (column-0) `models:` key line, with or without trailing
+#: inline content (flow mapping) or a trailing comment.
+_MODELS_KEY_RE = re.compile(r"^models:(?:\s|$)")
+
 _APPROVER_RE = re.compile(r"^(human|self|human:[\w.-]+|agent:[\w.-]+)$")
 _STABLE_TAG_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
 
@@ -1660,6 +1664,76 @@ def render_profile(ladder: list[dict[str, Any]], disc: "Discovery | None" = None
     return "\n".join(out).rstrip() + "\n"
 
 
+def _find_models_span(lines: list[str]) -> tuple[int, int] | None:
+    """Find the line-index span of a top-level ``models:`` block in raw YAML text.
+
+    YAML top-level keys sit at column 0 (the authoring convention every
+    profile in this repo follows). The span starts at the ``models:`` line
+    and extends through every following line that is blank, a column-0
+    comment, or indented (a child of the mapping) — ending at the next
+    column-0, non-blank, non-comment line (the next top-level key), or end of
+    file. This lets the caller replace only that span and leave every other
+    byte of the file — comments included — untouched.
+
+    Args:
+        lines: File content split with ``str.splitlines(keepends=True)``.
+
+    Returns:
+        ``(start, end)`` line indices with ``end`` exclusive, or ``None`` if
+        no top-level ``models:`` line is present.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if _MODELS_KEY_RE.match(line):
+            start = i
+            break
+    if start is None:
+        return None
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        first = line[:1]
+        if line.strip() == "" or first in (" ", "\t") or first == "#":
+            continue  # blank, indented (mapping child), or a column-0 comment
+        end = i
+        break
+    return start, end
+
+
+def _splice_models_block(text: str, rendered_block: str) -> str:
+    """Replace or append the top-level ``models:`` block in raw profile text.
+
+    This is the targeted-patch primitive behind :func:`write_models_block`
+    (#139 G6 follow-up): every other line — comments, blank lines, ``ladder:``,
+    ``version:``, anything else — passes through byte-identical. Only the
+    ``models:`` key's own span (per :func:`_find_models_span`) is replaced.
+    When no ``models:`` key exists yet, ``rendered_block`` is appended after a
+    blank-line separator so it never fuses onto a preceding comment or the
+    last line of an existing mapping.
+
+    Args:
+        text: The original file content (``""`` for a brand-new file).
+        rendered_block: The freshly rendered ``models:\\n  ...`` block text,
+            trailing newline included.
+
+    Returns:
+        The full document text with only the ``models:`` span touched.
+    """
+    lines = text.splitlines(keepends=True)
+    span = _find_models_span(lines)
+    if span is None:
+        prefix = text
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        if prefix and not prefix.endswith("\n\n"):
+            prefix += "\n"
+        return prefix + rendered_block
+
+    start, end = span
+    return "".join(lines[:start]) + rendered_block + "".join(lines[end:])
+
+
 def write_models_block(
     profile_path: Path,
     answers: dict[str, dict[str, str | None]] | None = None,
@@ -1682,6 +1756,15 @@ def write_models_block(
     already present in the file, still gets :data:`MODEL_PLACEHOLDER` rather
     than being left absent — fail safe, not fail silent (FR-10).
 
+    This is a **targeted patch**, not a full-document re-dump (#139 G6): only
+    the ``models:`` key's own text span is replaced (or appended if absent).
+    Comments, formatting, and every other top-level key — ``ladder:``,
+    ``citation:``, an operator's own annotations — pass through
+    byte-identical. A prior implementation round-tripped the whole file
+    through ``yaml.safe_load``/``yaml.safe_dump``, which silently discarded
+    every comment in the file, including the ~40 lines of load-bearing
+    authoring-rule commentary the shipped presets carry.
+
     Args:
         profile_path: Destination ``profile.yaml``.
         answers: Tier -> ``{"primary": <alias>, "fallback": <alias> | None}``
@@ -1699,7 +1782,7 @@ def write_models_block(
     Raises:
         ProfileError: If ``answers``/``decline`` name a tier outside
             :data:`MODEL_TIERS`, if ``profile_path`` exists but is not valid
-            YAML, or if the merged result fails to load back.
+            YAML, or if the patched result fails to load back.
     """
     answers = answers or {}
     declined = set(MODEL_TIERS) if decline is True else (set() if decline is False else set(decline))
@@ -1709,14 +1792,16 @@ def write_models_block(
         raise ProfileError(f"models: unknown tier(s) {sorted(unknown)}")
 
     if profile_path.is_file():
+        text = profile_path.read_text(encoding="utf-8")
         try:
-            existing: Any = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
+            existing: Any = yaml.safe_load(text) or {}
         except yaml.YAMLError as exc:
             raise ProfileError(f"{profile_path}: invalid YAML — {exc}") from exc
         if not isinstance(existing, dict):
             raise ProfileError(f"{profile_path}: top level must be a mapping")
     else:
-        existing = {"version": SCHEMA_VERSION}
+        text = ""
+        existing = {}
 
     models_block: dict[str, Any] = dict(existing.get("models") or {})
     for tier in MODEL_TIERS:
@@ -1731,17 +1816,20 @@ def write_models_block(
         elif tier not in models_block:
             models_block[tier] = {"primary": MODEL_PLACEHOLDER, "fallback": MODEL_PLACEHOLDER}
 
-    existing["models"] = models_block
-    existing.setdefault("version", SCHEMA_VERSION)
-
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
     # yaml.safe_dump(data, default_flow_style=False, sort_keys=False):
     # https://pyyaml.org/wiki/PyYAMLDocumentation (PyYAML 6.0.3, installed version)
-    # — block style, insertion order preserved, no Python-specific tags.
-    profile_path.write_text(
-        yaml.safe_dump(existing, default_flow_style=False, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
+    # — block style, insertion order preserved, no Python-specific tags. Only
+    # the small {"models": ...} sub-document is dumped; it is spliced into the
+    # original text rather than replacing it, so nothing else gets re-dumped.
+    rendered = yaml.safe_dump(
+        {"models": models_block}, default_flow_style=False, sort_keys=False, allow_unicode=True
     )
+    new_text = _splice_models_block(text, rendered)
+    if "version" not in existing:
+        new_text = f"version: {SCHEMA_VERSION}\n\n" + new_text
+
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(new_text, encoding="utf-8")
 
     load_profile(profile_path)  # validate what was just written before handing it back
     return profile_path
