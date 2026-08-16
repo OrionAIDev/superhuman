@@ -1,0 +1,1794 @@
+"""Tests for ``scripts.fleet.core.done`` (PLAN.md Chunk 5, TEST.md TC-26..TC-32).
+
+Covers the acceptance criteria in ``docs/superhuman/session-tracking/PLAN.md``
+Chunk 5: ``D0-code -> D1-merged`` requires merge evidence (TC-26);
+``D1-merged -> D2-test`` requires deploy+test evidence as a conjunction
+(TC-27); ``D2-test -> D3-uat`` and ``D3-uat -> D4-prod`` both require a
+recorded human approver (TC-28/TC-29); every skip-level and backward
+transition (including same-level) is rejected regardless of evidence
+(TC-30); the project's D-ceiling blocks advancement even with full
+evidence + approver (TC-31); and ``core/done.py`` never imports or calls
+anything LLM/model/adapter-shaped (TC-32, DP#5). Exhaustive per-rung
+coverage (every adjacent-forward, every backward, skip-level, same-level,
+both evidence gates, the approver gate, and the ceiling) is asserted
+directly against the transition table so `--cov-branch --cov-fail-under=100`
+on `core/done.py` is a real property, not merely "the file was imported."
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts.fleet.core.done import DONE_LEVELS, AdvanceResult, advance, event_for
+from scripts.fleet.core.errors import DonePolicyError
+from scripts.fleet.core.events import read_all
+
+_PROJECT_ID = "proj-done"
+_WRITER_ROLE = "Project Manager"
+_NODE = "claude/repo/proj/session-1"
+_TOP_CEILING = "D4-prod"  # no ceiling in practice — the top of the ladder
+
+
+def _log(tmp_path: Path) -> Path:
+    return tmp_path / "events.jsonl"
+
+
+def _advance(log_path: Path, target: str, *, evidence=None, approver=None, ceiling=_TOP_CEILING):
+    return advance(
+        _NODE,
+        target,
+        evidence=evidence,
+        approver=approver,
+        ceiling=ceiling,
+        project_id=_PROJECT_ID,
+        writer_role=_WRITER_ROLE,
+        log_path=log_path,
+    )
+
+
+def _full_evidence_for(target: str) -> dict[str, str]:
+    """Return evidence that satisfies every gate `target` might have.
+
+    Used by TC-30/TC-31 fixtures so a rejection can be attributed
+    unambiguously to the adjacency/ceiling check under test, never to a
+    starved evidence gate.
+    """
+    return {"commit": "abc123", "pr": "42", "deploy_id": "dep-1", "ci_run": "ci-1"}
+
+
+def _full_approver() -> str:
+    return "Jordan Rivera"
+
+
+def _advance_to(log_path: Path, target: str) -> None:
+    """Drive a node from D0-code straight up to `target` via legitimate calls."""
+    for level in DONE_LEVELS[1 : DONE_LEVELS.index(target) + 1]:
+        _advance(
+            log_path,
+            level,
+            evidence=_full_evidence_for(level),
+            approver=_full_approver() if level in ("D3-uat", "D4-prod") else None,
+        )
+
+
+class TestTC26MergeEvidenceGate:
+    """TC-26: D0-code -> D1-merged requires merge evidence."""
+
+    def test_advance_with_commit_evidence_succeeds(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result == AdvanceResult(status="advanced", node_id=_NODE, level="D1-merged")
+        events = read_all(log_path)
+        assert len(events) == 1
+        assert events[0].type == "done_level_advanced"
+        assert events[0].payload["done_level"] == "D1-merged"
+        assert events[0].payload["evidence"] == {"commit": "abc123"}
+
+    def test_advance_with_pr_evidence_succeeds(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        result = _advance(log_path, "D1-merged", evidence={"pr": "42"})
+        assert result.status == "advanced"
+
+    def test_advance_without_merge_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={})
+
+        assert read_all(log_path) == []
+
+    def test_advance_with_none_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence=None)
+
+        assert read_all(log_path) == []
+
+    def test_whitespace_only_commit_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """G5 fix #3: `_has_merge_evidence` must not treat whitespace-only
+        as present — `bool("   ")` is `True`, so the pre-fix gate silently
+        accepted a blank-looking commit reference."""
+        log_path = _log(tmp_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "   "})
+
+        assert read_all(log_path) == []
+
+    def test_boolean_true_commit_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """G5 fix #F4: `{"commit": True}` must NOT satisfy the evidence gate.
+
+        The pre-fix `_is_present` fell back to `bool(value)` for a
+        non-string value — `bool(True)` is truthy — so a caller could
+        satisfy D1-merged's evidence gate with a bare boolean flag instead
+        of an actual commit/PR reference. `_is_present` now requires a
+        non-blank STRING; every non-string value, however truthy, is "not
+        present."
+        """
+        log_path = _log(tmp_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": True})
+
+        assert read_all(log_path) == []
+
+
+class TestTC27DeployTestEvidenceConjunction:
+    """TC-27: D1-merged -> D2-test requires deploy+test evidence (conjunction)."""
+
+    def _at_d1(self, log_path: Path) -> None:
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+    def test_both_deploy_and_test_evidence_succeeds(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        result = _advance(
+            log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"}
+        )
+
+        assert result.status == "advanced"
+
+    def test_ci_run_only_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D2-test", evidence={"ci_run": "ci-1"})
+
+        assert len(read_all(log_path)) == 1  # only the D1 event from setup
+
+    def test_whitespace_only_deploy_and_test_evidence_raises_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """G5 fix #3: a whitespace-only value for either D2-test evidence key
+        must not satisfy the conjunction."""
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D2-test", evidence={"deploy_id": "d", "ci_run": "\n"})
+
+        assert len(read_all(log_path)) == 1
+
+    def test_deploy_id_only_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D2-test", evidence={"deploy_id": "dep-1"})
+
+        assert len(read_all(log_path)) == 1
+
+    def test_integer_deploy_id_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        """G5 fix #F4: `{"deploy_id": 1, "ci_run": "ci-1"}` must NOT satisfy
+        the conjunction — `deploy_id` must be an actual non-blank string
+        reference, not a truthy int."""
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D2-test", evidence={"deploy_id": 1, "ci_run": "ci-1"})
+
+        assert len(read_all(log_path)) == 1
+
+    def test_neither_evidence_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d1(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D2-test", evidence={})
+
+        assert len(read_all(log_path)) == 1
+
+
+class TestTC28HumanApproverGateD3:
+    """TC-28: D2-test -> D3-uat requires a recorded human approver."""
+
+    def _at_d2(self, log_path: Path) -> None:
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        _advance(log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"})
+
+    def test_with_named_human_approver_succeeds(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        result = _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="Jordan Rivera")
+
+        assert result.status == "advanced"
+        events = read_all(log_path)
+        assert events[-1].payload["approver"] == "Jordan Rivera"
+
+    def test_missing_approver_raises_even_with_full_evidence(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver=None)
+
+        assert len(read_all(log_path)) == 2  # only the D1/D2 setup events
+
+    def test_blank_approver_raises(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="   ")
+
+    @pytest.mark.parametrize(
+        "approver",
+        [
+            "jenkins",
+            "Jenkins",
+            "cron",
+            "CI",
+            "cd",
+            "automation",
+            "system",
+            "robot",
+            "bot",
+            "daemon",
+            "github-actions",
+            "gitlab-ci",
+            "circleci",
+            "travis",
+            "service-account",
+            "noreply",
+            "no-reply",
+            "0",
+            ".",
+            "123",
+            "--",
+            "",
+            "   ",
+            "ci-runner-01",
+            "jenkins-x",
+        ],
+    )
+    def test_bot_shaped_approver_is_rejected(self, tmp_path: Path, approver: str) -> None:
+        """G5 fix #2 (round 1) / #F3 (round 2): an automation-stem-shaped or
+        trivial approver is not a human identity, and is rejected the same
+        as a model/vendor-shaped one.
+
+        `core/done.py`'s human-approver gate rejects three overlapping
+        categories, matched at TOKEN boundaries (never raw substring, so a
+        human "Cindy"/"Cicero" is never rejected for containing "ci" — see
+        `test_plausible_human_names_are_accepted` below): (1)
+        `core.schema.is_model_vendor_name` matches (claude, gpt, ...); (2)
+        a whole token equal to a known automation stem (jenkins, cron, ci,
+        cd, bot, robot, system, automation, daemon, actions, pipeline,
+        runner, svc, noreply, github-actions, gitlab-ci, circleci, travis,
+        service-account, agent); (3) a trivial string (< 2 chars, or no
+        alphabetic character at all). None of this proves biological
+        human-ness — the manifest records a *claimed* approver, an audit
+        trail, not identity proof; a determined caller could still enter a
+        fake human-shaped name. See the module/function docstrings.
+
+        `"ci-runner-01"` and `"jenkins-x"` (G5 fix #F3) exercise the bug a
+        round-1 GPT-5 cross-model review pass found: the old tokenizer
+        stripped hyphens BEFORE splitting into tokens, so `"ci-runner-01"`
+        normalized to the single fused blob `"cirunner01"` — matching
+        nothing — and silently passed the gate. The fixed tokenizer splits
+        on separators (and digits) FIRST, so `"ci-runner-01"` -> `["ci",
+        "runner"]` (the "ci" token is caught) and `"jenkins-x"` -> `["jenkins",
+        "x"]` (the "jenkins" token is caught).
+        """
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver=approver)
+
+    def test_known_residual_concatenated_automation_name_without_separator_slips_through(
+        self, tmp_path: Path
+    ) -> None:
+        """G5 fix #F3's documented, approved residual: a CONCATENATED
+        automation-shaped name with NO separator at all (e.g. "deploybot2",
+        "jenkinsx") has no word boundary for the tokenizer to split on and
+        is not itself a listed compound stem, so it is NOT rejected. This
+        gate is a deterrent and an audit record, not proof of human-ness
+        (see `_has_automation_stem`'s docstring) — flagged as a known,
+        accepted limitation, not a bug to chase further.
+        """
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        result = _advance(
+            log_path, "D3-uat", evidence={"env": "uat"}, approver="deploybot2"
+        )
+
+        assert result.status == "advanced"
+
+    def test_model_vendor_shaped_approver_is_rejected(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="Claude Opus")
+
+    @pytest.mark.parametrize(
+        "approver",
+        ["Jordan Rivera", "Cindy Lee", "Dana Fox", "Cicero Nash"],
+    )
+    def test_plausible_human_names_are_accepted(self, tmp_path: Path, approver: str) -> None:
+        """Names that merely *contain* an automation-stem substring (e.g.
+        "Cindy"/"Cicero" contain "ci") must NOT be rejected — the stem match
+        is whole-token only, never a raw substring test."""
+        log_path = _log(tmp_path)
+        self._at_d2(log_path)
+
+        result = _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver=approver)
+
+        assert result.status == "advanced"
+
+
+class TestTC29HumanApproverGateD4:
+    """TC-29: D3-uat -> D4-prod requires a recorded human approver."""
+
+    def _at_d3(self, log_path: Path) -> None:
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        _advance(log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"})
+        _advance(log_path, "D3-uat", evidence={"env": "uat"}, approver="Jordan Rivera")
+
+    def test_with_named_human_approver_succeeds(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d3(log_path)
+
+        result = _advance(log_path, "D4-prod", evidence={"env": "prod"}, approver="Jordan Rivera")
+
+        assert result.status == "advanced"
+
+    def test_missing_approver_raises_even_with_full_evidence(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+        self._at_d3(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D4-prod", evidence={"env": "prod"}, approver=None)
+
+        assert len(read_all(log_path)) == 3  # only the D1/D2/D3 setup events
+
+
+class TestTC30SkipLevelAndBackwardTransitions:
+    """TC-30: every non-adjacent forward and every backward transition rejected."""
+
+    @pytest.mark.parametrize(
+        "start,target",
+        [
+            ("D0-code", "D2-test"),
+            ("D0-code", "D3-uat"),
+            ("D0-code", "D4-prod"),
+            ("D1-merged", "D3-uat"),
+            ("D1-merged", "D4-prod"),
+            ("D2-test", "D4-prod"),
+        ],
+    )
+    def test_skip_level_forward_rejected_regardless_of_evidence(
+        self, tmp_path: Path, start: str, target: str
+    ) -> None:
+        log_path = _log(tmp_path)
+        _advance_to(log_path, start)
+        before = read_all(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(
+                log_path,
+                target,
+                evidence=_full_evidence_for(target),
+                approver=_full_approver(),
+            )
+
+        assert read_all(log_path) == before  # nothing written
+
+    @pytest.mark.parametrize(
+        "start,target",
+        [
+            ("D4-prod", "D3-uat"),
+            ("D3-uat", "D2-test"),
+            ("D2-test", "D1-merged"),
+            ("D1-merged", "D0-code"),
+            ("D2-test", "D2-test"),  # same-level, grouped with backward per TC-30
+        ],
+    )
+    def test_backward_and_same_level_rejected_regardless_of_evidence(
+        self, tmp_path: Path, start: str, target: str
+    ) -> None:
+        log_path = _log(tmp_path)
+        _advance_to(log_path, start)
+        before = read_all(log_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(
+                log_path,
+                target,
+                evidence=_full_evidence_for(target),
+                approver=_full_approver(),
+            )
+
+        assert read_all(log_path) == before  # nothing written
+
+    def test_sequential_repeat_of_an_already_completed_advance_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """See module docstring / core/done.py's "No retry-idempotency" note.
+
+        A *sequential* repeat of the exact call that already succeeded is a
+        same-level attempt under TC-30's own framing (the node is already at
+        that level) — not the concurrent-race dedupe `AdvanceResult.status
+        == "deduped"` documents.
+        """
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+    @pytest.mark.parametrize("target", ["D0-code", "D1-merged", "D2-test", "D3-uat", "D4-prod"])
+    def test_every_adjacent_forward_step_succeeds(self, tmp_path: Path, target: str) -> None:
+        """Exhaustive positive coverage: every legitimate D(n) -> D(n+1) step."""
+        log_path = _log(tmp_path)
+        idx = DONE_LEVELS.index(target)
+        if idx == 0:
+            pytest.skip("D0-code is the default starting level, never an advance target")
+        _advance_to(log_path, DONE_LEVELS[idx - 1])
+
+        result = _advance(
+            log_path,
+            target,
+            evidence=_full_evidence_for(target),
+            approver=_full_approver(),
+        )
+
+        assert result.status == "advanced"
+
+
+class TestTC31DCeilingBlocksAdvancement:
+    """TC-31: D-ceiling blocks advancement regardless of evidence/approver."""
+
+    def _at_d2_with_full_d3_evidence(self, tmp_path: Path) -> Path:
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        _advance(log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"})
+        return log_path
+
+    def test_ceiling_at_d2_test_rejects_the_d3_advance(self, tmp_path: Path) -> None:
+        log_path = self._at_d2_with_full_d3_evidence(tmp_path)
+
+        with pytest.raises(DonePolicyError):
+            _advance(
+                log_path,
+                "D3-uat",
+                evidence={"env": "uat"},
+                approver="Jordan Rivera",
+                ceiling="D2-test",
+            )
+
+        assert len(read_all(log_path)) == 2  # only the D1/D2 setup events
+
+    def test_ceiling_at_d4_prod_allows_the_same_transition(self, tmp_path: Path) -> None:
+        log_path = self._at_d2_with_full_d3_evidence(tmp_path)
+
+        result = _advance(
+            log_path,
+            "D3-uat",
+            evidence={"env": "uat"},
+            approver="Jordan Rivera",
+            ceiling="D4-prod",
+        )
+
+        assert result.status == "advanced"
+
+    def test_unknown_ceiling_value_raises_value_error(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+
+        with pytest.raises(ValueError):
+            _advance(log_path, "D1-merged", evidence={"commit": "x"}, ceiling="D9-nonsense")
+
+    def test_unknown_target_level_raises_value_error(self, tmp_path: Path) -> None:
+        log_path = _log(tmp_path)
+
+        with pytest.raises(ValueError):
+            _advance(log_path, "D9-nonsense", evidence={"commit": "x"})
+
+
+class TestTC32DoneIsDeterministicCodeNeverInferred:
+    """TC-32: core/done.py has zero LLM/model/adapter imports or calls (DP#5)."""
+
+    _DONE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "fleet" / "core" / "done.py"
+
+    #: Substrings that mark an import as LLM/model/adapter-shaped. Matched
+    #: case-insensitively against the full dotted module string of every
+    #: import statement in `core/done.py`.
+    _FORBIDDEN_SUBSTRINGS = (
+        "anthropic",
+        "openai",
+        "adapter",
+        "session_relay",
+        "session-relay",
+        "mcp__",
+        "llm",
+    )
+
+    def _imported_modules(self) -> set[str]:
+        tree = ast.parse(self._DONE_PATH.read_text(encoding="utf-8"))
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    modules.add(node.module)
+                for alias in node.names:
+                    modules.add(alias.name)
+        return modules
+
+    def test_file_exists_to_scan(self) -> None:
+        # Guards against a vacuous pass if the file were ever renamed/moved.
+        assert self._DONE_PATH.is_file(), f"{self._DONE_PATH} does not exist"
+
+    def test_done_module_imports_nothing_llm_or_adapter_shaped(self) -> None:
+        modules = self._imported_modules()
+        offenders = {
+            m for m in modules if any(tok in m.lower() for tok in self._FORBIDDEN_SUBSTRINGS)
+        }
+        assert not offenders, (
+            f"core/done.py imports something LLM/model/adapter-shaped (DP#5 "
+            f"violation): {offenders}"
+        )
+
+    def test_guard_can_actually_fail_on_a_broken_fixture(self) -> None:
+        """Prove the guard is not vacuous: an injected anthropic import IS caught."""
+        broken_source = "import anthropic\n" + self._DONE_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(broken_source)
+        modules = {
+            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        offenders = {
+            m for m in modules if any(tok in m.lower() for tok in self._FORBIDDEN_SUBSTRINGS)
+        }
+        assert offenders, "the import guard failed to detect a deliberately broken fixture"
+
+    def test_advance_is_a_pure_function_of_its_arguments(self, tmp_path: Path) -> None:
+        """Calling `advance()` with identical inputs against identical state
+        is fully deterministic — no hidden randomness/model call could make
+        two calls disagree (a lightweight runtime complement to the static
+        import scan above)."""
+        log_a = _log(tmp_path / "a")
+        log_b = _log(tmp_path / "b")
+
+        result_a = _advance(log_a, "D1-merged", evidence={"commit": "abc123"})
+        result_b = _advance(log_b, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result_a == result_b
+
+
+class TestCurrentLevelDefensiveReadTolerance:
+    """`_current_level` skips a non-matching or malformed log entry (G5 F3).
+
+    Never triggered by `advance()`'s own writes (every event it appends
+    always carries a recognized `done_level` for the right `node_id`/type)
+    — only a directly-forged log entry reaches these branches, matching the
+    same read-time tolerance `core.edges` applies to its own event payloads.
+    """
+
+    def test_events_for_a_different_node_or_type_are_ignored(self, tmp_path: Path) -> None:
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+        # A different node's advancement, and a same-node non-done event,
+        # must not influence this node's computed current level.
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "22222222-2222-2222-2222-222222222222",
+                "idempotency_key": "done:other/node:D4-prod",
+                "ts": "2026-08-15T00:00:00.000000Z",
+                "type": "done_level_advanced",
+                "project_id": _PROJECT_ID,
+                "node_id": "other/node",
+                "writer_role": _WRITER_ROLE,
+                "payload": {"done_level": "D4-prod", "evidence": {}, "approver": "Jordan Rivera"},
+            },
+        )
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "33333333-3333-3333-3333-333333333333",
+                "idempotency_key": f"register:{_NODE}",
+                "ts": "2026-08-15T00:00:00.000000Z",
+                "type": "session_registered",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"harness": "claude", "workspace": "/w", "local_id": "1", "branch": ""},
+            },
+        )
+
+        # This node is still at the default D0-code, so D1-merged is the
+        # only legal next step — proves neither seeded event moved it.
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        assert result.status == "advanced"
+
+    def test_malformed_done_level_value_is_skipped_not_trusted(self, tmp_path: Path) -> None:
+        """G5 fix #F2 changed HOW this scenario reaches `_current_level`.
+
+        Before #F2, `core.events.append` accepted a `done_level_advanced`
+        event carrying an unrecognized `done_level` value (schema-valid — a
+        non-empty string — just not in `DONE_LEVELS`), and `_current_level`
+        was the thing skipping it defensively on read. After #F2,
+        `core.schema.validate_event` rejects that value AT THE WRITE
+        BOUNDARY (see `TestF2UnrecognizedDoneLevelRejected` below) — so this
+        scenario can now only be reached by a truly raw, direct write to the
+        log FILE, bypassing `core.events.append` (and therefore
+        `validate_event`) entirely. `core.events.read_all` runs
+        `validate_event` on every line it reads too, so the bogus line is
+        skipped there, before it would ever reach `_current_level`'s own
+        `fold_done_level`-based tolerance — the read-time defense-in-depth
+        this test now actually exercises.
+        """
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        # A forged event with an unrecognized done_level string, written
+        # directly to the log file — never through `core.events.append`,
+        # which would now reject it (#F2) before it ever reached disk.
+        bogus_line = json.dumps(
+            {
+                "schema_version": 1,
+                "event_id": "44444444-4444-4444-4444-444444444444",
+                "idempotency_key": f"done:{_NODE}:D9-bogus",
+                "ts": "2026-08-15T00:00:01.000000Z",
+                "type": "done_level_advanced",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"done_level": "D9-bogus", "evidence": {}, "approver": None},
+            }
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(bogus_line + "\n")
+
+        # Current is still correctly D1-merged (the bogus line never even
+        # parses into an Event), so D2-test is the only legal next step.
+        result = _advance(
+            log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"}
+        )
+        assert result.status == "advanced"
+
+
+class TestF2UnrecognizedDoneLevelRejected:
+    """G5 fix #F2: an unrecognized `done_level` value is rejected at the
+    write boundary, not merely tolerated on read (F1's `fold_done_level`
+    already ignores it defensively — this closes the hole one layer
+    earlier, so nothing bad is ever persisted in the first place, NFR-7)."""
+
+    def test_append_rejects_a_bogus_done_level_value(self, tmp_path: Path) -> None:
+        from scripts.fleet.core.events import append
+        from scripts.fleet.core.errors import ValidationError
+
+        log_path = _log(tmp_path)
+
+        with pytest.raises(ValidationError):
+            append(
+                log_path,
+                {
+                    "schema_version": 1,
+                    "event_id": "66666666-6666-6666-6666-666666666666",
+                    "idempotency_key": f"done:{_NODE}:D9-bogus",
+                    "ts": "2026-08-15T00:00:00.000000Z",
+                    "type": "done_level_advanced",
+                    "project_id": _PROJECT_ID,
+                    "node_id": _NODE,
+                    "writer_role": _WRITER_ROLE,
+                    "payload": {"done_level": "D9-bogus", "evidence": {}, "approver": None},
+                },
+            )
+
+        assert read_all(log_path) == []
+
+    def test_advance_rejects_the_bogus_target_level_before_this_boundary_even_runs(
+        self, tmp_path: Path
+    ) -> None:
+        """`advance()`'s own `_validate_known_level` already rejects an
+        unrecognized `target_level` with `ValueError`, before ever building
+        an event — this exercises that `core.done.advance()` and the raw
+        `core.events.append` write boundary agree on the same vocabulary
+        (`DONE_LEVELS`, now the single source of truth in `core.schema`)."""
+        log_path = _log(tmp_path)
+
+        with pytest.raises(ValueError):
+            _advance(log_path, "D9-bogus", evidence={"commit": "x"})
+
+        assert read_all(log_path) == []
+
+    def test_read_all_skips_a_bogus_value_injected_directly_to_the_log_file(
+        self, tmp_path: Path
+    ) -> None:
+        """A `done_level_advanced` line with an unrecognized `done_level`,
+        written directly to the log file (bypassing `append`/`validate_event`
+        entirely), is skipped by `read_all` the same as any other malformed
+        line — it never becomes an `Event`, so it can never be "trusted" by
+        anything downstream."""
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        bogus_line = json.dumps(
+            {
+                "schema_version": 1,
+                "event_id": "77777777-7777-7777-7777-777777777777",
+                "idempotency_key": f"done:{_NODE}:D9-bogus",
+                "ts": "2026-08-15T00:00:01.000000Z",
+                "type": "done_level_advanced",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"done_level": "D9-bogus", "evidence": {}, "approver": None},
+            }
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(bogus_line + "\n")
+
+        events = read_all(log_path)
+        assert len(events) == 1  # only the legitimate D1-merged event
+        assert events[0].payload["done_level"] == "D1-merged"
+
+
+class TestF1ForgedDirectAppendCannotCorruptTheLadder:
+    """G5 fix #F1: a direct `core.events.append()` of a correctly-typed
+    `done_level_advanced` event — never through `core.done.advance()`, so
+    none of its evidence/approver/adjacency gates ever ran — must not be
+    able to set a node's computed current level or projected fragment to
+    anything, ANY non-adjacent value included. `_current_level` and
+    `core.projection` both fold through the SAME shared helper,
+    `core.schema.fold_done_level`, so they can never disagree, on any log,
+    forged or not.
+    """
+
+    def _forged_event(self, target: str, *, event_id: str, ts: str) -> dict:
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "idempotency_key": f"done:{_NODE}:{target}",
+            "ts": ts,
+            "type": "done_level_advanced",
+            "project_id": _PROJECT_ID,
+            "node_id": _NODE,
+            "writer_role": _WRITER_ROLE,
+            "payload": {"done_level": target, "evidence": {}, "approver": "Jordan Rivera"},
+        }
+
+    def test_a_forged_direct_append_skip_from_d0_to_d4_is_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) A forged direct-append `done_level_advanced` to D4-prod from
+        the default D0-code — a recognized value, but not adjacent — must
+        leave the fragment/current-level at D0-code, not D4-prod."""
+        from scripts.fleet.core.done import _current_level
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+        append(
+            log_path,
+            self._forged_event(
+                "D4-prod",
+                event_id="88888888-8888-8888-8888-888888888888",
+                ts="2026-08-15T00:00:00.000000Z",
+            ),
+        )
+
+        assert _current_level(read_all(log_path), _NODE) == "D0-code"
+
+    def test_a_legal_advance_chain_tracks_each_rung(self, tmp_path: Path) -> None:
+        """(b) A genuine, legal advance chain (through `advance()` itself)
+        must still track each rung correctly — the fold isn't ONLY good at
+        rejecting forged input, it must also correctly accept real input."""
+        from scripts.fleet.core.done import _current_level
+
+        log_path = _log(tmp_path)
+        for target in DONE_LEVELS[1:]:
+            _advance(
+                log_path,
+                target,
+                evidence=_full_evidence_for(target),
+                approver=_full_approver() if target in ("D3-uat", "D4-prod") else None,
+            )
+            assert _current_level(read_all(log_path), _NODE) == target
+
+    def test_projection_done_level_equals_current_level_on_a_mixed_forged_log(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) The property test: for a log mixing legitimate `advance()`
+        writes with a forged direct-append skip, `core.projection`'s
+        rebuilt `done_level` for the node and `core.done._current_level`
+        computed over the same events must agree — because both fold
+        through the exact same `schema.fold_done_level` helper."""
+        from scripts.fleet.core.done import _current_level
+        from scripts.fleet.core.events import append
+        from scripts.fleet.core.projection import rebuild
+
+        log_path = _log(tmp_path)
+        sessions_dir = tmp_path / "sessions"
+
+        # A legitimate chain up to D2-test.
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        _advance(log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"})
+
+        # A forged skip straight to D4-prod, never through advance().
+        append(
+            log_path,
+            self._forged_event(
+                "D4-prod",
+                event_id="99999999-9999-9999-9999-999999999999",
+                ts="2026-08-15T00:00:02.000000Z",
+            ),
+        )
+
+        events = read_all(log_path)
+        expected = _current_level(events, _NODE)
+        fragments = rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+
+        # The invariant this fix guarantees.
+        assert fragments[_NODE].done_level == expected
+        # And it lands on the right value — the forged skip was ignored by
+        # both derivations, not merely "consistently wrong" together.
+        assert expected == "D2-test"
+
+
+class TestOwnershipAndDedupe:
+    """Rounding out branch coverage: writer_role/ownership and the dedupe path."""
+
+    def test_writer_role_must_not_be_model_shaped(self, tmp_path: Path) -> None:
+        from scripts.fleet.core.errors import ValidationError
+
+        log_path = _log(tmp_path)
+        with pytest.raises(ValidationError):
+            advance(
+                _NODE,
+                "D1-merged",
+                evidence={"commit": "abc123"},
+                approver=None,
+                ceiling=_TOP_CEILING,
+                project_id=_PROJECT_ID,
+                writer_role="Claude Sonnet 5",
+                log_path=log_path,
+            )
+        assert read_all(log_path) == []
+
+    def test_dedupe_branch_when_append_reports_an_existing_idempotency_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exercise the `appended is None` ("deduped") branch directly.
+
+        `core.events.append` returns `None` when two callers race to write
+        the *same* legitimate next step concurrently — the loser's write
+        collides on the shared idempotency key and is a safe no-op (see the
+        module docstring's "No retry-idempotency" note: this is the
+        concurrent-race case, distinct from TC-30's *sequential* same-level
+        rejection). That race is not deterministically reproducible in a
+        single-threaded test, so this monkeypatches `core.done.append`
+        itself to return `None` — the exact contract `core.events.append`
+        documents for a dedupe — on a call whose pre-lock adjacency check
+        otherwise passes cleanly (node at the default D0-code, target
+        D1-merged), and asserts `advance()` reports `status="deduped"`
+        rather than treating it as a rejection.
+        """
+        import scripts.fleet.core.done as done_module
+
+        log_path = _log(tmp_path)
+        monkeypatch.setattr(done_module, "append", lambda *args, **kwargs: None)
+
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result == AdvanceResult(status="deduped", node_id=_NODE, level="D1-merged")
+
+
+class TestN1PoisonedIdempotencyKeyLoudFail:
+    """G5 fix #N1: a poisoned/corrupt idempotency key must never dedupe silently.
+
+    A forged direct-append `done_level_advanced` event carrying idempotency
+    key `done:<node>:D1-merged` but a payload naming a DIFFERENT
+    `done_level` (e.g. `D4-prod`) is the poisoning scenario: a legitimate,
+    fully-evidenced later call to `advance(node, "D1-merged", ...)` builds
+    the exact same idempotency key, so `core.events.append`'s own dedupe
+    (a plain key match, agnostic to payload content) reports it as "already
+    recorded" and returns `None` — before this fix, `advance()` trusted that
+    at face value and returned `status="deduped"`, a silent success, while
+    the node's real current level never moved past D0-code (a silent
+    denial-of-advancement). `advance()` must now look the persisted event up
+    and confirm its `done_level` actually matches before reporting deduped.
+    """
+
+    def _forged_poisoned_event(self) -> dict:
+        return {
+            "schema_version": 1,
+            "event_id": "aaaaaaaa-0001-0001-0001-aaaaaaaaaaaa",
+            "idempotency_key": f"done:{_NODE}:D1-merged",
+            "ts": "2026-08-15T00:00:00.000000Z",
+            "type": "done_level_advanced",
+            "project_id": _PROJECT_ID,
+            "node_id": _NODE,
+            "writer_role": _WRITER_ROLE,
+            # Poisoned: the KEY names D1-merged, the PAYLOAD claims D4-prod.
+            "payload": {"done_level": "D4-prod", "evidence": {}, "approver": "Jordan Rivera"},
+        }
+
+    def test_forged_poisoned_key_raises_instead_of_silently_deduping(
+        self, tmp_path: Path
+    ) -> None:
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+        append(log_path, self._forged_poisoned_event())
+
+        # A legitimate, fully-evidenced call — real evidence, real target,
+        # the node genuinely at D0-code — must NOT report a silent
+        # "deduped" success just because its idempotency key collides with
+        # the poisoned entry.
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        # Nothing new was written — the poisoned event is the only one on
+        # the log, and the node's real current level never moved.
+        events = read_all(log_path)
+        assert len(events) == 1
+        from scripts.fleet.core.done import _current_level
+
+        assert _current_level(events, _NODE) == "D0-code"
+
+    def test_normal_concurrent_dedupe_for_a_matching_persisted_event_still_deduped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Contrast case: a genuinely matching persisted event (the real
+        concurrent-race no-op, not poisoning) must still return
+        `status="deduped"` without raising. `append()` is monkeypatched to
+        return `None` (simulating the race-loser branch, same technique as
+        `TestOwnershipAndDedupe`'s existing dedupe test) on a call whose
+        idempotency key already has a REAL, matching persisted event behind
+        it — the honest counterpart to the poisoned-key test above."""
+        import scripts.fleet.core.done as done_module
+
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        monkeypatch.setattr(done_module, "_current_level", lambda events, node_id: "D0-code")
+        monkeypatch.setattr(done_module, "append", lambda *args, **kwargs: None)
+
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result == AdvanceResult(status="deduped", node_id=_NODE, level="D1-merged")
+
+    def test_dedupe_with_no_persisted_event_at_all_is_trusted_defensively(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Preserves `TestOwnershipAndDedupe`'s existing scenario: `append()`
+        mocked to return `None` against an EMPTY log (nothing persisted at
+        all — not the realistic case, but shouldn't crash). `event_for`
+        finds nothing (`persisted is None`), which is treated defensively as
+        "trust the dedupe," not raised — there is nothing to contradict."""
+        import scripts.fleet.core.done as done_module
+
+        log_path = _log(tmp_path)
+        monkeypatch.setattr(done_module, "append", lambda *args, **kwargs: None)
+
+        result = _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert result == AdvanceResult(status="deduped", node_id=_NODE, level="D1-merged")
+
+
+class TestN4PreconditionUnmetReachable:
+    """G5 fix #N4: `PreconditionUnmet` IS reachable via a forged direct-append
+    adjacent event filed under a DIFFERENT idempotency key than the call
+    under test — it does not collide with that call's own dedupe key, so
+    `precondition` actually runs against the fresh, under-the-lock log
+    state and can legitimately reject. Simulated here by forging the
+    adjacent event for real (so the precondition's own fresh read sees it)
+    and monkeypatching `_current_level` to return a stale `"D0-code"` on
+    only the pre-lock call, matching the race window the comment describes.
+    """
+
+    def test_precondition_unmet_is_reached_and_fails_safe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import scripts.fleet.core.done as done_module
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+
+        # A forged direct-append event, adjacent from D0-code, filed under a
+        # DIFFERENT idempotency key than this test's own D1-merged call —
+        # so it does not collide with append()'s dedupe check.
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "bbbbbbbb-0002-0002-0002-bbbbbbbbbbbb",
+                "idempotency_key": "forged-adjacent-key-not-the-real-one",
+                "ts": "2026-08-15T00:00:00.000000Z",
+                "type": "done_level_advanced",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"done_level": "D1-merged", "evidence": {}, "approver": None},
+            },
+        )
+
+        real_current_level = done_module._current_level
+        call_count = {"n": 0}
+
+        def _stale_then_real(events, node_id):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # The pre-lock read: stale, as if it ran before the forged
+                # event above was visible.
+                return "D0-code"
+            return real_current_level(events, node_id)
+
+        monkeypatch.setattr(done_module, "_current_level", _stale_then_real)
+
+        with pytest.raises(DonePolicyError):
+            _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        # Fails safe: nothing new was written by the rejected call.
+        events = read_all(log_path)
+        assert len(events) == 1
+        assert events[0].idempotency_key == "forged-adjacent-key-not-the-real-one"
+
+
+class TestEventFor:
+    """`event_for()` — the lookup helper `cli.py` uses to project a fragment."""
+
+    def test_returns_the_persisted_event_after_a_successful_advance(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        event = event_for(_NODE, "D1-merged", log_path)
+
+        assert event is not None
+        assert event.type == "done_level_advanced"
+        assert event.node_id == _NODE
+        assert event.payload["done_level"] == "D1-merged"
+
+    def test_returns_none_when_no_such_transition_was_ever_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log(tmp_path)
+
+        assert event_for(_NODE, "D1-merged", log_path) is None
+
+    def test_skips_non_matching_events_before_returning_none(self, tmp_path: Path) -> None:
+        # A recorded transition to a *different* level must not satisfy the
+        # lookup — exercises the loop's "keep scanning" branch, not just
+        # the "log is empty" shortcut above.
+        log_path = _log(tmp_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+
+        assert event_for(_NODE, "D2-test", log_path) is None
+
+    def test_returns_none_against_a_log_that_does_not_exist_yet(self, tmp_path: Path) -> None:
+        assert event_for(_NODE, "D1-merged", tmp_path / "nonexistent.jsonl") is None
+
+    def test_does_not_match_an_event_for_a_different_node_with_the_same_key(
+        self, tmp_path: Path
+    ) -> None:
+        """R3-3 (G5 round 3, LOW/cheap hardening): `event_for` matched only
+        `type` + `idempotency_key`, not `node_id`. The key already embeds
+        `node_id` (`done:<node_id>:<target_level>`), so a real collision
+        needs a forged event with a mismatched node_id inside an otherwise
+        matching key — but matching `node_id` explicitly is a one-line
+        belt-and-suspenders hardening, and `event_for` backs the N1
+        poisoning check, so a false-positive match here would defeat that
+        check's guarantee too."""
+        from scripts.fleet.core.events import append
+
+        log_path = _log(tmp_path)
+        other_node = "claude/repo/proj/session-OTHER"
+        forged = {
+            "schema_version": 1,
+            "event_id": "aaaaaaaa-0002-0002-0002-aaaaaaaaaaaa",
+            # Same idempotency key text as a `_NODE` D1-merged transition
+            # would use, but the event's own `node_id` field is different.
+            "idempotency_key": f"done:{_NODE}:D1-merged",
+            "ts": "2026-08-15T00:00:00.000000Z",
+            "type": "done_level_advanced",
+            "project_id": _PROJECT_ID,
+            "node_id": other_node,
+            "writer_role": _WRITER_ROLE,
+            "payload": {"done_level": "D1-merged", "evidence": {}, "approver": None},
+        }
+        append(log_path, forged)
+
+        assert event_for(_NODE, "D1-merged", log_path) is None
+
+
+class TestProjectionRoundTrip:
+    """`advance()` -> `core.projection.project_event` round-trips `done_level`.
+
+    `core/done.py` itself never imports `core/projection` (NFR-2); this
+    proves the wiring `cli.py`'s `fleet done advance` performs (look up the
+    event via `event_for`, then call `project_event`) actually produces a
+    fragment whose `done_level` matches what was just recorded — the same
+    "write -> project -> read" round-trip every other event type in this
+    package already gets (`core.projection`'s own module docstring: any
+    payload key matching `STATUS_FIELDS`, which includes `done_level`,
+    projects generically with no special-casing needed here).
+    """
+
+    def test_advance_then_project_event_updates_the_fragment(self, tmp_path: Path) -> None:
+        from scripts.fleet.core.projection import project_event
+        from scripts.fleet.core.store import read_fragment
+
+        log_path = _log(tmp_path)
+        sessions_dir = tmp_path / "sessions"
+
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        event = event_for(_NODE, "D1-merged", log_path)
+        assert event is not None
+        fragment = project_event(event, sessions_dir)
+
+        assert fragment.done_level == "D1-merged"
+        assert read_fragment(_NODE, sessions_dir).done_level == "D1-merged"
+
+    def test_rebuild_from_scratch_also_reflects_the_latest_done_level(
+        self, tmp_path: Path
+    ) -> None:
+        from scripts.fleet.core.projection import rebuild
+
+        log_path = _log(tmp_path)
+        sessions_dir = tmp_path / "sessions"
+
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        _advance(log_path, "D2-test", evidence={"deploy_id": "dep-1", "ci_run": "ci-1"})
+
+        fragments = rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+
+        assert fragments[_NODE].done_level == "D2-test"
+
+
+class TestCliDoneAdvanceSubcommand:
+    """`fleet done advance` wiring, end-to-end (PLAN.md Chunk 5's CLI step)."""
+
+    def _parser_args(self, workspace: Path, fleet_dir: Path, target: str, **extra: str):
+        from scripts.fleet.cli import build_parser
+
+        argv = [
+            "done",
+            "advance",
+            "--node-id",
+            _NODE,
+            "--target-level",
+            target,
+            "--project-id",
+            _PROJECT_ID,
+            "--slug",
+            "demo-slug",
+            "--workspace",
+            str(workspace),
+            "--writer-role",
+            _WRITER_ROLE,
+            "--fleet-dir",
+            str(fleet_dir),
+        ]
+        for flag, value in extra.items():
+            argv.extend([f"--{flag.replace('_', '-')}", value])
+        return build_parser().parse_args(argv)
+
+    def test_advance_via_cli_writes_event_and_projects_fragment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from scripts.fleet.core.store import read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 0
+        events = read_all(fleet_dir / "events.jsonl")
+        assert len(events) == 1
+        assert events[0].payload["done_level"] == "D1-merged"
+        fragment = read_fragment(_NODE, fleet_dir / "sessions")
+        assert fragment is not None
+        assert fragment.done_level == "D1-merged"
+
+    def test_rejected_advance_via_cli_returns_nonzero_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+
+        # Skip-level from the default D0-code — rejected regardless of the
+        # CLI plumbing, proving a policy rejection surfaces as a clean
+        # nonzero exit with nothing written, not an uncaught traceback.
+        args = self._parser_args(workspace, fleet_dir, "D2-test")
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_explicit_ceiling_flag_blocks_advance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace,
+            fleet_dir,
+            "D1-merged",
+            evidence_json=str(evidence_file),
+            ceiling="D0-code",
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_ceiling_resolved_from_profile_rung_label_blocks_advance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The D-ceiling, left unspecified on the CLI, comes from the
+        operator's `.superhuman/profile.yaml` via a `d_ceiling` rung label
+        (`cli._resolve_d_ceiling` — flagged as a design call in this
+        chunk's report, since the profile schema has no dedicated field for
+        it yet)."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text(
+            "version: 1\n"
+            "ladder:\n"
+            "  - name: work\n"
+            "    detect:\n"
+            "      default: true\n"
+            "    labels:\n"
+            "      d_ceiling: D0-code\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_invalid_configured_d_ceiling_fails_closed_not_silently_unrestricted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 fix #F5: a PRESENT but unrecognized `d_ceiling` profile value
+        (e.g. a typo like "D2_test", underscore instead of hyphen) must fail
+        CLOSED with a clean nonzero exit — not silently fall back to the
+        unrestricted D4-prod default, which would let an operator's typo
+        quietly disable the very ceiling they configured. Contrast with
+        `test_no_matching_profile_defaults_to_unrestricted_ceiling` below,
+        where NO d_ceiling is configured at all — that absent case still
+        legitimately defaults to D4-prod (documented behavior, unchanged)."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text(
+            "version: 1\n"
+            "ladder:\n"
+            "  - name: work\n"
+            "    detect:\n"
+            "      default: true\n"
+            "    labels:\n"
+            "      d_ceiling: D2_test\n",  # typo: underscore, not a hyphen
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_missing_evidence_json_file_returns_nonzero_not_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 fix #4: `json.loads(path.read_text())` used to run OUTSIDE the
+        try/except in `_cmd_done_advance`, so a missing/malformed evidence
+        file crashed with an uncaught exception instead of a clean nonzero
+        exit."""
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+
+        args = self._parser_args(
+            workspace,
+            fleet_dir,
+            "D1-merged",
+            evidence_json=str(tmp_path / "does-not-exist.json"),
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_evidence_json_top_level_array_returns_nonzero_not_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text("[1, 2]", encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_malformed_evidence_json_returns_nonzero_not_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text("{not valid json", encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_no_matching_profile_defaults_to_unrestricted_ceiling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 0  # D4-prod default ceiling never blocks D1-merged
+
+    def test_corrupt_profile_fails_closed_not_silently_unrestricted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G5 fix #N3: a profile that EXISTS but fails to load/parse (bad
+        YAML, here) must fail CLOSED with a clean nonzero exit — not
+        silently fall back to the unrestricted D4-prod default. Contrast
+        with `test_no_matching_profile_defaults_to_unrestricted_ceiling`
+        just above, where NO profile exists at all — that genuinely absent
+        case still legitimately defaults to D4-prod (unchanged)."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        # Malformed YAML — `load_profile` raises ProfileError on this.
+        profile_path.write_text("version: 1\nladder: [this is not valid: yaml:::\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_present_profile_with_unknown_top_level_key_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A second corrupt-input shape for the same G5 fix #N3: valid YAML,
+        but a schema violation `load_profile` also raises `ProfileError`
+        for (an unknown top-level key) — must fail closed the same way as
+        malformed YAML, not just the parse-error case."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text("version: 1\nbogus_key: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+        fleet_dir = tmp_path / "fleet"
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(json.dumps({"commit": "abc123"}), encoding="utf-8")
+
+        args = self._parser_args(
+            workspace, fleet_dir, "D1-merged", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 1
+        assert read_all(fleet_dir / "events.jsonl") == []
+
+    def test_resolve_d_ceiling_absent_profile_still_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct unit-level confirmation that the genuinely ABSENT case
+        (no profile file at all) is unaffected by G5 fix #N3 — it still
+        resolves the documented D4-prod default, not a raise."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        assert _resolve_d_ceiling(workspace) == "D4-prod"
+
+    def test_resolve_d_ceiling_raises_value_error_for_a_present_corrupt_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct unit-level confirmation of the G5 fix #N3 fail-closed path."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text("version: 1\nladder: [this is not valid: yaml:::\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+
+        with pytest.raises(ValueError):
+            _resolve_d_ceiling(workspace)
+
+    def test_resolve_d_ceiling_fails_closed_for_scalar_labels_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#R6-2 (PM-reproduced, BLOCKING): pre-fix, a profile with a scalar
+        `labels: D0-code` (not a mapping) loaded cleanly and produced a Rung
+        whose `labels` was the string `"D0-code"`; `_resolve_d_ceiling`'s
+        `_D_CEILING_LABEL_KEY not in resolution.stage.labels` then ran as a
+        substring test against that string rather than raising, and silently
+        returned the unrestricted `D4-prod` default — a promotion-control
+        fail-open reachable via a normal `fleet done advance`. Post-fix,
+        `load_profile` rejects the scalar `labels` at load time, so this
+        raises `ValueError` (fail closed) via the existing
+        `ProfileError`->`ValueError` path, exactly like the #N3/#F5 cases
+        above."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text(
+            "version: 1\n"
+            "ladder:\n"
+            "  - name: work\n"
+            "    detect:\n"
+            "      default: true\n"
+            "    labels: D0-code\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+
+        with pytest.raises(ValueError):
+            _resolve_d_ceiling(workspace)
+
+    @pytest.mark.parametrize("labels_yaml", ["[]", '""', "false", "0"])
+    def test_resolve_d_ceiling_fails_closed_for_falsy_labels_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels_yaml: str
+    ) -> None:
+        """#R7-1 (7th GPT-5 pass, PM-reproduced, BLOCKING): the #R6-2 fix only
+        caught a *truthy* non-mapping (`labels: D0-code`); a present-but-falsy
+        non-mapping (`labels: []`, `""`, `false`, `0`) was short-circuited to
+        `{}` by the `or {}` idiom BEFORE the mapping check, so it reached the
+        SAME unrestricted-`D4-prod` fail-open end to end via a normal
+        `fleet done advance`. Post-fix (`is None` vs present-falsy),
+        `_resolve_d_ceiling` fails closed (`ValueError`) on all of them."""
+        from scripts.fleet.cli import _resolve_d_ceiling
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        profile_path = tmp_path / "profile.yaml"
+        profile_path.write_text(
+            "version: 1\n"
+            "ladder:\n"
+            "  - name: work\n"
+            "    detect:\n"
+            "      default: true\n"
+            f"    labels: {labels_yaml}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile_path))
+
+        with pytest.raises(ValueError):
+            _resolve_d_ceiling(workspace)
+
+
+class TestCliDoneAdvanceRecoversFromCorruptCachedFragment:
+    """G5 round-5 (eliminate-the-class fix, #P4-1/#P4-2).
+
+    A 4th GPT-5 review round found two BLOCKING findings that converge to
+    one root cause: `project_event`'s corrupt-cached-fragment recovery was
+    incomplete. `#P4-1` — it only caught `ValidationError`/
+    `json.JSONDecodeError`; a non-UTF-8 or unreadable cached fragment still
+    crashed with an uncaught exception. `#P4-2` (the important one) — even
+    when it did catch the corruption, it silently reset every status field
+    the triggering event's own payload does not mention (a
+    `done_level_advanced` event carries only done/evidence/approver, so a
+    node's `block_state`/`review_state`/`adoption_state` would be quietly
+    reset to their registration defaults — silent state loss).
+
+    The fix: `project_event` no longer guesses. On a corrupt EXISTING
+    cached fragment it raises `core.errors.FragmentCorrupt` and leaves
+    recovery to the caller. `fleet done advance` (`cli._cmd_done_advance`)
+    now catches `FragmentCorrupt` and recovers via
+    `core.projection.rebuild()` — a full, correct, all-fields
+    reconstruction from the log, since the just-appended transition event
+    is already durably recorded there by the time projection runs.
+    """
+
+    def _parser_args(self, workspace: Path, fleet_dir: Path, target: str, **extra: str):
+        from scripts.fleet.cli import build_parser
+
+        argv = [
+            "done",
+            "advance",
+            "--node-id",
+            _NODE,
+            "--target-level",
+            target,
+            "--project-id",
+            _PROJECT_ID,
+            "--slug",
+            "demo-slug",
+            "--workspace",
+            str(workspace),
+            "--writer-role",
+            _WRITER_ROLE,
+            "--fleet-dir",
+            str(fleet_dir),
+        ]
+        for flag, value in extra.items():
+            argv.extend([f"--{flag.replace('_', '-')}", value])
+        return build_parser().parse_args(argv)
+
+    def _block_the_node(self, log_path: Path) -> None:
+        """Append a `block_changed` event directly, independent of `advance()` —
+        `block_state` is a separate status field `core/done.py` never
+        touches, so this is the only way to put the node in a non-default
+        blocked state for the test."""
+        from scripts.fleet.core.events import append
+
+        append(
+            log_path,
+            {
+                "schema_version": 1,
+                "event_id": "eid-block",
+                "idempotency_key": f"block:{_NODE}",
+                "ts": "2026-08-15T00:00:00.000000Z",
+                "type": "block_changed",
+                "project_id": _PROJECT_ID,
+                "node_id": _NODE,
+                "writer_role": _WRITER_ROLE,
+                "payload": {"block_state": "blocked"},
+            },
+        )
+
+    def _corrupt_the_cached_fragment(self, sessions_dir: Path, *, non_utf8: bool = False) -> None:
+        from scripts.fleet.core.store import fragment_path
+
+        path = fragment_path(_NODE, sessions_dir)
+        if non_utf8:
+            path.write_bytes(b"\xff\xfe garbage not utf-8")
+        else:
+            path.write_text('{"node_id": "portable/ws/proj/x", "lifecy', encoding="utf-8")
+
+    def test_p4_2_recovered_fragment_keeps_block_state_not_reset_to_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The important one. Pre-fix, this fails: the recovered fragment's
+        `block_state` comes back `"unblocked"` (the registration default)
+        instead of the log's true `"blocked"`, because the old
+        `_fresh_fragment(event)` fallback only applied the triggering
+        `done_level_advanced` event's own fields (done/evidence/approver)
+        and defaulted everything else — silently discarding the
+        `block_changed` event that came before it in the log."""
+        from scripts.fleet.core.projection import rebuild
+        from scripts.fleet.core.store import read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        log_path = fleet_dir / "events.jsonl"
+        sessions_dir = fleet_dir / "sessions"
+
+        # Block the node, then legitimately advance it to D1-merged —
+        # both facts must survive the recovery below.
+        self._block_the_node(log_path)
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+        assert read_fragment(_NODE, sessions_dir).block_state == "blocked"  # sanity
+
+        self._corrupt_the_cached_fragment(sessions_dir)
+
+        # A legitimate D2-test advance through the CLI — the caller path
+        # under test.
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(
+            json.dumps({"deploy_id": "dep-1", "ci_run": "ci-1"}), encoding="utf-8"
+        )
+        args = self._parser_args(
+            workspace, fleet_dir, "D2-test", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 0
+        recovered = read_fragment(_NODE, sessions_dir)
+        assert recovered is not None
+        assert recovered.done_level == "D2-test"
+        assert recovered.block_state == "blocked", (
+            "corrupt-cached-fragment recovery silently reset block_state to "
+            "its default instead of recovering it from the log (#P4-2)"
+        )
+
+        # Property: the recovered fragment agrees with a from-scratch
+        # rebuild() on every status field, not just the ones this test
+        # happens to assert on individually.
+        expected = rebuild(log_path, tmp_path / "sessions-expected", project_id=_PROJECT_ID)[
+            _NODE
+        ]
+        assert recovered.lifecycle == expected.lifecycle
+        assert recovered.block_state == expected.block_state
+        assert recovered.review_state == expected.review_state
+        assert recovered.adoption_state == expected.adoption_state
+        assert recovered.done_level == expected.done_level
+
+    def test_p4_1_non_utf8_cached_fragment_recovers_without_crashing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pre-fix, this fails: `read_fragment` does `path.read_text(encoding
+        ="utf-8")` before `json.loads` ever runs, so undecodable bytes raise
+        an uncaught `UnicodeDecodeError` — a case the old
+        `except (ValidationError, json.JSONDecodeError)` in `project_event`
+        never covered — crashing `fleet done advance` with a traceback
+        instead of a clean exit, even though the transition had already
+        been durably appended to the log."""
+        from scripts.fleet.core.projection import rebuild
+        from scripts.fleet.core.store import read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        log_path = fleet_dir / "events.jsonl"
+        sessions_dir = fleet_dir / "sessions"
+
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+        self._corrupt_the_cached_fragment(sessions_dir, non_utf8=True)
+
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(
+            json.dumps({"deploy_id": "dep-1", "ci_run": "ci-1"}), encoding="utf-8"
+        )
+        args = self._parser_args(
+            workspace, fleet_dir, "D2-test", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        assert exit_code == 0
+        recovered = read_fragment(_NODE, sessions_dir)
+        assert recovered is not None
+        assert recovered.done_level == "D2-test"
+
+    def test_p4_1_unreadable_cached_fragment_recovers_without_crashing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other #P4-1 shape: a fragment file that exists and is valid
+        UTF-8/JSON-shaped but cannot be `read_text()`'d at all (permissions,
+        a transient disk error) — `OSError`, not `UnicodeDecodeError` or
+        `json.JSONDecodeError`. Simulated here rather than via real file
+        permissions, since POSIX permission bits are not reliably enforced
+        for the file owner on every CI platform this suite runs on."""
+        import pathlib
+
+        from scripts.fleet.core.projection import rebuild
+        from scripts.fleet.core.store import fragment_path, read_fragment
+
+        monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        fleet_dir = tmp_path / "fleet"
+        log_path = fleet_dir / "events.jsonl"
+        sessions_dir = fleet_dir / "sessions"
+
+        _advance(log_path, "D1-merged", evidence={"commit": "abc123"})
+        rebuild(log_path, sessions_dir, project_id=_PROJECT_ID)
+
+        target_name = fragment_path(_NODE, sessions_dir).name
+        original_read_text = pathlib.Path.read_text
+
+        def _boom(self: pathlib.Path, *args: object, **kwargs: object) -> str:
+            if self.name == target_name:
+                raise PermissionError("simulated unreadable fragment file")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", _boom)
+
+        evidence_file = tmp_path / "evidence.json"
+        evidence_file.write_text(
+            json.dumps({"deploy_id": "dep-1", "ci_run": "ci-1"}), encoding="utf-8"
+        )
+        args = self._parser_args(
+            workspace, fleet_dir, "D2-test", evidence_json=str(evidence_file)
+        )
+        exit_code = args.func(args)
+
+        monkeypatch.undo()
+        assert exit_code == 0
+        recovered = read_fragment(_NODE, sessions_dir)
+        assert recovered is not None
+        assert recovered.done_level == "D2-test"
