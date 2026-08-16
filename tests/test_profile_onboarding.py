@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -1096,6 +1097,54 @@ def test_write_models_block_rejects_two_canonical_models_keys_still(tmp_path: Pa
     )
     with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
         sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_rejects_merge_key_populated_models(tmp_path: Path) -> None:
+    """Round 3.6 FIX Y: a `models` value injected via a top-level YAML merge key must fail loud.
+
+    A top-level `<<: *anchor` merges the anchored mapping's keys into the
+    document root, so `yaml.safe_load` populates `existing["models"]` even
+    though no `models` scalar key node exists anywhere in the document's own
+    top-level mapping. `yaml.compose` (used by
+    `_semantic_top_level_models_key_count`) does not resolve merge keys, so
+    it reports `semantic_count == 0`; the regex-only `model_key_count` is
+    also 0. Before the fix, `(0, 0)` was unconditionally treated as "nothing
+    to guard" and the splice appended a second, canonical `models:` block
+    beneath the merge-derived one instead of raising — silently producing a
+    profile whose on-disk text and `yaml.safe_load`-resolved value disagree.
+    Gating the guard on `raw_models` (computed first) closes this: whenever
+    the loader actually sees a `models` value, by any means, the guard
+    requires the canonical/semantic span to be exactly `(1, 1)`.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        "_defaults: &defaults\n"
+        "  models:\n"
+        "    most_capable:\n"
+        "      primary: vendor-a/big\n"
+        "      fallback: null\n"
+        "<<: *defaults\n"
+        "citation: internal policy doc\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    # Confirm the premise: yaml.safe_load really does populate `models` via
+    # the merge key, with no `models` key node visible to yaml.compose.
+    loaded = yaml.safe_load(original_text)
+    assert loaded.get("models") == {"most_capable": {"primary": "vendor-a/big", "fallback": None}}
+    composed = yaml.compose(original_text)
+    assert not any(
+        isinstance(key_node, yaml.ScalarNode) and key_node.value == "models"
+        for key_node, _value_node in composed.value
+    ), "premise check: no top-level 'models' key node should exist for compose to see"
+
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original_text, (
+        "a failed write must leave the profile byte-untouched"
+    )
 
 
 def test_write_models_block_accepts_normal_single_models_key(tmp_path: Path) -> None:

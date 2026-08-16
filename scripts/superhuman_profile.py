@@ -1951,9 +1951,31 @@ def write_models_block(
     # canonical key shadowed by a quoted one, or a quoted-only key with no
     # canonical span to splice into — means the targeted patch below cannot
     # safely edit this file, so fail loud rather than guess.
+    #
+    # `raw_models` is computed FIRST and the guard is gated on it (round 3.6
+    # FIX Y) because `yaml.safe_load` can populate a top-level `models` key
+    # WITHOUT any `models` scalar node existing at the document root at
+    # all — a top-level YAML merge key (`<<: *anchor`) merges a `models:`
+    # mapping from the anchored document into the root. `yaml.compose` (used
+    # by `_semantic_top_level_models_key_count`) does not resolve merge keys,
+    # so it sees no `models` key node and reports `semantic_count == 0`; the
+    # regex-only `model_key_count` also stays 0. The old guard treated
+    # `(0, 0)` as always safe and let the splice below APPEND a second
+    # `models:` block underneath the merge-derived one, which `yaml.safe_load`
+    # would then silently prefer over the merge (last-key-wins) — a second,
+    # invisible-to-the-regex `models:` block, not a fail-loud error. Gating on
+    # `raw_models` closes that: whenever the loader actually sees a `models`
+    # value (merge key or otherwise), the canonical/semantic span count must
+    # be exactly `(1, 1)` or this is not a file the targeted patch can safely
+    # edit.
+    raw_models = existing.get("models")
+    if raw_models is not None and not isinstance(raw_models, dict):
+        raise ProfileError(f"{profile_path}: 'models:' must be a mapping")
+
     model_key_count = sum(1 for line in text.splitlines(keepends=True) if _MODELS_KEY_RE.match(line))
     semantic_count = _semantic_top_level_models_key_count(text, profile_path)
-    if (semantic_count, model_key_count) not in {(0, 0), (1, 1)}:
+    required = (1, 1) if raw_models is not None else (0, 0)
+    if (semantic_count, model_key_count) != required:
         raise ProfileError(
             f"{profile_path}: expected exactly one top-level 'models:' key, found "
             f"{semantic_count} that YAML resolves to 'models' (any spelling) and "
@@ -1961,10 +1983,6 @@ def write_models_block(
             "targeted patch can edit — remove the duplicate, or rewrite the key as a plain, "
             "unquoted 'models:', before writing"
         )
-
-    raw_models = existing.get("models")
-    if raw_models is not None and not isinstance(raw_models, dict):
-        raise ProfileError(f"{profile_path}: 'models:' must be a mapping")
 
     models_block: dict[str, Any] = dict(raw_models or {})
     for tier in MODEL_TIERS:

@@ -102,9 +102,16 @@ consulted: [business-expert]
        which exists, is executable, and exits 49 with an advert instead of running Python. Mirror
        the execute-probe loop `scripts/autonomous-precondition.sh` already uses (see that script's
        "Prefer the bundle's venv interpreter…" comment): try each candidate by actually running it,
-       and take the first one that succeeds, before invoking the CLI:
+       and take the first one that succeeds, before invoking the CLI. **Resolve `PY` as a bash
+       ARRAY, not a plain string** — the `py -3` launcher is two words (`py` and `-3`), and a
+       single-word `PY="py -3"` string, later invoked double-quoted (`$PY` inside quotes), makes
+       bash search for one executable literally named `py -3` (with the space), which does not
+       exist and fails — even
+       though the unquoted probe (`$candidate -c ...`, which word-splits) reported it as working.
+       Every candidate, single-word ones included, is stored and invoked as an array so the probe
+       and the real invocation split the SAME way:
        ```
-       PY=""
+       PY=()
        for candidate in \
          ".venv/bin/python" \
          ".venv/Scripts/python.exe" \
@@ -113,19 +120,20 @@ consulted: [business-expert]
        do
          [ -n "$candidate" ] || continue
          if "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
-           PY="$candidate"
+           PY=("$candidate")
            break
          fi
        done
-       if [ -z "$PY" ] && command -v py >/dev/null 2>&1; then
-         for candidate in "py -3" "py"; do
-           if $candidate -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
-             PY="$candidate"
+       if [ "${#PY[@]}" -eq 0 ] && command -v py >/dev/null 2>&1; then
+         for cand in "py -3" "py"; do
+           IFS=' ' read -r -a cand_arr <<< "$cand"
+           if "${cand_arr[@]}" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+             PY=("${cand_arr[@]}")
              break
            fi
          done
        fi
-       if [ -z "$PY" ]; then
+       if [ "${#PY[@]}" -eq 0 ]; then
          echo "kickoff: no working python interpreter found (tried .venv, python3, python, py -3, py)." >&2
          exit 1
        fi
@@ -144,7 +152,7 @@ consulted: [business-expert]
        `--answers-json-file -`, with the profile path itself quoted too — no temp file, so there is
        nothing to clean up and nothing left behind in `/tmp` carrying operator model aliases:
        ```
-       "$PY" scripts/superhuman_profile.py models set --profile "<profile-path>" \
+       "${PY[@]}" scripts/superhuman_profile.py models set --profile "<profile-path>" \
          --answers-json-file - \
          --decline "<comma-separated declined/deferred tier names>" <<'JSON'
        {"most_capable": {"primary": "...", "fallback": "..."}, ...}

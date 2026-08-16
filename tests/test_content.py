@@ -7,6 +7,8 @@ and SKILL.md; verifies required H2 sections per role contract.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -1465,4 +1467,62 @@ def test_kickoff_models_set_invocation_is_injection_proof(skill_root: Path) -> N
     )
     assert '--profile "<profile-path>"' in text, (
         "kickoff recipe must quote the profile path passed to `models set`"
+    )
+    assert '"${PY[@]}" scripts/superhuman_profile.py models set' in text, (
+        "kickoff recipe must invoke the resolved interpreter as an unquoted-splice "
+        "array (\"${PY[@]}\"), not a quoted scalar (\"$PY\") — see "
+        "test_kickoff_interpreter_resolution_is_array_safe for why"
+    )
+
+
+def test_kickoff_interpreter_resolution_is_array_safe(skill_root: Path) -> None:
+    """Round 3.6 FIX X: the `py -3` interpreter candidate must survive invocation.
+
+    The probe loop resolves the interpreter by EXECUTING each candidate
+    (`$candidate -c ...`, unquoted, so a two-word candidate like `py -3`
+    word-splits correctly during the probe). Before the fix, the resolved
+    candidate was then stored as a plain string (`PY="$candidate"`) and the
+    real `models set` invocation used it QUOTED (`"$PY"`). For every
+    single-word candidate that round-trips fine, but for the `py -3` fallback
+    it makes bash search for one executable literally named `py -3` (with the
+    space) — which does not exist — even though the probe, one line earlier,
+    reported `py -3` as a working interpreter. The fix stores `PY` as a bash
+    ARRAY (`PY=(...)`) so a multi-word candidate is preserved as separate
+    words all the way through to the real invocation.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+
+    assert "PY=()" in text, "interpreter resolution must initialize PY as an array"
+    assert 'PY=("$candidate")' in text, (
+        "each single-word candidate must be stored into the PY array, not a plain string"
+    )
+    assert 'PY=("${cand_arr[@]}")' in text, (
+        "the py-launcher fallback (multi-word, e.g. 'py -3') must be split into an "
+        "array and stored via array expansion, preserving each word separately"
+    )
+    assert '"${cand_arr[@]}" -c "import sys; sys.exit(0)"' in text, (
+        "the py-launcher fallback candidate must itself be execute-probed as an "
+        "array, matching how it will actually be invoked"
+    )
+    assert 'PY=""' not in text, (
+        "PY must never be reset to a plain empty string — that regresses to the "
+        "quoted-scalar bug for multi-word candidates like 'py -3'"
+    )
+    assert '"$PY"' not in text, (
+        "PY must never be invoked as a quoted scalar — a multi-word candidate "
+        "('py -3') would be looked up as one executable name containing a space"
+    )
+
+    match = re.search(r"```\n(\s*PY=\(\).*?fi\n\s*```)", text, re.DOTALL)
+    assert match, "could not extract the interpreter-resolution fenced code block"
+    snippet = match.group(1).rsplit("```", 1)[0]
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available to parse-check the extracted snippet")
+    result = subprocess.run(
+        [bash, "-n", "-c", snippet], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"interpreter-resolution snippet failed `bash -n`: {result.stderr}"
     )
