@@ -21,8 +21,6 @@ import pytest
 from scripts.fleet.adapter.portable import PortableAdapter
 from scripts.fleet.cli import build_parser, register_session
 from scripts.fleet.core.edges import add_edge
-from scripts.fleet.core.events import read_all
-from scripts.fleet.core.store import iter_fragments
 from scripts.fleet import view
 
 _PROJECT_ID = "proj-view"
@@ -165,6 +163,30 @@ class TestFleetMdGenerator:
         assert superhuman_md.read_bytes() == before
 
 
+class TestEscapeMdCell:
+    """Chunk-6 review nit #1: a Markdown table cell must survive `|` AND a
+    bare newline — the schema does NOT guarantee status values / node-id
+    components are newline-free, so escaping is defensive, not decorative."""
+
+    def test_pipe_is_escaped(self) -> None:
+        assert view._escape_md_cell("a|b") == "a\\|b"
+
+    def test_newline_and_carriage_return_become_spaces(self) -> None:
+        # A raw newline would split one logical row across two Markdown lines
+        # and corrupt the table; it must be flattened to a space.
+        assert "\n" not in view._escape_md_cell("active\n| injected |")
+        assert "\r" not in view._escape_md_cell("a\rb")
+        assert view._escape_md_cell("a\nb") == "a b"
+        assert view._escape_md_cell("a\r\nb") == "a  b"
+
+    def test_pipe_and_newline_together(self) -> None:
+        out = view._escape_md_cell("x|y\nz")
+        assert "\n" not in out and "\\|" in out
+
+    def test_empty_becomes_em_dash_placeholder(self) -> None:
+        assert view._escape_md_cell("") == "—"
+
+
 class TestReadOnlyManifest:
     """FR-7/CC-7: neither `status` nor `gen-view` ever writes the manifest."""
 
@@ -172,9 +194,6 @@ class TestReadOnlyManifest:
         log_path = fleet_dir / "events.jsonl"
         sessions_dir = fleet_dir / "sessions"
         log_bytes = log_path.read_bytes() if log_path.is_file() else None
-        fragment_bytes = {
-            f.node_id: (fleet_dir / "sessions").exists() for f in iter_fragments(sessions_dir)
-        }
         # Byte-for-byte snapshot of every fragment file on disk, keyed by
         # filename (not node_id) so a rename/corruption would also show up.
         fragment_files = {}
@@ -231,7 +250,9 @@ class TestReadOnlyManifest:
         out = capsys.readouterr().out
 
         assert rc == 0
-        assert "sess-a" in out or _PROJECT_ID in out or out  # something was printed
+        # The registered session's local-id is a literal component of its
+        # node_id, so it must appear in the rendered status table.
+        assert "sess-a" in out
         after = self._manifest_snapshot(fleet_dir)
         assert after == before
 

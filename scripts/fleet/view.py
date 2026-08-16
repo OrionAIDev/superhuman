@@ -90,6 +90,12 @@ def collect_rows(
     fragments: list[Fragment] = list_sessions(sessions_dir, project_id=project_id)
     rows: list[dict[str, str]] = []
     for fragment in sorted(fragments, key=lambda f: f.node_id):
+        # Chunk-6 review nit #2 (accepted throwaway tradeoff): `edges_of`
+        # re-reads and re-resolves the whole log once per session, so this
+        # loop is O(N_sessions x M_events). Acceptable for a disposable
+        # viewer over a handful of sessions; if this ever grew, resolve the
+        # graph once and filter per node. Deliberately NOT optimized here —
+        # this viewer is superseded by the Phase-2 dashboard (PLAN.md Chunk 6).
         edges = edges_of(fragment.node_id, log_path)
         edges_text = "; ".join(
             _format_edge(fragment.node_id, e)
@@ -190,17 +196,24 @@ def _escape_md_cell(value: str) -> str:
 
     Args:
         value: the raw cell text (a node id, status value, or rendered edge
-            list — any of which may legally be empty, but never contain a
-            literal newline per this package's own schema, DP#5).
+            list). Any of these may legally be empty. They are NOT guaranteed
+            free of table-breaking characters: the manifest schema only
+            requires non-empty post-strip strings for status values
+            (`core.schema.validate_event`/`validate_fragment` do not reject an
+            embedded newline), and a `node_id` embeds caller-supplied
+            workspace / local-id components — so this escapes defensively
+            rather than relying on any upstream guarantee (Chunk-6 review
+            nit #1; an earlier docstring here wrongly claimed a DP#5 schema
+            guarantee that does not exist).
 
     Returns:
-        str: `value` with any `|` escaped (the one character that would
-        otherwise break table-cell parsing) and empty replaced by an
-        explicit em-dash placeholder so an empty edges column still renders
-        as a visible cell rather than a blank one that looks like a parse
-        error.
+        str: `value` with `|` escaped and any newline / carriage-return
+        replaced by a space (both `|` and a bare newline would otherwise
+        break Markdown table-cell parsing), and empty replaced by an explicit
+        em-dash placeholder so an empty edges column still renders as a
+        visible cell rather than a blank one that looks like a parse error.
     """
-    escaped = value.replace("|", "\\|")
+    escaped = value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
     return escaped if escaped else "—"
 
 
