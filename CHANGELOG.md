@@ -25,6 +25,17 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **Eight shell scripts shipped without the executable bit.** Every script under `scripts/` (plus
+  the installed `scripts/git-hooks/pre-commit`) carries a `#!/usr/bin/env bash` shebang and is
+  documented as invoked directly — `scripts/install-hooks.sh` and `scripts/release.sh` in
+  MIGRATION.md, the `autonomous-*` and `cleanup-project.sh` drivers in the phase recipes, README,
+  and smoke checklists — yet all were committed 100644. On POSIX they fail with "permission denied"
+  at the point of use, and git refuses to run a non-executable `pre-commit` hook. Invisible on
+  Windows twice over (git does not track the exec bit there, and `os.access(X_OK)` returns True for
+  any file), following the same fault that hid `hooks/session-start`. All eight are now 100755 via
+  `git update-index --chmod=+x`; `examples/promote.sh.example` is left 100644 as a copy-and-adapt
+  template. A parametrized `test_structure.py::test_shell_script_executable` now holds the line on
+  POSIX for each, mirroring `test_session_start_hook_executable`.
 - **The publication guard could not see 11 of the 163 tracked files.** `SCANNED_SUFFIXES` was an
   *allowlist* of twelve extensions, so every file type nobody thought to add was invisible —
   including `hooks/session-start` and `scripts/git-hooks/pre-commit`, both shipped executables and
