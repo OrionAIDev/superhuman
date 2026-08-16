@@ -32,7 +32,7 @@ from scripts.fleet.core.events import append as core_append  # noqa: E402
 from scripts.fleet.core.events import read_all  # noqa: E402
 from scripts.fleet.core.query import list_sessions  # noqa: E402
 from scripts.fleet.core.schema import Fragment  # noqa: E402
-from scripts.fleet.core.store import fragment_path, write_fragment  # noqa: E402
+from scripts.fleet.core.store import fragment_path, read_fragment, write_fragment  # noqa: E402
 from scripts.fleet import handoff  # noqa: E402
 from scripts.fleet.handoff import _resolve_handoff_expiry_seconds  # noqa: E402
 
@@ -1675,3 +1675,131 @@ class TestCorruptCachedFragmentRecovery:
 
         assert result.status == "launched"
         assert rebuild_calls["n"] == 1
+
+
+class TestStaleClosedFragmentIsNotACandidate:
+    """11th-round preflight, REALISTIC, PM-reproduced (R11-A).
+
+    `_open_awaiting_launch_rows` seeded its candidate pool from whatever
+    fragments said `lifecycle="awaiting-launch"`. Round 10 made the LOG
+    authoritative for *adding* a row back (a deleted fragment no longer
+    drops a live candidate), but not for *removing* one: a fragment left
+    stale by a crash in the window between a durable log append and the
+    later fragment projection (see `cancel()`/launch: append, then
+    project) still claims `awaiting-launch` while the log has already
+    closed that row. A real open handoff sharing its `(cwd, branch)` then
+    matched BOTH and returned a false `ambiguous`, refusing a launch that
+    should have succeeded.
+    """
+
+    def _stale_a_closed_row(
+        self, node_id: str, sessions_dir: Path, snapshot: object
+    ) -> None:
+        """Rewrite a closed row's fragment back to its pre-close snapshot."""
+        write_fragment(snapshot, sessions_dir)  # type: ignore[arg-type]
+
+    def test_cancelled_row_with_stale_fragment_does_not_cause_false_ambiguity(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        log_path, sessions_dir = fleet_dir
+        closed = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-closed")
+        snapshot = read_fragment(closed.node_id, sessions_dir)
+        handoff.cancel(
+            closed.node_id,
+            project_id="proj-abc123",
+            writer_role="Project Manager",
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+        )
+        # Crash-window simulation: the log says cancelled, the cache does not.
+        self._stale_a_closed_row(closed.node_id, sessions_dir, snapshot)
+        assert read_fragment(closed.node_id, sessions_dir).lifecycle == "awaiting-launch"
+
+        live = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-live")
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "launched"
+        assert result.node_id == live.node_id
+        assert result.match_method == "fuzzy"
+
+    def test_stale_closed_row_is_not_the_sole_match_either(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """The log-closed row must not be launchable on its own either."""
+        log_path, sessions_dir = fleet_dir
+        closed = _emit(git_repo, fleet_dir, branch="feature/y", handoff_id="hid-only")
+        snapshot = read_fragment(closed.node_id, sessions_dir)
+        handoff.cancel(
+            closed.node_id,
+            project_id="proj-abc123",
+            writer_role="Project Manager",
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+        )
+        self._stale_a_closed_row(closed.node_id, sessions_dir, snapshot)
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            cwd=git_repo,
+            branch="feature/y",
+        )
+
+        assert result.status == "not_found"
+        assert not [e for e in read_all(log_path) if e.type == "handoff_launched"]
+
+
+class TestHandoffCliRejectsBlankIdentityCleanly:
+    """11th-round preflight, PM-reproduced (R11-B).
+
+    `make_node_id` correctly rejects a blank component (round 10's
+    structural guard), but `handoff emit`/`cancel` caught only
+    `ValidationError`/`OwnershipError`, so that `ValueError` escaped as an
+    unhandled traceback instead of the `fleet ...: rejected: ...` line every
+    other subcommand renders. Realistic trigger: an unset shell variable
+    expanded into `--slug "$SLUG"`.
+    """
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_emit_with_blank_slug_is_a_clean_rejection_not_a_traceback(
+        self, git_repo: Path, tmp_path: Path, blank: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        prompt_file = tmp_path / "prompt.md"
+        prompt_file.write_text("Please continue.", encoding="utf-8")
+        fleet_dir = tmp_path / "fleet"
+
+        args = build_parser().parse_args(
+            [
+                "handoff",
+                "emit",
+                "--project-id",
+                "proj-abc123",
+                "--slug",
+                blank,
+                "--workspace",
+                str(git_repo),
+                "--prompt-file",
+                str(prompt_file),
+                "--writer-role",
+                "Project Manager",
+                "--fleet-dir",
+                str(fleet_dir),
+            ]
+        )
+
+        exit_code = args.func(args)
+
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "rejected" in captured.err
+        assert "Traceback" not in captured.err
+        # Nothing durable was written.
+        assert not (fleet_dir / "events.jsonl").exists()

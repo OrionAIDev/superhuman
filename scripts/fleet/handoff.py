@@ -457,10 +457,10 @@ def _open_awaiting_launch_rows(
         already_rebuilt = True
         current_fragments = iter_fragments(sessions_dir, skip_corrupt=True)
 
+    log_open_node_ids = _log_open_handoff_node_ids(log_path)
     open_node_ids = {f.node_id for f in current_fragments if f.lifecycle == "awaiting-launch"}
 
     if not already_rebuilt:
-        log_open_node_ids = _log_open_handoff_node_ids(log_path)
         missing = log_open_node_ids - open_node_ids
         if missing and any(read_fragment(nid, sessions_dir) is None for nid in missing):
             rebuild(log_path, sessions_dir)
@@ -468,6 +468,22 @@ def _open_awaiting_launch_rows(
             open_node_ids = {
                 f.node_id for f in current_fragments if f.lifecycle == "awaiting-launch"
             }
+
+    # 11th-round preflight, REALISTIC, PM-reproduced (R11-A): the log is
+    # authoritative in BOTH directions, not just for adding a row back. The
+    # recovery above re-adds a live row whose fragment went missing; this
+    # drops a row whose fragment still claims `awaiting-launch` while the log
+    # has already closed it (`handoff_launched`/`handoff_cancelled`/
+    # `handoff_expired`). That staleness is reachable without any forged
+    # event: `cancel()` and the launch path both append to the log durably
+    # *first* and project the fragment *after*, so a crash in that window
+    # leaves exactly this disagreement — and a real open handoff sharing the
+    # stale row's `(cwd, branch)` then matched both and returned a false
+    # `ambiguous`, refusing a launch that should have succeeded. Intersecting
+    # also subsumes the pre-existing "fragment with no matching
+    # `handoff_emitted` event is skipped rather than guessed at" rule below:
+    # such an orphan is absent from the log-derived set by construction.
+    open_node_ids &= log_open_node_ids
 
     if not open_node_ids:
         return []

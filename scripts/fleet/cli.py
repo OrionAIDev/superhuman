@@ -393,7 +393,10 @@ def _cmd_handoff_emit(args: argparse.Namespace) -> int:
     except LockTimeoutError as exc:
         print(f"fleet handoff emit: could not acquire the manifest lock: {exc}", file=sys.stderr)
         return 1
-    except (ValidationError, OwnershipError) as exc:
+    except (ValidationError, OwnershipError, ValueError) as exc:
+        # `ValueError` covers `make_node_id`'s blank-component guard (11th-round
+        # preflight, R11-B): a blank `--slug`/`--workspace` must render the same
+        # one-line rejection every other subcommand does, never a traceback.
         print(f"fleet handoff emit: rejected: {exc}", file=sys.stderr)
         return 1
 
@@ -432,7 +435,8 @@ def _cmd_handoff_cancel(args: argparse.Namespace) -> int:
     except LockTimeoutError as exc:
         print(f"fleet handoff cancel: could not acquire the manifest lock: {exc}", file=sys.stderr)
         return 1
-    except (ValidationError, OwnershipError) as exc:
+    except (ValidationError, OwnershipError, ValueError) as exc:
+        # See `_cmd_handoff_emit` (11th-round preflight, R11-B).
         print(f"fleet handoff cancel: rejected: {exc}", file=sys.stderr)
         return 1
 
