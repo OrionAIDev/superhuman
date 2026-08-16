@@ -988,6 +988,84 @@ def test_return_schema_doc_defines_six_fields_once(skill_root: Path) -> None:
     )
 
 
+# --- C-KICK: #139 elicitation sub-flow ---
+
+#: Vendor/model name fragments that must never appear as a pre-filled default
+#: answer in the kickoff elicitation (NFR-1, provider-neutral). A vendor name
+#: may still appear as a clearly-marked illustrative example.
+_VENDOR_NAME_FRAGMENTS = (
+    "anthropic", "claude", "opus", "sonnet", "haiku",
+    "openai", "chatgpt", "gpt-",
+    "google", "gemini",
+    "meta", "llama",
+    "mistral", "cohere", "grok", "xai",
+)
+
+#: Markers that make a vendor mention a clearly-marked example rather than a
+#: pre-filled default (TC-14).
+_EXAMPLE_MARKERS = ("e.g.", "for example", "such as")
+
+
+def test_kickoff_elicits_three_tiers_primary_fallback(skill_root: Path) -> None:
+    """Kickoff Step 3 elicits primary+fallback provider*model for all 3 tiers.
+
+    FR-8: the elicitation must cover all three capability tiers
+    (`most_capable`, `standard`, `cheap`) crossed with primary AND fallback,
+    invoke the deterministic writer (dev-principle #5 — elicit is inference,
+    write is code), and never pre-fill a concrete vendor/model as *the*
+    answer. A vendor name may appear only inside a clearly-marked example.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    for tier in ("most_capable", "standard", "cheap"):
+        assert tier in text, f"kickoff must name model tier '{tier}'"
+    assert "primary" in lower and "fallback" in lower, (
+        "kickoff elicitation must ask for both a primary and a fallback per tier"
+    )
+    assert "write_models_block" in text, (
+        "kickoff must hand elicited answers to superhuman_profile.write_models_block "
+        "(config generation is code, not LLM free-text — dev-principle #5)"
+    )
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line_lower = line.lower()
+        for vendor in _VENDOR_NAME_FRAGMENTS:
+            idx = line_lower.find(vendor)
+            if idx == -1:
+                continue
+            window = line_lower[max(0, idx - 80):idx]
+            assert any(m in window for m in _EXAMPLE_MARKERS), (
+                f"0-kickoff.md:{lineno}: vendor fragment {vendor!r} appears without a "
+                f"clearly-marked example prefix (e.g./for example/such as): {line.strip()!r}"
+            )
+
+
+def test_kickoff_decline_path_is_neutral_and_fails_safe(skill_root: Path) -> None:
+    """Decline/defer path is documented and names the neutral placeholder (FR-10).
+
+    Consistent with C-PROF's MODEL_PLACEHOLDER ("PROMPT_ME"): declining or
+    deferring the elicitation must never fall back to a vendor assumption, and
+    must not block kickoff from proceeding.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    assert "decline" in lower or "defer" in lower, (
+        "kickoff must document the decline/defer path for the model-tier elicitation"
+    )
+    assert "PROMPT_ME" in text, (
+        "kickoff must name the neutral placeholder (PROMPT_ME) written on decline/defer"
+    )
+    assert "fail" in lower and "safe" in lower, (
+        "kickoff must state that declining fails safe rather than assuming a vendor"
+    )
+    assert "first run" in lower or "first-run" in lower, (
+        "kickoff must scope the elicitation to first run / unset profile tiers, "
+        "not every project kickoff"
+    )
+
+
 def test_license_and_notice_present(skill_root: Path) -> None:
     """A publishable repo must carry both a LICENSE and upstream attribution."""
     licence = skill_root / "LICENSE"

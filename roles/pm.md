@@ -114,6 +114,13 @@ If user picks **remote**: follow the remote-sync flow in `conventions/git.md` (a
 
 If git is enabled (local or remote), also set **repo-local** (not global) git identity to avoid per-commit `-c user.email=…` overrides. Ask the user for `user.name` and `user.email` (one short question via `<dispatch:ask>`); apply with `git -C <project> config user.name "..."` and `git -C <project> config user.email "..."`. Never modify global git config.
 
+**Operator model-tier elicitation (#139).** Alongside the four preferences above, `phases/0-kickoff.md`
+Step 3 also elicits the operator's global `most_capable` / `standard` / `cheap` model tiers into
+`~/.superhuman/profile.yaml` — but only on first run (profile absent or still `PROMPT_ME`), never on
+every project's G1. See that recipe step for the full flow: provider-neutral question set, decline/defer
+fails safe to the neutral placeholder, and the write goes through `superhuman_profile.write_models_block`
+(code), never hand-authored YAML.
+
 **4. Parallelism (only present if parallelism is plausible for this project)**
 - **PM-decides** — PM autonomously dispatches parallel chunks when safe
 - **Gate-each** — PM proposes parallel; user approves each time (G9)

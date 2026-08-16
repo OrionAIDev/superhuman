@@ -80,6 +80,31 @@ consulted: [business-expert]
    - Update SUPERHUMAN.md front-matter with the chosen values, including `HITL-level:` and
      `Modifies-existing-code:`. Declare the latter explicitly as `yes` or `no` — leaving it blank
      is not an implicit `no`, and the gate treats an undeclared field as a gap.
+   - **Operator model-tier elicitation (#139, provider-neutral — first run only).** This configures
+     the *operator's* global `~/.superhuman/profile.yaml`, not this project, so it does not belong
+     on every kickoff. Before asking anything, check the resolved profile's `models:` block (see
+     `scripts/superhuman_profile.py`, tiers `most_capable` / `standard` / `cheap`):
+     - **If all three tiers already have a real (non-`PROMPT_ME`) `primary` entry, skip this
+       elicitation entirely** — nothing to ask, proceed to Present G0 (and G1) below.
+     - **Otherwise (profile/`models:` absent, or any tier still `PROMPT_ME`), elicit.** Ask via
+       `<dispatch:ask>`, per tier `most_capable`, `standard`, `cheap`, a **primary** AND a
+       **fallback** provider·model pair the operator wants used at that capability level. The
+       question set is provider-neutral: do not pre-fill or suggest any concrete vendor/model as
+       *the* answer. Illustrative examples are fine when clearly marked (e.g. "for example, a
+       vendor's flagship reasoning model for `most_capable`, a fast/cheap tier model for `cheap`")
+       — but the field itself must start blank, never defaulted to one provider.
+     - **Decline/defer.** The operator may decline or defer any or all tiers (e.g. "not sure yet",
+       "skip for now"). This must never block kickoff — proceed regardless of how many tiers were
+       answered.
+     - **Write, don't hand-write.** Elicitation is inference (this recipe); writing the profile is
+       code (dev-principle #5). Call the deterministic writer, never author the YAML by hand:
+       `scripts/superhuman_profile.py`'s `write_models_block(profile_path, answers, decline=...)`
+       (`<dispatch:bash>`). Pass the answered tiers in `answers` (`{tier: {"primary": ..., "fallback":
+       ...}}`); pass the declined/deferred tier names (or `decline=True` for all) in `decline=`. A
+       declined or deferred tier — and any tier the operator never reaches — is written by the
+       helper as the neutral `PROMPT_ME` placeholder, never a vendor assumption: this **fails safe**
+       and the operator is prompted again on a later first run once the profile still shows
+       placeholders.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On
