@@ -1,0 +1,48 @@
+# Fixture: hand-edited profile with header comments, a ladder, and an already
+# existing models: block. Regression anchor for write_models_block's targeted
+# patch (#139 G6) — everything in this file except the models: span must
+# survive a write byte-identical.
+#
+# Ordering is load-bearing twice over:
+#   1. Narrower rungs first — deny rungs precede allow rungs, so a path
+#      matching two equally-specific detectors resolves to the safer verdict.
+#   2. Allow rungs carry no `env_marker`. Markers outrank paths, so marking an
+#      allow rung would let a `dev` marker inside a production path override
+#      the production block.
+
+version: 1
+citation: "Release policy"
+
+ladder:
+  - name: production
+    kind: production
+    detect:
+      path_segments: [production, prod]
+      env_marker: [prod, production]
+    approvals:
+      act_unattended: never
+      promote_into: { all_of: [agent:security-reviewer, human] }
+    promote: { manual: true }
+
+  - name: dev
+    kind: development
+    detect:
+      path_segments: [dev, development]
+    approvals:
+      act_unattended: [self]
+      promote_into: none
+    tests: [unit, integration]
+
+  - name: workstation
+    kind: authoring
+    detect: { default: true }
+    approvals:
+      act_unattended: [self]
+      promote_into: none
+
+# The block below already has `standard` filled in from a prior run; a write
+# touching only `most_capable` must leave this tier and every comment alone.
+models:
+  standard:
+    primary: vendor-a/mid
+    fallback: vendor-b/mid

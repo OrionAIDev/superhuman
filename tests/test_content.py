@@ -7,6 +7,8 @@ and SKILL.md; verifies required H2 sections per role contract.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -512,6 +514,171 @@ def test_superhuman_template_has_autonomous_sections(skill_root: Path) -> None:
     assert "## Environment:" in text, "needed by the precondition guard's marker check"
 
 
+RESUME_PACKET_FIELDS = [
+    "objective",
+    "immutable constraints",
+    "decisions-locked",
+    "ruled-out paths",
+    "current state",
+    "next-3-actions",
+    "evidence-pointers",
+]
+
+
+def test_resume_packet_section_present_and_ordered(skill_root: Path) -> None:
+    """SUPERHUMAN.md template carries a Resume packet above the volatile logs (FR-1).
+
+    The Resume packet must appear before the append-only log sections (Decisions
+    log, Chunk log, Drift notes, ...) so a resuming session reads the kept-current
+    packet first. All seven labelled fields must be present.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    assert "## Resume packet" in text, "template missing '## Resume packet' section"
+
+    resume_pos = text.find("## Resume packet")
+    for heading in ("## Decisions log", "## Chunk log", "## Drift notes"):
+        heading_pos = text.find(heading)
+        assert heading_pos != -1, f"template missing '{heading}' section"
+        assert resume_pos < heading_pos, (
+            f"'## Resume packet' must appear before '{heading}'"
+        )
+
+    for field in RESUME_PACKET_FIELDS:
+        assert field in text, f"Resume packet missing field label '{field}'"
+
+
+def test_decisions_locked_distinct_from_decisions_log(skill_root: Path) -> None:
+    """'## Decisions locked' is a distinct H2 from the append-only '## Decisions log' (FR-6).
+
+    Both sections must coexist: Decisions locked records what may not be
+    reopened; Decisions log records what happened. One does not replace the
+    other.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    sections = _h2_sections(text)
+    assert "Decisions locked" in sections, "template missing '## Decisions locked' section"
+    assert "Decisions log" in sections, "template missing '## Decisions log' section"
+
+
+def test_orch_documents_read_packet_first_and_refresh(skill_root: Path) -> None:
+    """SKILL.md and/or pm.md document read-packet-first resume + refresh-at-each-gate (FR-2).
+
+    On resume, the PM must read the '## Resume packet' FIRST as the single
+    always-current entry point before reconstructing from the logs; the PM must
+    also refresh (keep current) the packet at every gate — not merely append to
+    it. This extends the existing resume path (HARD-GATE step 1 in SKILL.md); it
+    does not replace it.
+    """
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined = skill_text + "\n" + pm_text
+    lower = combined.lower()
+
+    assert "resume packet" in lower, (
+        "SKILL.md and/or pm.md must reference the '## Resume packet' section on resume"
+    )
+    assert "first" in lower and "resume packet" in lower, (
+        "must document reading the Resume packet FIRST on resume"
+    )
+    assert "refresh" in lower, (
+        "must document that the PM refreshes the Resume packet at every gate"
+    )
+    assert "kept-current" in lower or "kept current" in lower, (
+        "must state the packet is kept-current (not append-only) at every gate"
+    )
+
+
+def test_orch_documents_locked_not_relitigated(skill_root: Path) -> None:
+    """SKILL.md and/or pm.md document locked-decisions-not-relitigated semantics (FR-7).
+
+    A decision in '## Decisions locked' must not be relitigated/reopened on
+    resume; changing one requires an explicit surfaced action (a gate or a
+    drift entry) — never a silent edit. This is distinct from the append-only
+    '## Decisions log'.
+    """
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined = skill_text + "\n" + pm_text
+    lower = combined.lower()
+
+    assert "decisions locked" in lower, (
+        "SKILL.md and/or pm.md must reference the '## Decisions locked' section"
+    )
+    assert "relitigat" in lower or "reopen" in lower, (
+        "must document that locked decisions are not relitigated/reopened on resume"
+    )
+    assert "silent edit" in lower, (
+        "must document that changing a locked decision is never a silent edit"
+    )
+    assert "drift" in lower and ("gate" in lower), (
+        "must document that changing a locked decision requires a surfaced gate/drift event"
+    )
+
+
+def test_backward_compat_fixture_resumes_without_error(skill_root: Path) -> None:
+    """A pre-existing SUPERHUMAN.md lacking the new sections still resumes cleanly (NFR-2).
+
+    Resume is prose/PM-judgment — there is no resume script to call — so this is
+    a presence assertion on the documented rule plus a durable regression-anchor
+    fixture. The fixture has a structurally VALID '## Decisions log' (the
+    HARD-GATE validity check would pass) but lacks both '## Resume packet' and
+    '## Decisions locked'. SKILL.md and/or pm.md must explicitly document that
+    absence of the new sections is treated as empty, never as corruption.
+    """
+    fixture_path = skill_root / "tests" / "fixtures" / "superhuman_legacy_no_resume_packet.md"
+    assert fixture_path.is_file(), "missing backward-compat fixture superhuman_legacy_no_resume_packet.md"
+    fixture_text = fixture_path.read_text(encoding="utf-8")
+
+    # Fixture has a valid Decisions log per the HARD-GATE rule (G<digit> + 'user decision:').
+    assert "## Decisions log" in fixture_text
+    assert re.search(r"G\d+:.*user decision:", fixture_text), (
+        "fixture must contain a G<n> entry with a 'user decision:' field so the "
+        "HARD-GATE validity check would pass"
+    )
+    # Fixture genuinely lacks the two new sections.
+    assert "## Resume packet" not in fixture_text
+    assert "## Decisions locked" not in fixture_text
+
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined_lower = (skill_text + "\n" + pm_text).lower()
+
+    assert "not as corruption" in combined_lower or "never as corruption" in combined_lower, (
+        "SKILL.md and/or pm.md must state that absent new sections are treated as "
+        "empty, not corruption"
+    )
+    assert "treated as empty" in combined_lower, (
+        "SKILL.md and/or pm.md must explicitly say the absent sections are 'treated as empty'"
+    )
+
+
+def test_resume_absence_version_gate_documented(skill_root: Path) -> None:
+    """Post-review FIX 5: absence of Resume packet/Decisions locked is version-gated.
+
+    A missing '## Resume packet' or '## Decisions locked' means something
+    different depending on when the SUPERHUMAN.md was written. For a file
+    declaring `Superhuman-version:` 1.1.0 or later (the release that
+    introduced these sections — see CHANGELOG.md), absence is unexpected and
+    must be surfaced as stale state via G6, never silently treated as empty.
+    Only a pre-1.1.0 (or version-undeclared) file gets the legacy
+    fall-back-to-logs treatment covered by NFR-2
+    (`test_backward_compat_fixture_resumes_without_error`).
+    """
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    combined_lower = (skill_text + "\n" + pm_text).lower()
+
+    assert "1.1.0" in combined_lower, (
+        "must name the version (1.1.0) at which Resume packet / Decisions locked were introduced"
+    )
+    assert "superhuman-version" in combined_lower, (
+        "must key the gate off the declared Superhuman-version field"
+    )
+    assert "stale state" in combined_lower or "stale-state" in combined_lower, (
+        "a missing section on a >=1.1.0 file must be surfaced as stale state, not treated as empty"
+    )
+
+
 def test_skill_md_has_autonomous_progression_rule(skill_root: Path) -> None:
     """SKILL.md must include the autonomous-phase-progression cross-cutting rule.
 
@@ -599,6 +766,104 @@ def test_source_cited_convention_wired(skill_root: Path) -> None:
     dev = (skill_root / "roles" / "developer.md").read_text(encoding="utf-8")
     assert "conventions/source-cited.md" in dev, "developer.md frontmatter/body must reference source-cited"
     assert "UNVERIFIED" in conv.read_text(encoding="utf-8"), "source-cited must define the UNVERIFIED flag"
+
+
+# --- C-ROLES: canonical return-schema threaded through all roles ---
+
+CANONICAL_SCHEMA_ROLE_FILES = [
+    "pm.md", "architect.md", "developer.md", "qa.md",
+    "tester.md", "business-expert.md", "surrogate-user.md",
+]
+
+
+@pytest.mark.parametrize("role_file", CANONICAL_SCHEMA_ROLE_FILES)
+def test_role_references_canonical_schema(skill_root: Path, role_file: str) -> None:
+    """Every role points at the canonical six-field return schema by pointer (FR-4)."""
+    text = (skill_root / "roles" / role_file).read_text(encoding="utf-8")
+    assert "conventions/subagent-return-schema.md" in text, (
+        f"{role_file} must reference conventions/subagent-return-schema.md"
+    )
+
+
+def test_verdict_schemas_specialize_canonical_conclusion(skill_root: Path) -> None:
+    """Existing role verdict schemas are retained, reconciled as conclusion specializations (FR-4/A3).
+
+    A3: rip-and-replace is forbidden. QA/Tester keep approved|issues_found, Surrogate keeps
+    ACCEPT|ESCALATE, Architect keeps its option-table output — each must additionally say its
+    verdict rides in / specializes the canonical schema's `conclusion` field.
+    """
+    qa = (skill_root / "roles" / "qa.md").read_text(encoding="utf-8")
+    tester = (skill_root / "roles" / "tester.md").read_text(encoding="utf-8")
+    surrogate = (skill_root / "roles" / "surrogate-user.md").read_text(encoding="utf-8")
+    architect = (skill_root / "roles" / "architect.md").read_text(encoding="utf-8")
+
+    for name, text in (("qa.md", qa), ("tester.md", tester)):
+        assert "approved" in text and "issues_found" in text, (
+            f"{name} must retain its approved|issues_found verdict"
+        )
+        low = text.lower()
+        assert "conclusion" in low or "specializ" in low, (
+            f"{name} must note its verdict rides in / specializes the canonical conclusion field"
+        )
+
+    assert "ACCEPT" in surrogate and "ESCALATE" in surrogate, (
+        "surrogate-user.md must retain its ACCEPT|ESCALATE verdict"
+    )
+    low = surrogate.lower()
+    assert "conclusion" in low or "specializ" in low, (
+        "surrogate-user.md must note its verdict rides in / specializes the canonical conclusion field"
+    )
+
+    assert "option" in architect.lower() and "recommend" in architect.lower(), (
+        "architect.md must retain its option-table output"
+    )
+    low = architect.lower()
+    assert "conclusion" in low or "specializ" in low, (
+        "architect.md must note its recommendation rides in / specializes the canonical conclusion field"
+    )
+
+
+def test_surrogate_schema_exception_is_recorded(skill_root: Path) -> None:
+    """Surrogate's exemption from the six-field schema is an explicit, recorded carve-out — not a
+    silent or self-contradictory omission (FR-4; Phase 3.3 preflight finding, DECISIONS ADR-8).
+
+    The presence-only reconciliation test above missed a self-contradiction where surrogate-user.md
+    pointed to the canonical schema but then flatly said it did not use it. This guard asserts the
+    omission is framed as the one recorded exception, and that the schema doc itself documents it.
+    """
+    schema = (skill_root / "conventions" / "subagent-return-schema.md").read_text(encoding="utf-8").lower()
+    surrogate = (skill_root / "roles" / "surrogate-user.md").read_text(encoding="utf-8").lower()
+
+    assert "exception" in schema and "surrogate" in schema, (
+        "subagent-return-schema.md must document the surrogate as the one recorded exception"
+    )
+    assert "adr-8" in schema, "the schema doc must point at where the exception is recorded (DECISIONS.md ADR-8)"
+
+    assert "adr-8" in surrogate or "recorded exception" in surrogate, (
+        "surrogate-user.md must reference the recorded exception (ADR-8), not silently drop the schema"
+    )
+    assert "not a silent omission" in surrogate or "documented carve-out" in surrogate, (
+        "surrogate-user.md must frame its exemption as explicit/documented, per FR-4 ('no role silently omits')"
+    )
+
+
+def test_pm_output_discipline_names_canonical_schema(skill_root: Path) -> None:
+    """pm.md Output discipline names the canonical schema and keeps the prose-rejection rule (FR-5)."""
+    text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    sections = _h2_sections(text)
+    assert "Output discipline" in sections, "pm.md missing '## Output discipline' section"
+
+    start = text.find("## Output discipline")
+    end = text.find("\n## ", start + 1)
+    body = text[start:end if end != -1 else len(text)]
+
+    assert "conventions/subagent-return-schema.md" in body, (
+        "pm.md Output discipline must reference conventions/subagent-return-schema.md "
+        "as the accepted shape for subagent returns"
+    )
+    assert "free-form prose" in body.lower() or "free form prose" in body.lower(), (
+        "pm.md Output discipline must keep its existing free-form-prose rejection rule"
+    )
 
 
 def test_orchestration_patterns_catalog(skill_root: Path) -> None:
@@ -736,6 +1001,156 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
     )
 
 
+RETURN_SCHEMA_FIELDS = ["conclusion", "evidence", "commands", "assumptions", "risks", "next-action"]
+
+
+def test_return_schema_doc_defines_six_fields_once(skill_root: Path) -> None:
+    """conventions/subagent-return-schema.md is the sole full six-field definition (C-RS/FR-3).
+
+    The doc names conclusion -> evidence -> commands -> assumptions -> risks -> next-action,
+    in that order, exactly once. Every other shipped markdown file may point at the doc but
+    must not redefine the full ordered set itself — a light heuristic (all six labels present
+    as a defined list) is enough to catch a second competing definition.
+    """
+    conv = skill_root / "conventions" / "subagent-return-schema.md"
+    assert conv.is_file(), "conventions/subagent-return-schema.md missing"
+    text = conv.read_text(encoding="utf-8")
+
+    positions = [text.find(f"**{field}**") for field in RETURN_SCHEMA_FIELDS]
+    assert all(p != -1 for p in positions), (
+        f"subagent-return-schema.md must define all six fields as bold labels: {RETURN_SCHEMA_FIELDS}"
+    )
+    assert positions == sorted(positions), (
+        "the six fields must appear in canonical order: "
+        + " -> ".join(RETURN_SCHEMA_FIELDS)
+    )
+
+    offenders: list[str] = []
+    for path in skill_root.rglob("*.md"):
+        if path == conv:
+            continue
+        rel = path.relative_to(skill_root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        other_text = path.read_text(encoding="utf-8", errors="replace")
+        if all(f"**{field}**" in other_text for field in RETURN_SCHEMA_FIELDS):
+            offenders.append(str(rel))
+    assert not offenders, (
+        "these files redefine the full six-field schema instead of pointing at "
+        "conventions/subagent-return-schema.md:\n  " + "\n  ".join(offenders)
+    )
+
+
+# --- C-KICK: #139 elicitation sub-flow ---
+
+#: Vendor/model name fragments that must never appear as a pre-filled default
+#: answer in the kickoff elicitation (NFR-1, provider-neutral). A vendor name
+#: may still appear as a clearly-marked illustrative example.
+_VENDOR_NAME_FRAGMENTS = (
+    "anthropic", "claude", "opus", "sonnet", "haiku",
+    "openai", "chatgpt", "gpt-",
+    "google", "gemini",
+    "meta", "llama",
+    "mistral", "cohere", "grok", "xai",
+)
+
+#: Markers that make a vendor mention a clearly-marked example rather than a
+#: pre-filled default (TC-14).
+_EXAMPLE_MARKERS = ("e.g.", "for example", "such as")
+
+
+def test_kickoff_elicits_three_tiers_primary_fallback(skill_root: Path) -> None:
+    """Kickoff Step 3 elicits primary+fallback provider*model for all 3 tiers.
+
+    FR-8: the elicitation must cover all three capability tiers
+    (`most_capable`, `standard`, `cheap`) crossed with primary AND fallback,
+    invoke the deterministic writer (dev-principle #5 — elicit is inference,
+    write is code), and never pre-fill a concrete vendor/model as *the*
+    answer. A vendor name may appear only inside a clearly-marked example.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    for tier in ("most_capable", "standard", "cheap"):
+        assert tier in text, f"kickoff must name model tier '{tier}'"
+    assert "primary" in lower and "fallback" in lower, (
+        "kickoff elicitation must ask for both a primary and a fallback per tier"
+    )
+    assert "write_models_block" in text, (
+        "kickoff must hand elicited answers to superhuman_profile.write_models_block "
+        "(config generation is code, not LLM free-text — dev-principle #5)"
+    )
+
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line_lower = line.lower()
+        for vendor in _VENDOR_NAME_FRAGMENTS:
+            idx = line_lower.find(vendor)
+            if idx == -1:
+                continue
+            window = line_lower[max(0, idx - 80):idx]
+            assert any(m in window for m in _EXAMPLE_MARKERS), (
+                f"0-kickoff.md:{lineno}: vendor fragment {vendor!r} appears without a "
+                f"clearly-marked example prefix (e.g./for example/such as): {line.strip()!r}"
+            )
+
+
+def test_kickoff_decline_path_is_neutral_and_fails_safe(skill_root: Path) -> None:
+    """Decline/defer path is documented and names the neutral placeholder (FR-10).
+
+    Consistent with C-PROF's MODEL_PLACEHOLDER ("PROMPT_ME"): declining or
+    deferring the elicitation must never fall back to a vendor assumption, and
+    must not block kickoff from proceeding.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+    lower = text.lower()
+
+    assert "decline" in lower or "defer" in lower, (
+        "kickoff must document the decline/defer path for the model-tier elicitation"
+    )
+    assert "PROMPT_ME" in text, (
+        "kickoff must name the neutral placeholder (PROMPT_ME) written on decline/defer"
+    )
+    assert "fail" in lower and "safe" in lower, (
+        "kickoff must state that declining fails safe rather than assuming a vendor"
+    )
+    assert "first run" in lower or "first-run" in lower, (
+        "kickoff must scope the elicitation to first run / unset profile tiers, "
+        "not every project kickoff"
+    )
+
+
+# --- C-DISP: dispatch-time placeholder warning ---
+
+
+def test_dispatch_documents_placeholder_warning(skill_root: Path) -> None:
+    """Dispatch-time placeholder warning is documented in both consumers (OQ-5, FR-10).
+
+    When a dispatch's resolved tier is still C-PROF's unfilled placeholder
+    (``PROMPT_ME``) in the operator's profile, the PM must emit a one-line
+    warning naming the tier and PROCEED — never pause or gate. The rule must
+    be documented in both `adaptation/dispatch.md` (the model-selection
+    mechanism) and `roles/pm.md` (the PM behavior), and explicitly
+    characterized as Type B (notification, non-blocking).
+    """
+    dispatch_text = (skill_root / "adaptation" / "dispatch.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+
+    for label, text in (("adaptation/dispatch.md", dispatch_text), ("roles/pm.md", pm_text)):
+        lower = text.lower()
+        assert "prompt_me" in lower, (
+            f"{label} must name the unfilled placeholder (PROMPT_ME) the warning keys on"
+        )
+        assert "one-line" in lower or "one line" in lower, (
+            f"{label} must characterize the warning as one-line"
+        )
+        assert "type b" in lower or "type-b" in lower, (
+            f"{label} must characterize the warning as Type B (notification, no pause)"
+        )
+        assert "non-blocking" in lower or "does not" in lower or "not a gate" in lower, (
+            f"{label} must state the warning does not pause or gate autonomous progression"
+        )
+
+
 def test_license_and_notice_present(skill_root: Path) -> None:
     """A publishable repo must carry both a LICENSE and upstream attribution."""
     licence = skill_root / "LICENSE"
@@ -746,4 +1161,368 @@ def test_license_and_notice_present(skill_root: Path) -> None:
     text = notice.read_text(encoding="utf-8")
     assert "MIT" in text and "references/" in text, (
         "NOTICE.md must state the upstream licence and which paths it covers"
+    )
+
+
+# --- C-HYG: hygiene — VERSION/CHANGELOG/README (TC-17, TC-18) ---
+
+#: Narrower than `_VENDOR_NAME_FRAGMENTS` above. TC-14 scans a single
+#: provider-neutral elicitation doc where even bare "google"/"meta"/"claude"
+#: are suspect. TC-17 scans a much wider file set that legitimately says
+#: "Claude Code" (the harness name), "Google-style docstrings" (a style
+#: name), "meta-gate" (an unrelated PM concept), etc. — bare substrings there
+#: would be false positives unrelated to NFR-1. TC-17 instead matches actual
+#: model-FAMILY product names, word-bounded: that is what the immutable
+#: constraint (LD-1) cares about — a concrete *model* baked in as a default,
+#: not the word "Google" or "Claude" appearing inside an unrelated compound
+#: term or the harness's own product name.
+_TC17_VENDOR_TOKENS = (
+    "opus", "sonnet", "haiku",
+    r"gpt-\d", "chatgpt",
+    "gemini",
+    "llama",
+    "mistral", "cohere", "grok", "xai",
+)
+_TC17_TOKEN_RE = re.compile(r"\b(?:" + "|".join(_TC17_VENDOR_TOKENS) + r")\b", re.IGNORECASE)
+
+#: In addition to `_EXAMPLE_MARKERS` (e.g./for example/such as), these phrases
+#: also clearly mark a vendor mention as illustrative/non-default across the
+#: wider TC-17 file set: "go stale" (SKILL.md/README.md's staleness warning
+#: about concrete model names), "or your harness's alias" (the profile.yaml
+#: snippet's own inline comment marking the value as swappable), "legacy"
+#: (the ADR-6 bare-string-normalization docstring example), and
+#: "forbidden"/"do not reliably honor" (the PM-tier denylist, which names
+#: what NOT to use — structurally the opposite of a default).
+_TC17_EXTRA_MARKERS = (
+    "go stale",
+    "or your harness's alias",
+    "legacy",
+    "forbidden",
+    "do not reliably honor",
+    "does not reliably honor",
+    "not reliably honor",
+)
+
+#: The full set of files this project (#165 fidelity + #139 provider setup)
+#: created or modified, per PLAN.md's "File structure" list — minus
+#: `adaptation/dispatch.md`, excluded for the reason below, and
+#: `CHANGELOG.md`, handled separately because only its NEW section is this
+#: project's content (see the docstring).
+_TC17_FILES = (
+    "conventions/subagent-return-schema.md",
+    "templates/SUPERHUMAN.md.tpl",
+    "roles/pm.md",
+    "roles/architect.md",
+    "roles/developer.md",
+    "roles/qa.md",
+    "roles/tester.md",
+    "roles/business-expert.md",
+    "roles/surrogate-user.md",
+    "SKILL.md",
+    "scripts/superhuman_profile.py",
+    "phases/0-kickoff.md",
+    "VERSION",
+    "README.md",
+)
+
+#: README.md subsections documenting Claude-Code-native config, pre-existing
+#: since v0.1.3. Claude Code is single-provider (`adaptation/dispatch.md`:
+#: "no fallback path") and its `settings.json` literally only accepts
+#: Anthropic's own shortnames — this is harness-specific MECHANISM, not a
+#: superhuman-authored default, exactly analogous to the
+#: `adaptation/dispatch.md` tier table this test excludes outright below.
+#: Relitigating either is out of this project's charter.
+_TC17_EXCLUDED_README_HEADINGS = ("### Claude Code config",)
+
+
+def _tc17_strip_excluded_readme_sections(text: str) -> str:
+    """Remove `_TC17_EXCLUDED_README_HEADINGS` subsections from README.md text.
+
+    Args:
+        text: full README.md contents.
+
+    Returns:
+        The text with each excluded H3 subsection (heading through the line
+        before the next H2/H3 heading) removed.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.rstrip("\n").rstrip("\r")
+        if stripped in _TC17_EXCLUDED_README_HEADINGS:
+            skipping = True
+            continue
+        if skipping and (stripped.startswith("## ") or stripped.startswith("### ")):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def _tc17_scan(label: str, text: str, offenders: list[str]) -> None:
+    """Scan text for unmarked vendor/model defaults and record offenders.
+
+    Args:
+        label: file label used in the offender message.
+        text: text to scan.
+        offenders: list to append `"label:pos: detail"` strings to.
+    """
+    for match in _TC17_TOKEN_RE.finditer(text):
+        start, end = match.span()
+        window = text[max(0, start - 160):end + 80].lower()
+        if any(m in window for m in _EXAMPLE_MARKERS) or any(
+            m in window for m in _TC17_EXTRA_MARKERS
+        ):
+            continue
+        lineno = text.count("\n", 0, start) + 1
+        offenders.append(f"{label}:{lineno}: {match.group(0)!r} not clearly marked as an example")
+
+
+def test_no_vendor_baked_as_default_in_changed_files(skill_root: Path) -> None:
+    """No concrete vendor/model name is baked in as an unmarked default (TC-17).
+
+    Full-project grep gate over every file this project (#165 fidelity +
+    #139 provider setup) created or modified, per NFR-1/FR-10/LD-1: a vendor
+    name may appear only as a clearly-marked illustrative example, never as
+    *the* default/required value in a template, generator, or elicitation.
+
+    Scoping decisions (documented per the chunk-8 spec's explicit ask):
+
+    - `adaptation/dispatch.md` is excluded entirely. Its "Tier -> model
+      (Claude Code -- Anthropic only)" table is pre-existing, single-harness
+      MECHANISM -- the concrete model aliases Claude Code itself resolves a
+      tier to on a single-provider harness with "no fallback path" -- not a
+      superhuman-authored default. `test_dispatch_documents_placeholder_warning`
+      (TC-16) already covers the content this project actually added to that
+      file (the placeholder-warning rule). Re-scanning the harness table
+      would relitigate a pre-existing, intentionally concrete, per-harness
+      fact table outside this project's charter.
+    - `CHANGELOG.md` is checked only for the section this chunk adds (the
+      dated `## [1.1.0]` release notes), not the file's full history.
+      Historical dated entries document real past incidents (e.g. a prior
+      smoke run's model choice) and are factual record, not a default this
+      project proposes -- scanning them would produce noise unrelated to
+      NFR-1.
+    - Within `README.md`, the pre-existing (v0.1.3) "### Claude Code config"
+      subsection is excluded for the same single-harness-mechanism reason as
+      `adaptation/dispatch.md` (see `_TC17_EXCLUDED_README_HEADINGS`).
+    - The vendor-token list (`_TC17_VENDOR_TOKENS`) is deliberately narrower
+      than `_VENDOR_NAME_FRAGMENTS` (used by TC-14 against a single
+      provider-neutral doc): bare "claude"/"google"/"meta" collide with this
+      wider file set's legitimate, unrelated prose ("Claude Code" the
+      harness, "Google-style docstrings", "meta-gate") and would be noise,
+      not signal, for the "baked in as a default" question this test asks.
+    """
+    offenders: list[str] = []
+
+    for rel in _TC17_FILES:
+        path = skill_root / rel
+        assert path.is_file(), f"expected shipped file missing: {rel}"
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if rel == "README.md":
+            text = _tc17_strip_excluded_readme_sections(text)
+        _tc17_scan(rel, text, offenders)
+
+    changelog_text = (skill_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"^## \[1\.1\.0\].*?(?=^## \[|\Z)", changelog_text, re.MULTILINE | re.DOTALL
+    )
+    assert section, "CHANGELOG.md must have a ## [1.1.0] release section (see TC-18)"
+    _tc17_scan("CHANGELOG.md (## [1.1.0] section)", section.group(0), offenders)
+
+    detail = "\n  ".join(offenders)
+    assert not offenders, (
+        "vendor/model name(s) appear as an unmarked default in shipped files:\n  " + detail
+    )
+
+
+def test_changelog_entry_names_165_and_139(skill_root: Path) -> None:
+    """VERSION is bumped and CHANGELOG.md documents both #165 and #139 (TC-18, NFR-4/NFR-6).
+
+    VERSION must be a valid semver strictly greater than the pre-project
+    value (1.0.3); CHANGELOG.md must carry a dated release entry naming both
+    roadmap items; and that entry must carry no AI/model/provider
+    attribution — role names only, per NFR-6.
+    """
+    version_text = (skill_root / "VERSION").read_text(encoding="utf-8").strip()
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-[A-Za-z0-9.-]+)?", version_text)
+    assert match, f"Invalid semver: {version_text}"
+    assert tuple(int(g) for g in match.groups()[:3]) > (1, 0, 3), (
+        f"VERSION must be bumped above the pre-project value 1.0.3, got {version_text}"
+    )
+
+    changelog_text = (skill_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"^## \[" + re.escape(version_text) + r"\].*? - \d{4}-\d{2}-\d{2}.*?(?=^## \[|\Z)",
+        changelog_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert section, (
+        f"CHANGELOG.md must have a dated '## [{version_text}] - YYYY-MM-DD' entry matching VERSION"
+    )
+    entry = section.group(0)
+
+    assert "#165" in entry, "CHANGELOG entry must name #165 (fidelity)"
+    assert "#139" in entry, "CHANGELOG entry must name #139 (provider setup)"
+
+    entry_lower = entry.lower()
+    for forbidden in (
+        "anthropic", "claude", "openai", "chatgpt", "gpt-", "gemini",
+        "generated with", "generated by", "co-authored-by", "written by claude",
+    ):
+        assert forbidden not in entry_lower, (
+            f"CHANGELOG #165/#139 entry must carry no AI/model/provider attribution "
+            f"(NFR-6) — found {forbidden!r}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# review round 3 (#139/#165 post-review hardening)
+# --------------------------------------------------------------------------- #
+
+
+def test_hard_gate_resume_bullet_is_version_gated(skill_root: Path) -> None:
+    """FIX A: the HARD-GATE step-1 VALID→resume bullet must not treat absence of
+    '## Resume packet'/'## Decisions locked' as unconditionally empty.
+
+    Before this fix, SKILL.md's HARD-GATE bullet said absence of these sections
+    is "never as corruption" with no qualification, which contradicts the later
+    '## Resume packet and locked decisions' section (and roles/pm.md), which
+    correctly version-gates that rule on `Superhuman-version:` — below 1.1.0 (or
+    undeclared) is legitimate legacy-empty, but 1.1.0+ treats a missing section
+    as stale state surfaced via G6. A PM following the HARD-GATE bullet literally
+    would silently swallow a corrupted >=1.1.0 file's missing sections — the
+    exact fidelity hole the version-gate exists to close. The HARD-GATE bullet
+    itself must reference the version gate (1.1.0) near the resume-absence
+    wording, not just the later section that most readers skim past.
+    """
+    text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+
+    hard_gate_match = re.search(r"<HARD-GATE>.*?</HARD-GATE>", text, re.DOTALL)
+    assert hard_gate_match, "SKILL.md missing the HARD-GATE block"
+    hard_gate_text = hard_gate_match.group(0)
+
+    bullet_match = re.search(
+        r"VALID → resume\..*?(?=\n\s*- INVALID)", hard_gate_text, re.DOTALL
+    )
+    assert bullet_match, "HARD-GATE missing the 'VALID → resume' bullet"
+    bullet_text = bullet_match.group(0)
+
+    assert "Resume packet" in bullet_text and "absent" in bullet_text, (
+        "HARD-GATE VALID→resume bullet must still address absence of "
+        "'## Resume packet'/'## Decisions locked'"
+    )
+    assert "1.1.0" in bullet_text, (
+        "HARD-GATE VALID→resume bullet must version-gate the resume-absence "
+        "handling on 'Superhuman-version: 1.1.0' (not treat absence as "
+        "unconditionally empty) — see the fuller "
+        "'## Resume packet and locked decisions' section"
+    )
+    assert "G6" in bullet_text, (
+        "HARD-GATE VALID→resume bullet must say a missing section at >=1.1.0 "
+        "is surfaced via G6, not silently treated as empty"
+    )
+    # The VALIDITY condition itself (unchanged by this fix) must still be intact
+    # elsewhere in the HARD-GATE block.
+    assert "## Decisions log" in hard_gate_text and "user decision:" in hard_gate_text
+
+
+def test_kickoff_models_set_invocation_is_injection_proof(skill_root: Path) -> None:
+    """FIX B (round 3) / FIX 3 (round 3.5): phases/0-kickoff.md Step 3 must not
+    interpolate elicited/operator JSON directly into a single-quoted shell
+    word, and must not leak a temp file.
+
+    Before FIX B, the recipe built `--answers-json '{...}'` with the JSON
+    payload written straight into a quoted shell argument — an operator alias
+    or elicited answer containing a quote, `$`, or backtick would break the
+    quoting or inject shell (dev-principle #5: no LLM-marshalled data into a
+    shell word). FIX B routed the JSON through a quoted heredoc into a
+    `mktemp` temp file passed via `--answers-json-file <path>` — injection-proof,
+    but the temp file was never removed, leaking operator model aliases into
+    `/tmp` on every kickoff. Round 3.5 drops the temp file entirely: the CLI
+    already supports `--answers-json-file -` (read JSON from stdin), so the
+    quoted heredoc is piped directly into the command's stdin — no
+    intermediate file, no cleanup/trap needed, and the profile path is still
+    quoted.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+
+    assert "--answers-json '" not in text, (
+        "kickoff recipe must not interpolate --answers-json with an inline "
+        "single-quoted JSON literal containing operator/elicited values"
+    )
+    assert "--answers-json-file -" in text, (
+        "kickoff recipe must use --answers-json-file - to read the answers JSON "
+        "from stdin, avoiding both shell interpolation and a temp file"
+    )
+    assert "mktemp" not in text, (
+        "kickoff recipe must not write the answers JSON to a mktemp temp file — "
+        "that file is never cleaned up and leaks operator model aliases into /tmp; "
+        "use --answers-json-file - (stdin) instead"
+    )
+    assert "<<'JSON'" in text or "<<'EOF'" in text, (
+        "kickoff recipe must pipe the answers JSON via a QUOTED heredoc "
+        "(quoted delimiter disables shell expansion inside it)"
+    )
+    assert '--profile "<profile-path>"' in text, (
+        "kickoff recipe must quote the profile path passed to `models set`"
+    )
+    assert '"${PY[@]}" scripts/superhuman_profile.py models set' in text, (
+        "kickoff recipe must invoke the resolved interpreter as an unquoted-splice "
+        "array (\"${PY[@]}\"), not a quoted scalar (\"$PY\") — see "
+        "test_kickoff_interpreter_resolution_is_array_safe for why"
+    )
+
+
+def test_kickoff_interpreter_resolution_is_array_safe(skill_root: Path) -> None:
+    """Round 3.6 FIX X: the `py -3` interpreter candidate must survive invocation.
+
+    The probe loop resolves the interpreter by EXECUTING each candidate
+    (`$candidate -c ...`, unquoted, so a two-word candidate like `py -3`
+    word-splits correctly during the probe). Before the fix, the resolved
+    candidate was then stored as a plain string (`PY="$candidate"`) and the
+    real `models set` invocation used it QUOTED (`"$PY"`). For every
+    single-word candidate that round-trips fine, but for the `py -3` fallback
+    it makes bash search for one executable literally named `py -3` (with the
+    space) — which does not exist — even though the probe, one line earlier,
+    reported `py -3` as a working interpreter. The fix stores `PY` as a bash
+    ARRAY (`PY=(...)`) so a multi-word candidate is preserved as separate
+    words all the way through to the real invocation.
+    """
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+
+    assert "PY=()" in text, "interpreter resolution must initialize PY as an array"
+    assert 'PY=("$candidate")' in text, (
+        "each single-word candidate must be stored into the PY array, not a plain string"
+    )
+    assert 'PY=("${cand_arr[@]}")' in text, (
+        "the py-launcher fallback (multi-word, e.g. 'py -3') must be split into an "
+        "array and stored via array expansion, preserving each word separately"
+    )
+    assert '"${cand_arr[@]}" -c "import sys; sys.exit(0)"' in text, (
+        "the py-launcher fallback candidate must itself be execute-probed as an "
+        "array, matching how it will actually be invoked"
+    )
+    assert 'PY=""' not in text, (
+        "PY must never be reset to a plain empty string — that regresses to the "
+        "quoted-scalar bug for multi-word candidates like 'py -3'"
+    )
+    assert '"$PY"' not in text, (
+        "PY must never be invoked as a quoted scalar — a multi-word candidate "
+        "('py -3') would be looked up as one executable name containing a space"
+    )
+
+    match = re.search(r"```\n(\s*PY=\(\).*?fi\n\s*```)", text, re.DOTALL)
+    assert match, "could not extract the interpreter-resolution fenced code block"
+    snippet = match.group(1).rsplit("```", 1)[0]
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available to parse-check the extracted snippet")
+    result = subprocess.run(
+        [bash, "-n", "-c", snippet], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"interpreter-resolution snippet failed `bash -n`: {result.stderr}"
     )

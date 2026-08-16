@@ -57,6 +57,27 @@
 - README.md (PM)
 - SUPERHUMAN.md (PM, automatic)
 
+## Resume packet
+<!-- KEPT-CURRENT, not append-only: the PM refreshes this block at every gate so a fresh
+     session can resume from a single read. It REFERENCES the volatile sections below rather
+     than restating them — decisions-locked, current state, and evidence-pointers are pointers,
+     not copies, so this block cannot drift out of sync with the sections it points at. Only
+     objective, immutable constraints, ruled-out paths, and next-3-actions are restated here
+     because they have no other home. -->
+- **objective:** {{one_or_two_sentence_objective}}
+- **immutable constraints:** {{constraints_that_cannot_change_this_project}}
+- **decisions-locked:** see `## Decisions locked` below
+- **ruled-out paths:** {{approaches_considered_and_rejected_with_one_line_why}}
+- **current state:** see `## Chunk log` (latest row) and the last gate entry in `## Decisions log`
+- **next-3-actions:** {{action_1}}; {{action_2}}; {{action_3}}
+- **evidence-pointers:** {{file_paths_that_ground_the_above}}
+
+## Decisions locked
+<!-- Distinct from the append-only Decisions log below. This section records what may NOT be
+     reopened (as opposed to Decisions log, which records what happened, append-only). Format:
+     [<ISO timestamp>] G<n>: <locked item, one line>. Changing a locked item requires a
+     surfaced gate/drift event — never a silent edit. -->
+
 ## Decisions log
 <!-- Append-only. Format: [<ISO timestamp>] G<n>: <one-line summary>; user decision: <decision> -->
 

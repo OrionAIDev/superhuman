@@ -8,18 +8,23 @@ safe ladder into a permissive one without any visible symptom.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import superhuman_profile as sp  # noqa: E402
 
 RESOLVER = Path(__file__).resolve().parents[1] / "scripts" / "superhuman_profile.py"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+PRESETS = Path(__file__).resolve().parents[1] / "profiles" / "presets"
 
 
 @pytest.fixture()
@@ -295,3 +300,964 @@ def test_doctor_surfaces_the_agent_only_approver_warning(tmp_path: Path) -> None
     proc = _cli(["doctor", str(tmp_path / "prod")], extra={"SUPERHUMAN_PROFILE": str(dest)})
     assert proc.returncode == 0, "a warning must not block"
     assert "WARNING" in proc.stdout and "no 'human' approver" in proc.stdout
+
+
+# --------------------------------------------------------------------------- #
+# models: generator (C-PROF, #139) — TC-10, TC-11, TC-12
+# --------------------------------------------------------------------------- #
+
+
+def test_models_generator_round_trips_primary_fallback(tmp_path: Path) -> None:
+    """The writer populates all 3 tiers, and the loader reads them back as mappings.
+
+    TC-10 (FR-9): a deterministic writer, not LLM free-text, produces the
+    ``models:`` block; the loader must resolve every tier to a ``{primary,
+    fallback}`` mapping with no further edits.
+    """
+    dest = tmp_path / "profile.yaml"
+    answers = {
+        "most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"},
+        "standard": {"primary": "vendor-a/mid", "fallback": "vendor-b/mid"},
+        "cheap": {"primary": "vendor-a/small", "fallback": "vendor-b/small"},
+    }
+    sp.write_models_block(dest, answers)
+
+    profile = sp.load_profile(dest)
+    for tier, entry in answers.items():
+        resolved = profile.models[tier]
+        assert set(resolved) == {"primary", "fallback"}
+        assert resolved["primary"] == entry["primary"]
+        assert resolved["fallback"] == entry["fallback"]
+
+
+def test_models_generator_creates_file_and_section_if_absent(tmp_path: Path) -> None:
+    """FR-9: the writer creates the profile file (and `models:` section) when absent."""
+    dest = tmp_path / "nested" / "profile.yaml"
+    assert not dest.exists()
+
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    assert dest.is_file()
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["most_capable"]["fallback"] is None
+    # Untouched tiers still fail safe rather than silently vanishing.
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_generator_merges_into_existing_profile(tmp_path: Path) -> None:
+    """Re-running the writer for one tier must not clobber a prior tier's answer."""
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+    sp.write_models_block(dest, {"standard": {"primary": "vendor-a/mid", "fallback": None}})
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+
+
+def test_models_generator_rejects_unknown_tier(tmp_path: Path) -> None:
+    """An unrecognised tier name fails loud rather than being written silently."""
+    dest = tmp_path / "profile.yaml"
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, {"fastest": {"primary": "vendor-a/big", "fallback": None}})
+    assert not dest.exists()
+
+
+def test_legacy_bare_string_models_normalizes_to_mapping(tmp_path: Path) -> None:
+    """TC-11: a legacy bare-string `models:` tier loads and normalizes to a mapping.
+
+    ADR-6: back-compat is via parse-time normalization, so every downstream
+    reader of ``Profile.models`` sees the mapping form regardless of which
+    shape the file was written in.
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\nmodels:\n  most_capable: opus\n",  # test data only, per LD-1
+        encoding="utf-8",
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"] == {"primary": "opus", "fallback": None}
+
+
+def test_mapping_form_models_pass_through_unchanged(tmp_path: Path) -> None:
+    """An already-mapping `models:` tier is taken as-is (ADR-6)."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\nmodels:\n  standard:\n    primary: vendor-a/mid\n"
+        "    fallback: vendor-b/mid\n",
+        encoding="utf-8",
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["standard"] == {"primary": "vendor-a/mid", "fallback": "vendor-b/mid"}
+
+
+def test_malformed_models_entry_fails_loud(tmp_path: Path) -> None:
+    """An unrecognised `models:` tier shape raises rather than silently coercing."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\nmodels:\n  most_capable: 123\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.load_profile(dest)
+
+
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        "models:\n  most_capable: ''\n",  # empty bare-string alias
+        "models:\n  most_capable:\n    primary: opus\n    extra: nope\n",  # unknown key
+        "models:\n  most_capable:\n    fallback: sonnet\n",  # missing primary
+        "models:\n  most_capable:\n    primary: opus\n    fallback: 7\n",  # non-string fallback
+        "models: nope\n",  # models: itself not a mapping
+    ],
+)
+def test_normalize_models_rejects_every_bad_shape(tmp_path: Path, models_yaml: str) -> None:
+    """Each malformed `models:` shape fails loud with a `ProfileError`, not silently."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\n" + models_yaml, encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.load_profile(dest)
+
+
+def test_models_absent_normalizes_to_empty_mapping(tmp_path: Path) -> None:
+    """No `models:` key at all is not an error — it normalizes to `{}` (FR-9)."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\n", encoding="utf-8")
+    assert sp.load_profile(dest).models == {}
+
+
+def test_decline_path_writes_neutral_placeholder(tmp_path: Path) -> None:
+    """TC-12 (FR-10): declining every tier writes a neutral, vendor-free placeholder.
+
+    The written file must still load (fail safe, not fail loud), and the
+    placeholder token must never be a concrete vendor/model name.
+    """
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, decline=True)
+
+    profile = sp.load_profile(dest)
+    for tier in sp.MODEL_TIERS:
+        entry = profile.models[tier]
+        assert entry["primary"] == sp.MODEL_PLACEHOLDER
+        assert entry["fallback"] == sp.MODEL_PLACEHOLDER
+        # Vendor-free: the placeholder is a self-documenting token, not a model alias.
+        for vendor_hint in ("opus", "sonnet", "haiku", "gpt", "gemini", "claude"):
+            assert vendor_hint not in entry["primary"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# models: generator — targeted-patch comment preservation (#139 G6)
+# --------------------------------------------------------------------------- #
+
+
+def test_write_models_block_preserves_comments_and_ladder(tmp_path: Path) -> None:
+    """Writing one tier must not disturb any other byte of a hand-edited file.
+
+    G6 follow-up: the writer used to `yaml.safe_load`/`yaml.safe_dump` the
+    whole document, silently stripping every comment. It must now splice only
+    the `models:` span, leaving header comments, `ladder:`, and an
+    already-answered tier verbatim.
+    """
+    original = (FIXTURES / "profile_with_comments_and_models.yaml").read_text(encoding="utf-8")
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    match = re.search(r"(?m)^models:", original)
+    assert match, "fixture must contain a top-level models: key"
+    header = original[: match.start()]
+
+    assert new_text.startswith(header), "everything before the models: key must be byte-identical"
+    for line in header.splitlines():
+        if line.strip().startswith("#"):
+            assert line in new_text, f"comment line lost: {line!r}"
+
+    profile = sp.load_profile(dest)
+    assert [r.name for r in profile.ladder] == ["production", "dev", "workstation"]
+    assert profile.models["most_capable"] == {"primary": "vendor-a/big", "fallback": None}
+    assert profile.models["standard"] == {"primary": "vendor-a/mid", "fallback": "vendor-b/mid"}
+    assert profile.models["cheap"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_inserts_without_disturbing_commented_profile(tmp_path: Path) -> None:
+    """A commented profile with a ladder but no models: block gets one appended.
+
+    Uses the shipped `classic-3tier` preset, which has ~40 lines of
+    load-bearing comments and no `models:` key at all.
+    """
+    original = (PRESETS / "classic-3tier.yaml").read_text(encoding="utf-8")
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, decline=True)
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert new_text.startswith(original), "existing content must survive untouched, with only an append"
+    assert "models:" in new_text
+
+    profile = sp.load_profile(dest)
+    assert [r.name for r in profile.ladder] == [
+        "production", "staging", "dev", "workstation-trunk", "workstation",
+    ]
+    for tier in sp.MODEL_TIERS:
+        assert profile.models[tier]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_second_write_patches_only_its_own_span(tmp_path: Path) -> None:
+    """Two successive writer calls must not compound damage to the models: span."""
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+    text_after_first = dest.read_text(encoding="utf-8")
+    assert text_after_first.count("models:") == 1, "must not duplicate the models: key"
+
+    sp.write_models_block(dest, {"standard": {"primary": "vendor-a/mid", "fallback": None}})
+    text_after_second = dest.read_text(encoding="utf-8")
+    assert text_after_second.count("models:") == 1
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+
+
+def test_write_models_block_span_ends_at_next_top_level_key(tmp_path: Path) -> None:
+    """A `models:` block followed by another top-level key stops there, not at EOF."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable: opus\n"  # legacy bare-string form, test data only per LD-1
+        "conventions:\n"
+        "  - python\n",
+        encoding="utf-8",
+    )
+
+    sp.write_models_block(dest, {"standard": {"primary": "vendor-a/mid", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert "conventions:\n  - python" in new_text, "content after the models: span must survive"
+    profile = sp.load_profile(dest)
+    assert profile.conventions == ("python",)
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+
+
+def test_write_models_block_insert_adds_newline_when_file_lacks_one(tmp_path: Path) -> None:
+    """A file with no trailing newline still gets a clean, valid append."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\nladder:\n  - name: a\n    detect: {default: true}", encoding="utf-8")
+
+    sp.write_models_block(dest, decline=True)
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert "detect: {default: true}\n\nmodels:" in new_text
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_rejects_invalid_existing_yaml(tmp_path: Path) -> None:
+    """A pre-existing file that is not valid YAML fails loud, not silently."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("models: [unterminated\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_rejects_non_mapping_top_level(tmp_path: Path) -> None:
+    """A pre-existing file whose top level is not a mapping fails loud."""
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+
+# --------------------------------------------------------------------------- #
+# models: generator — preflight-review follow-up fixes
+# --------------------------------------------------------------------------- #
+
+
+def test_write_models_block_leaves_original_untouched_on_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKER 1 (preflight): a bad splice must never overwrite a valid file.
+
+    The prior implementation wrote the patched text to `profile_path` and
+    validated afterwards — so an invalid splice result had already clobbered
+    a previously-valid profile.yaml by the time the error was raised, with no
+    way back. The writer must validate a temp file FIRST and only atomically
+    swap it in on success, leaving the original byte-untouched on failure.
+    """
+    dest = tmp_path / "profile.yaml"
+    original = "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+    dest.write_text(original, encoding="utf-8")
+
+    # Force the splice to produce YAML that cannot possibly parse.
+    monkeypatch.setattr(sp, "_splice_models_block", lambda text, rendered: "models: [unterminated\n")
+
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original, "original file must be byte-untouched on failure"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "profile.yaml"]
+    assert not leftovers, f"no temp file should be left behind: {leftovers}"
+
+
+def test_write_models_block_cleans_up_temp_on_non_profileerror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preflight correctness residual: cleanup must cover EVERY failure path.
+
+    The earlier writer only unlinked the temp sibling inside `except
+    ProfileError`. A non-ProfileError raised while validating the temp file
+    (an OSError, say) escaped that handler and leaked a stray `.tmp` beside
+    the profile — cosmetic (the original stays intact) but untidy. The write/
+    validate/replace is now wrapped so the temp is removed on any failure.
+    """
+    dest = tmp_path / "profile.yaml"
+    original = "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n"
+    dest.write_text(original, encoding="utf-8")
+
+    # Force a non-ProfileError from validation, after the temp file exists.
+    def _boom(_path: Path) -> None:
+        raise OSError("disk gremlins during validation")
+
+    monkeypatch.setattr(sp, "load_profile", _boom)
+
+    with pytest.raises(OSError, match="disk gremlins"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original, "original file must be byte-untouched on failure"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "profile.yaml"]
+    assert not leftovers, f"no temp file should be left behind on a non-ProfileError: {leftovers}"
+
+
+def test_write_models_block_preserves_column0_comment_after_models_block(tmp_path: Path) -> None:
+    """BLOCKER 2 (preflight): a column-0 comment after `models:` belongs to what follows it.
+
+    `_find_models_span` used to treat a column-0 comment line as still part of
+    the `models:` mapping, so it got silently absorbed into the replaced span
+    and deleted — exactly the comment loss the targeted-patch rewrite was
+    supposed to prevent. The comment must survive, because it documents the
+    NEXT key (`ladder:`), not `models:`.
+    """
+    original = (
+        "version: 1\n"
+        "models:\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n"
+        "\n"  # a blank line still belongs to the models: span, not the comment after it
+        "# Ladder rules: narrower rungs first, deny before allow.\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+    )
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert "# Ladder rules: narrower rungs first, deny before allow.\n" in new_text
+    assert new_text.endswith(
+        "# Ladder rules: narrower rungs first, deny before allow.\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+    ), "everything from the comment onward must survive verbatim, in order"
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid"
+    assert [r.name for r in profile.ladder] == ["a"]
+
+
+def test_write_models_block_rejects_non_mapping_models_value(tmp_path: Path) -> None:
+    """SHOULD-FIX 3 (preflight): a scalar `models:` value fails loud with ProfileError.
+
+    `dict(existing.get("models") or {})` raises an uncaught `ValueError` on a
+    non-mapping `models:` value (e.g. a bare scalar) instead of the
+    `ProfileError` the docstring promises every other malformed-input path.
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text("version: 1\nmodels: opus\n", encoding="utf-8")
+    with pytest.raises(sp.ProfileError):
+        sp.write_models_block(dest, decline=True)
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_write_models_block_preserves_original_line_endings(tmp_path: Path, eol: bytes) -> None:
+    """SHOULD-FIX 4 (preflight): untouched lines keep their exact original EOL bytes.
+
+    `Path.read_text`/`write_text` do universal-newline translation on read and
+    OS-default translation on write, so an untouched region's line endings
+    could silently flip (e.g. a CRLF-authored file collapsing to LF, or — on
+    this Windows dev box — an LF-authored file being rewritten to CRLF) even
+    though no content changed. That breaks the "byte-identical untouched
+    region" contract the targeted-patch rewrite exists to guarantee.
+    """
+    lines = [
+        b"version: 1", b'citation: "Release policy"', b"",
+        b"ladder:", b"  - name: a", b"    detect: {default: true}",
+    ]
+    original_bytes = eol.join(lines) + eol
+    dest = tmp_path / "profile.yaml"
+    dest.write_bytes(original_bytes)
+
+    sp.write_models_block(dest, decline=True)
+
+    new_bytes = dest.read_bytes()
+    assert new_bytes.startswith(original_bytes), (
+        f"untouched region must keep its original {eol!r} line endings byte-for-byte"
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_decline_specific_tiers_only(tmp_path: Path) -> None:
+    """A per-tier decline list leaves answered tiers alone."""
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(
+        dest,
+        answers={"most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"}},
+        decline=["standard", "cheap"],
+    )
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+    assert profile.models["cheap"]["fallback"] == sp.MODEL_PLACEHOLDER
+
+
+# --------------------------------------------------------------------------- #
+# models: generator — post-review hardening (#139/#165)
+# --------------------------------------------------------------------------- #
+
+
+def test_models_set_cli_round_trip(tmp_path: Path) -> None:
+    """FIX 1: `models set` is the CLI seam for write_models_block.
+
+    Before this subcommand existed, phases/0-kickoff.md Step 3 told the PM to
+    call `write_models_block(...)` via `<dispatch:bash>` — impossible for a
+    bare Python function. The CLI round-trip must actually persist to
+    profile.yaml.
+    """
+    dest = tmp_path / "profile.yaml"
+    answers_json = (
+        '{"most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"}}'
+    )
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json", answers_json,
+         "--decline", "standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+    assert "wrote" in result.stdout
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"] == {
+        "primary": "vendor-a/big", "fallback": "vendor-b/big"
+    }
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+    assert profile.models["cheap"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_set_cli_decline_all_writes_placeholder(tmp_path: Path) -> None:
+    """FIX 1: the decline path (no answers at all) still round-trips through the CLI."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(
+        ["models", "set", "--profile", str(dest),
+         "--decline", "most_capable,standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+    profile = sp.load_profile(dest)
+    for tier in sp.MODEL_TIERS:
+        assert profile.models[tier]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_set_cli_bad_json_exits_nonzero_with_profileerror(tmp_path: Path) -> None:
+    """FIX 1: malformed --answers-json fails loud with a ProfileError message, not a traceback."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(["models", "set", "--profile", str(dest), "--answers-json", "{not json"])
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "superhuman-profile:" in result.stderr
+    assert "invalid JSON" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_unknown_tier_exits_nonzero(tmp_path: Path) -> None:
+    """FIX 1: an unrecognized tier name in --answers-json fails loud, not silently."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(
+        ["models", "set", "--profile", str(dest),
+         "--answers-json", '{"fastest": {"primary": "vendor-a/big"}}']
+    )
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "unknown tier" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_answers_json_file_round_trip(tmp_path: Path) -> None:
+    """FIX B (round 3): --answers-json-file reads the same JSON shape from a file.
+
+    Injection-proofing: an operator alias or an elicited answer can contain a
+    quote, `$`, or a backtick — interpolating it into a single-quoted
+    `--answers-json '...'` shell word can break the quoting or inject shell
+    (dev-principle #5). Routing the same JSON through a file sidesteps shell
+    interpolation entirely; the resulting profile must be identical to the
+    inline-JSON path.
+    """
+    dest = tmp_path / "profile.yaml"
+    answers_file = tmp_path / "answers.json"
+    answers_file.write_text(
+        '{"most_capable": {"primary": "vendor-a/big", "fallback": "vendor-b/big"}}',
+        encoding="utf-8",
+    )
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json-file", str(answers_file),
+         "--decline", "standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+    assert "wrote" in result.stdout
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"] == {
+        "primary": "vendor-a/big", "fallback": "vendor-b/big"
+    }
+    assert profile.models["standard"]["primary"] == sp.MODEL_PLACEHOLDER
+    assert profile.models["cheap"]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_models_set_cli_answers_json_file_stdin(tmp_path: Path) -> None:
+    """FIX B (round 3): '-' reads the answers JSON from stdin instead of a file."""
+    dest = tmp_path / "profile.yaml"
+    answers_json = '{"most_capable": {"primary": "vendor-a/big"}}'
+    result = subprocess.run(
+        [sys.executable, str(RESOLVER), "models", "set", "--profile", str(dest),
+         "--answers-json-file", "-", "--decline", "standard,cheap"],
+        input=answers_json, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+
+
+def test_models_set_cli_both_answers_sources_exits_nonzero(tmp_path: Path) -> None:
+    """FIX B (round 3): --answers-json and --answers-json-file are mutually exclusive."""
+    dest = tmp_path / "profile.yaml"
+    answers_file = tmp_path / "answers.json"
+    answers_file.write_text("{}", encoding="utf-8")
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json", "{}",
+         "--answers-json-file", str(answers_file)]
+    )
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "mutually exclusive" in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_neither_answers_source_nor_decline_exits_nonzero(tmp_path: Path) -> None:
+    """FIX B (round 3): with no JSON source and no --decline, there is nothing to do."""
+    dest = tmp_path / "profile.yaml"
+    result = _cli(["models", "set", "--profile", str(dest)])
+    assert result.returncode != 0
+    assert result.returncode == sp.EXIT_USAGE
+    assert "nothing to do" in result.stderr
+    assert not dest.exists()
+
+
+def test_models_set_cli_answers_json_file_survives_shell_metacharacters(tmp_path: Path) -> None:
+    """FIX B (round 3): a value containing a quote/`$` survives untouched via the file path.
+
+    This is the regression anchor for the injection concern: a single-quoted
+    `--answers-json '{...}'` shell word would break (or worse, expand `$…`) on
+    an alias like `vendor's-$pecial/model`. Going through a file means the
+    value never passes through shell word-splitting/expansion at all.
+    """
+    dest = tmp_path / "profile.yaml"
+    tricky_alias = "vendor's-$pecial/model`with-backtick"
+    answers_file = tmp_path / "answers.json"
+    answers_file.write_text(
+        json.dumps({"most_capable": {"primary": tricky_alias}}), encoding="utf-8"
+    )
+    result = _cli(
+        ["models", "set", "--profile", str(dest), "--answers-json-file", str(answers_file),
+         "--decline", "standard,cheap"]
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == tricky_alias
+
+
+def test_write_models_block_updates_symlink_target_not_the_link(tmp_path: Path) -> None:
+    """FIX 2: a symlinked profile.yaml must have its REAL target updated, not be
+    clobbered by `os.replace` swapping in a plain file where the symlink was.
+
+    `os.replace(tmp, profile_path)` on a symlinked `profile_path` replaces the
+    symlink's own directory entry, destroying the link and leaving the real
+    (shared) target stale. The writer must resolve through the symlink and
+    swap the RESOLVED target instead.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    real_profile = real / "profile.yaml"
+    real_profile.write_text(
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n", encoding="utf-8"
+    )
+    link = tmp_path / "profile.yaml"
+    try:
+        link.symlink_to(real_profile)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable in this environment: {exc}")
+
+    sp.write_models_block(link, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    assert link.is_symlink(), "the symlink itself must survive the write, not be replaced by a plain file"
+    assert os.path.realpath(str(link)) == os.path.realpath(str(real_profile)), (
+        "the symlink must still point at the same real file"
+    )
+    assert "models:" in real_profile.read_text(encoding="utf-8"), (
+        "the REAL target must carry the new models: block"
+    )
+    profile = sp.load_profile(link)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+
+
+def test_write_models_block_resolves_symlink_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIX 2, environment-independent variant: exercises the resolve-before-replace path
+    without requiring OS symlink-creation privilege (unavailable in some CI/sandbox
+    environments, including this one — `SeCreateSymbolicLinkPrivilege` on Windows
+    without Developer Mode/admin). Simulates a symlinked `profile_path` by
+    monkeypatching `Path.is_symlink`/`Path.resolve` for just this one path, then
+    asserts the write landed on the RESOLVED target rather than at `profile_path`
+    (which, for a real symlink, is the link's own directory entry). This variant
+    only exercises resolve-before-replace targeting, not the read/merge-with-
+    existing-content path (`profile_path.is_file()` correctly reports `False` for
+    the never-created `link_path`); the full read+write round-trip through a real
+    OS symlink is covered by
+    `test_write_models_block_updates_symlink_target_not_the_link` above, which
+    skips (rather than fails) where symlink creation is unprivileged.
+    """
+    link_path = tmp_path / "profile.yaml"
+    real_path = tmp_path / "real-profile.yaml"
+    real_path.write_text(
+        "version: 1\nladder:\n  - name: a\n    detect: {default: true}\n", encoding="utf-8"
+    )
+
+    real_is_symlink = Path.is_symlink
+    real_resolve = Path.resolve
+
+    def fake_is_symlink(self: Path) -> bool:
+        if self == link_path:
+            return True
+        return real_is_symlink(self)
+
+    def fake_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if self == link_path:
+            return real_path
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    sp.write_models_block(link_path, {"most_capable": {"primary": "vendor-a/big", "fallback": None}})
+
+    assert not link_path.exists(), (
+        "the write must never create a plain file at the symlink's own path"
+    )
+    assert "models:" in real_path.read_text(encoding="utf-8"), (
+        "the resolved (real) target must carry the new models: block"
+    )
+    profile = sp.load_profile(real_path)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+
+
+def test_write_models_block_rejects_duplicate_top_level_models_key(tmp_path: Path) -> None:
+    """FIX 3: two top-level `models:` blocks must fail loud, not silently mis-write.
+
+    `yaml.safe_load` keeps only the LAST of two top-level `models:` keys
+    (PyYAML does not reject duplicate mapping keys), while
+    `_find_models_span`/`_splice_models_block` locate and replace only the
+    FIRST. Left unchecked, a write against such a malformed profile would
+    silently patch the wrong (shadowed) block.
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+        "models:\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_rejects_yaml_equivalent_quoted_models_key(tmp_path: Path) -> None:
+    """FIX C (round 3): a YAML-equivalent spelling of `models:` must fail loud, not append.
+
+    `yaml.safe_load` accepts quoted-key spellings like `"models":` as
+    equivalent to the canonical `models:` — so `raw_models` (from safe_load)
+    is non-None even though the column-0 `^models:` regex the targeted splice
+    depends on matches zero spans. Before this fix, `_splice_models_block`
+    would then find no span to replace and instead APPEND a second, canonical
+    `models:` block underneath the existing quoted-key one — silently
+    producing the same duplicate-key shape the count>1 guard above exists to
+    reject. This must fail loud instead.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        '"models":\n'
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    with pytest.raises(sp.ProfileError, match="models:"):
+        sp.write_models_block(dest, decline=True)
+
+    # Confirm the guard actually prevented a silent append: the file must be
+    # byte-untouched (validate-then-swap never wrote a temp/replacement), and
+    # in particular must NOT have gained a second, canonical `models:` block.
+    text_after = dest.read_text(encoding="utf-8")
+    assert text_after == original_text, (
+        "a failed write must leave the profile byte-untouched, not append a "
+        "second canonical 'models:' block alongside the quoted-key one"
+    )
+
+
+def test_write_models_block_rejects_canonical_plus_quoted_models_key(tmp_path: Path) -> None:
+    """Round 3.5 FIX 1: one canonical `models:` PLUS one quoted `"models":` must fail loud.
+
+    The pre-existing guard counted only the canonical `^models:` spelling, so
+    this shape passed it (canonical count == 1) even though `yaml.safe_load`
+    sees TWO top-level `models` keys and keeps only the last — the writer
+    would patch the canonical (now-shadowed) block and leave the quoted
+    duplicate, which the loader actually reads, untouched. The semantic
+    counter (`yaml.compose`) must catch this even though the old regex-only
+    count could not.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        '"models":\n'
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original_text, (
+        "a failed write must leave the profile byte-untouched"
+    )
+
+
+def test_write_models_block_rejects_two_canonical_models_keys_still(tmp_path: Path) -> None:
+    """Round 3.5: the semantic rewrite must not regress the plain two-`models:` case.
+
+    Same shape as `test_write_models_block_rejects_duplicate_top_level_models_key`
+    above, re-asserted here to pin the semantic check's behaviour on the
+    simplest duplicate shape (both keys canonical, no quoting involved).
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        "models:\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_rejects_merge_key_populated_models(tmp_path: Path) -> None:
+    """Round 3.6 FIX Y: a `models` value injected via a top-level YAML merge key must fail loud.
+
+    A top-level `<<: *anchor` merges the anchored mapping's keys into the
+    document root, so `yaml.safe_load` populates `existing["models"]` even
+    though no `models` scalar key node exists anywhere in the document's own
+    top-level mapping. `yaml.compose` (used by
+    `_semantic_top_level_models_key_count`) does not resolve merge keys, so
+    it reports `semantic_count == 0`; the regex-only `model_key_count` is
+    also 0. Before the fix, `(0, 0)` was unconditionally treated as "nothing
+    to guard" and the splice appended a second, canonical `models:` block
+    beneath the merge-derived one instead of raising — silently producing a
+    profile whose on-disk text and `yaml.safe_load`-resolved value disagree.
+    Gating the guard on `raw_models` (computed first) closes this: whenever
+    the loader actually sees a `models` value, by any means, the guard
+    requires the canonical/semantic span to be exactly `(1, 1)`.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        "_defaults: &defaults\n"
+        "  models:\n"
+        "    most_capable:\n"
+        "      primary: vendor-a/big\n"
+        "      fallback: null\n"
+        "<<: *defaults\n"
+        "citation: internal policy doc\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    # Confirm the premise: yaml.safe_load really does populate `models` via
+    # the merge key, with no `models` key node visible to yaml.compose.
+    loaded = yaml.safe_load(original_text)
+    assert loaded.get("models") == {"most_capable": {"primary": "vendor-a/big", "fallback": None}}
+    composed = yaml.compose(original_text)
+    assert not any(
+        isinstance(key_node, yaml.ScalarNode) and key_node.value == "models"
+        for key_node, _value_node in composed.value
+    ), "premise check: no top-level 'models' key node should exist for compose to see"
+
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original_text, (
+        "a failed write must leave the profile byte-untouched"
+    )
+
+
+def test_write_models_block_accepts_normal_single_models_key(tmp_path: Path) -> None:
+    """Round 3.5: a normal, single, unquoted `models:` key must still succeed.
+
+    The semantic guard must not be so strict it rejects the overwhelmingly
+    common case — one canonical `models:` key and nothing shadowing it — and
+    every tier must still end up populated (FR-10).
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n",
+        encoding="utf-8",
+    )
+    sp.write_models_block(dest, decline=True)
+
+    text = dest.read_text(encoding="utf-8")
+    assert text.count("models:") == 1
+    profile = sp.load_profile(dest)
+    for tier in sp.MODEL_TIERS:
+        assert profile.models[tier]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_rejects_quoted_only_models_key(tmp_path: Path) -> None:
+    """Round 3.5: a lone `'models':` (single-quoted, no canonical spelling) must fail loud.
+
+    Semantically this is exactly one `models` key (`semantic_count == 1`), but
+    zero of them are in the canonical, editable spelling
+    (`model_key_count == 0`) — the targeted splice has no span to patch, and
+    appending would silently create a second, canonical `models:` key
+    alongside the quoted one. Fail loud instead of guessing.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        "'models':\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    with pytest.raises(sp.ProfileError, match="models:"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original_text, (
+        "a failed write must leave the profile byte-untouched"
+    )
+
+
+def test_write_models_block_preserves_indented_tier_after_column0_comment_inside_block(
+    tmp_path: Path,
+) -> None:
+    """FIX 4: a column-0 comment BETWEEN two indented tier entries is still inside the block.
+
+    Unlike the BLOCKER-2 comment (`test_write_models_block_preserves_column0_comment_after_models_block`),
+    which documents the NEXT top-level key, this comment sits between
+    `most_capable:` and `standard:` — both still children of the `models:`
+    mapping. Before the FIX-4 lookahead, `_find_models_span` truncated the
+    span at this comment, leaving `standard:` un-replaced and — because it
+    stayed indented directly below the freshly spliced-in block — silently
+    re-absorbed as a duplicate/stale key inside the NEW `models:` mapping.
+    """
+    original = (
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        "# a note about the standard tier below\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n"
+        "\n"
+        "ladder:\n"
+        "  - name: a\n"
+        "    detect: {default: true}\n"
+    )
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(original, encoding="utf-8")
+
+    sp.write_models_block(dest, {"cheap": {"primary": "vendor-a/small", "fallback": None}})
+
+    new_text = dest.read_text(encoding="utf-8")
+    assert new_text.count("models:") == 1, "must not end up with a duplicated models: key"
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == "vendor-a/big"
+    assert profile.models["standard"]["primary"] == "vendor-a/mid", (
+        "the tier after the in-block comment must survive untouched, not be orphaned"
+    )
+    assert profile.models["cheap"]["primary"] == "vendor-a/small"
+    assert [r.name for r in profile.ladder] == ["a"], "content after the models: span must survive"
+
+
+def test_find_models_span_stops_at_comment_before_next_top_level_key(tmp_path: Path) -> None:
+    """FIX 4 regression guard: the original BLOCKER-2 shape is unaffected by the lookahead.
+
+    A column-0 comment immediately followed (after only blanks/comments) by a
+    column-0 KEY still ends the span at the comment — this is the case the
+    lookahead must NOT change.
+    """
+    lines = (
+        "models:\n"
+        "  standard:\n"
+        "    primary: x\n"
+        "# documents the next key\n"
+        "ladder:\n"
+        "  - name: a\n"
+    ).splitlines(keepends=True)
+    span = sp._find_models_span(lines)
+    assert span == (0, 3), "span must end before the comment, unchanged from BLOCKER-2 behavior"

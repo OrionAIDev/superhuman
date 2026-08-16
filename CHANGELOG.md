@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [1.1.0] - 2026-08-15
+
+### Added
+
 - **`--slug` / `--project` on `superhuman_profile.py check`**, threaded through
   `scripts/autonomous-precondition.sh`. Project-state preconditions are questions about one
   project, and a repo may hold several under `docs/superhuman/`; the slug says which.
@@ -16,8 +30,50 @@ All notable changes to this project will be documented in this file. Format adap
 - `tests/test_precondition_scope.py` — the multi-project regression fixture whose absence let all
   of the below ship: two project dirs in one repo, one compliant and one not, asserting the gate
   answers about the one it was named.
+- **`## Resume packet`** in the SUPERHUMAN template (`templates/SUPERHUMAN.md.tpl`) — a
+  kept-current, single-read handoff block (objective, immutable constraints, decisions-locked
+  pointer, ruled-out paths, current state, next-3-actions, evidence-pointers) positioned above the
+  volatile logs. Three of the seven fields point at their existing canonical home instead of
+  restating it (decisions-locked, current state, evidence-pointers); the other four have no other
+  home and are restated in place (#165).
+- **`## Decisions locked`** — a first-class template section, structurally distinct from the
+  append-only `## Decisions log`, naming decisions that are not relitigated on resume. Reopening a
+  locked decision is now a surfaced gate/drift event, never a silent edit (#165).
+- **`conventions/subagent-return-schema.md`** — the canonical six-field subagent return schema
+  (conclusion, evidence, commands, assumptions, risks, next-action), referenced by pointer from
+  every role file (PM, Architect, Developer, QA, Tester, Business Expert, Surrogate User). Existing
+  verdict schemas — QA/Tester's `approved|issues_found`, Surrogate User's `ACCEPT|ESCALATE`,
+  Architect's option-table contract — now ride in `conclusion` as named specializations rather than
+  competing definitions (#165).
+- **Read-packet-first resume + locked-not-relitigated orchestration semantics**, documented in
+  `SKILL.md` and `roles/pm.md`: on resume the PM reads the Resume packet before reconstructing
+  state from the logs, and refreshes the packet at every gate rather than letting it go stale. A
+  pre-existing `SUPERHUMAN.md` written before this change, with neither new section, still resumes
+  without error — their absence is treated as empty, never as corruption (#165).
+- **First-run, provider-neutral model-tier setup (#139).** `phases/0-kickoff.md` Step 3 now elicits,
+  per capability tier (`most_capable` / `standard` / `cheap`), both a primary and a fallback
+  provider·model, and hands the answers to a new deterministic writer,
+  `scripts/superhuman_profile.py::write_models_block`, rather than letting inference free-text the
+  config (dev-principle #5: config generation is code). Declining or deferring the elicitation
+  writes the neutral, self-documenting `PROMPT_ME` placeholder instead of assuming any provider,
+  and the resulting file still loads.
+- **Dispatch-time placeholder warning (#139).** `adaptation/dispatch.md` and `roles/pm.md` document
+  a one-line, non-blocking (Type B) warning for when a dispatch's resolved tier is still an unfilled
+  `PROMPT_ME` placeholder — it names the tier and proceeds; it never pauses autonomous progression.
 
 ### Changed
+
+- **`profile.yaml` `models:` public shape (#139, ADR-6).** Each tier's value grows from a bare
+  string to a mapping, `{primary, fallback}`, so a tier can carry both a primary and a fallback
+  provider·model. Normalization happens once, at parse time, in `scripts/superhuman_profile.py`: a
+  legacy bare string (`most_capable: opus`) is read as `{"primary": "opus", "fallback": None}`, and
+  a mapping passes through unchanged — every downstream reader of `Profile.models` sees the mapping
+  form regardless of which shape the file on disk uses. Existing profiles keep loading unchanged;
+  no migration is forced. **Blast-radius note for downstream integrations:** any code that indexed
+  a tier and expected a bare string must be updated to read `.["primary"]` instead.
+- **`SKILL.md`'s and `README.md`'s illustrative `models:` snippets** now show the current per-tier
+  `{primary, fallback}` shape with generic, harness-neutral placeholder aliases, replacing the
+  superseded bare-string illustration (#139, ADR-6 supersedes-note).
 
 ### Deprecated
 

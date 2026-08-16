@@ -80,6 +80,97 @@ consulted: [business-expert]
    - Update SUPERHUMAN.md front-matter with the chosen values, including `HITL-level:` and
      `Modifies-existing-code:`. Declare the latter explicitly as `yes` or `no` — leaving it blank
      is not an implicit `no`, and the gate treats an undeclared field as a gap.
+   - **Operator model-tier elicitation (#139, provider-neutral — first run only).** This configures
+     the *operator's* global `~/.superhuman/profile.yaml`, not this project, so it does not belong
+     on every kickoff. Before asking anything, check the resolved profile's `models:` block (see
+     `scripts/superhuman_profile.py`, tiers `most_capable` / `standard` / `cheap`):
+     - **If all three tiers already have a real (non-`PROMPT_ME`) `primary` entry, skip this
+       elicitation entirely** — nothing to ask, proceed to Present G0 (and G1) below.
+     - **Otherwise (profile/`models:` absent, or any tier still `PROMPT_ME`), elicit.** Ask via
+       `<dispatch:ask>`, per tier `most_capable`, `standard`, `cheap`, a **primary** AND a
+       **fallback** provider·model pair the operator wants used at that capability level. The
+       question set is provider-neutral: do not pre-fill or suggest any concrete vendor/model as
+       *the* answer. Illustrative examples are fine when clearly marked (e.g. "for example, a
+       vendor's flagship reasoning model for `most_capable`, a fast/cheap tier model for `cheap`")
+       — but the field itself must start blank, never defaulted to one provider.
+     - **Decline/defer.** The operator may decline or defer any or all tiers (e.g. "not sure yet",
+       "skip for now"). This must never block kickoff — proceed regardless of how many tiers were
+       answered.
+     - **Resolve the interpreter by EXECUTING candidates, not by testing for their existence.**
+       `command -v python` only checks that something named `python` is on `PATH` and marked
+       executable — on Windows that can resolve to the Microsoft Store "app execution alias" stub,
+       which exists, is executable, and exits 49 with an advert instead of running Python. Mirror
+       the execute-probe loop `scripts/autonomous-precondition.sh` already uses (see that script's
+       "Prefer the bundle's venv interpreter…" comment): try each candidate by actually running it,
+       and take the first one that succeeds, before invoking the CLI. **Resolve `PY` as a bash
+       ARRAY, not a plain string** — the `py -3` launcher is two words (`py` and `-3`), and a
+       single-word `PY="py -3"` string, later invoked double-quoted (`$PY` inside quotes), makes
+       bash search for one executable literally named `py -3` (with the space), which does not
+       exist and fails — even
+       though the unquoted probe (`$candidate -c ...`, which word-splits) reported it as working.
+       Every candidate, single-word ones included, is stored and invoked as an array so the probe
+       and the real invocation split the SAME way:
+       ```
+       PY=()
+       for candidate in \
+         ".venv/bin/python" \
+         ".venv/Scripts/python.exe" \
+         "$(command -v python3 || true)" \
+         "$(command -v python || true)"
+       do
+         [ -n "$candidate" ] || continue
+         if "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+           PY=("$candidate")
+           break
+         fi
+       done
+       if [ "${#PY[@]}" -eq 0 ] && command -v py >/dev/null 2>&1; then
+         for cand in "py -3" "py"; do
+           IFS=' ' read -r -a cand_arr <<< "$cand"
+           if "${cand_arr[@]}" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+             PY=("${cand_arr[@]}")
+             break
+           fi
+         done
+       fi
+       if [ "${#PY[@]}" -eq 0 ]; then
+         echo "kickoff: no working python interpreter found (tried .venv, python3, python, py -3, py)." >&2
+         exit 1
+       fi
+       ```
+       (`<dispatch:bash>`). Do not shortcut this with `command -v python || command -v python3` —
+       that finds a name on `PATH`, not a working interpreter, and would silently select the
+       Store-stub instead of failing loud.
+     - **Write, don't hand-write.** Elicitation is inference (this recipe); writing the profile is
+       code (dev-principle #5). Call the deterministic writer's CLI entry point — `models set`,
+       which wraps `write_models_block(profile_path, answers, decline=...)` — never author the YAML
+       by hand and never call `write_models_block` directly as Python (it has no `<dispatch:bash>`
+       seam). Never interpolate an operator alias or an elicited answer directly into a shell word
+       (dev-principle #5) — a value containing a quote, `$`, or a backtick would break the quoting
+       or inject shell. Instead, pipe the answers JSON directly to the command's STDIN through a
+       QUOTED heredoc (a quoted delimiter disables all shell expansion inside it) using
+       `--answers-json-file -`, with the profile path itself quoted too — no temp file, so there is
+       nothing to clean up and nothing left behind in `/tmp` carrying operator model aliases:
+       ```
+       "${PY[@]}" scripts/superhuman_profile.py models set --profile "<profile-path>" \
+         --answers-json-file - \
+         --decline "<comma-separated declined/deferred tier names>" <<'JSON'
+       {"most_capable": {"primary": "...", "fallback": "..."}, ...}
+       JSON
+       ```
+       (`<dispatch:bash>`). No operator string is ever interpolated into a shell word — the answers
+       travel over stdin inside the quoted heredoc, and the CLI reads them from there because
+       `--answers-json-file -` means "read JSON from stdin". `--answers-json-file` carries the
+       answered tiers as a JSON object (`{tier: {"primary": ..., "fallback": ...}}`); `--decline`
+       carries the declined/deferred tier names (omit it, or pass all three tier names, to defer
+       everything — if every tier is declined and none are answered, the heredoc may be an empty
+       `{}` and `--decline` alone is enough). A declined or deferred tier — and any tier the
+       operator never reaches — is written by the command as the neutral `PROMPT_ME` placeholder,
+       never a vendor assumption: this **fails safe** and the operator is prompted again on a later
+       first run once the profile still shows placeholders. A malformed answers JSON or an
+       unrecognized tier name exits non-zero with a `ProfileError` message, never a silent no-op or
+       a traceback — treat a non-zero exit here as a kickoff blocker, same as any other failed
+       `<dispatch:bash>` step.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On

@@ -95,3 +95,13 @@ Aliases (not concrete model names) so the mapping survives provider model update
 - Each *new* dispatch starts fresh at primary (primary-recovery between dispatches is welcome and desired).
 
 Worked example (OpenClaw, Tester role, cheap/fast tier): orchestrator calls `sessions_spawn(model="claude-fast", …)`; if that returns an auth-failure error, it retries `sessions_spawn(model="gemini-good", …)` and appends the fallback line to `SUPERHUMAN.md`.
+
+## Dispatch-time placeholder warning (C-DISP)
+
+When the tier resolved for a dispatch is still an unfilled placeholder (`PROMPT_ME`, written by
+`write_models_block` in `scripts/superhuman_profile.py` — see C-PROF) in the operator's
+`~/.superhuman/profile.yaml` `models:` block, the orchestrator emits a **one-line, Type-B
+(notification, non-blocking) warning** naming the tier, then PROCEEDS with the dispatch — e.g.
+`warning: tier 'most_capable' is unconfigured (PROMPT_ME) — run first-run provider setup`. This
+warning does not pause or gate autonomous progression; it is not a gate, only a fail-safe
+reminder that a deferred tier is still unset (FR-10, OQ-5).

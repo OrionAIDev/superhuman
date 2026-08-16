@@ -22,7 +22,9 @@ Artifacts land at `<your-project-root>/docs/superhuman/<slug>/`.
 - `SKILL.md` — the orchestrator entry
 - `roles/` — one prompt per role
 - `phases/` — orchestration recipes per phase
-- `conventions/` — user-set defaults (Python, testing, git)
+- `conventions/` — user-set defaults (Python, testing, git); `subagent-return-schema.md` is the
+  canonical six-field shape (conclusion, evidence, commands, assumptions, risks, next-action) every
+  role's report rides in
 - `templates/artifacts/` — skeletons for canonical project artifacts
 - `references/` — evolved content forked from superpowers
 - `adaptation/dispatch.md` — single port-time edit point for harness differences (e.g. OpenClaw)
@@ -147,17 +149,22 @@ The PM thread (the model you, the user, are talking to) must be a most-capable t
 
 ### Where the tier -> model mapping lives
 
-Tier → model is account-specific, so it belongs in your profile rather than in this skill:
+Tier → model is account-specific, so it belongs in your profile rather than in this skill. Each
+tier carries both a primary and a fallback alias (ADR-6); a legacy bare-string tier value still
+loads and is normalized to this shape at read time:
 
 ```yaml
 # ~/.superhuman/profile.yaml
 models:
-  most_capable: opus      # or your harness's alias for "current best"
-  standard:     sonnet
-  cheap:        haiku
+  most_capable: { primary: <your-most-capable-alias>, fallback: <your-fallback-alias> }
+  standard:     { primary: <your-standard-alias>,     fallback: <your-fallback-alias> }
+  cheap:        { primary: <your-cheap-alias>,         fallback: <your-fallback-alias> }
 ```
 
-`adaptation/dispatch.md` supplies a per-harness default when the profile declares none.
+On first run, kickoff (G1) elicits these per-tier primary/fallback aliases and writes this block
+for you; declining leaves a neutral `PROMPT_ME` placeholder rather than assuming a provider — see
+"Set up a deployment profile" and `phases/0-kickoff.md`. `adaptation/dispatch.md` supplies a
+per-harness default when the profile declares none.
 
 **Acceptable** for the PM thread: any alias resolving to a current top-tier model, any provider.
 
@@ -201,6 +208,10 @@ Fallback handling: Claude Code's `settings.json` `model` field is a single value
 ### Subagents
 
 Subagent dispatches use their own model-tier selection per `adaptation/dispatch.md` model-tier table (PM/Architect/code-quality reviewer → most-capable; Developer/QA/Business Expert → standard; Tester/mechanical chunks → cheap-fast). The config above only governs the user-facing PM orchestrator thread.
+
+### Cross-session continuity
+
+Every `SUPERHUMAN.md` carries a `## Resume packet` — a single-read handoff block (objective, immutable constraints, decisions-locked, ruled-out paths, current state, next-3-actions, evidence-pointers) the PM reads first on resume, before reconstructing state from the logs — and a `## Decisions locked` section, distinct from the append-only `## Decisions log`, naming decisions that are not relitigated; reopening one is a surfaced gate/drift event, never a silent edit. A pre-existing project written before these sections landed still resumes without error. Every role's status report rides in the canonical six-field schema (`conventions/subagent-return-schema.md`) — conclusion, evidence, commands, assumptions, risks, next-action — with each role's existing verdict (e.g. QA/Tester's `approved|issues_found`) as a named specialization of `conclusion`, not a competing format.
 
 ## HITL levels (v0.5.0)
 

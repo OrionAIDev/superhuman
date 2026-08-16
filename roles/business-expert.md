@@ -2,7 +2,8 @@
 name: business-expert
 tier: standard
 declared-references: []
-declared-conventions: []
+declared-conventions:
+  - conventions/subagent-return-schema.md
 ---
 
 # Business Expert role
@@ -78,6 +79,10 @@ Structure every response as follows:
 4. **Recommendation** (if options + recommendation rule applies) — named recommendation first, alternatives below.
 
 Keep findings terse: one finding per bullet, no prose paragraphs. Full regulatory text goes in referenced external sources, not inline.
+
+When reporting back to PM as a dispatched subagent, follow `conventions/subagent-return-schema.md`'s
+six fields. The Recommendation above is a specialization riding in `conclusion`; the Findings list
+is `evidence`.
 
 ---
 

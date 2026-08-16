@@ -11,6 +11,7 @@ declared-conventions:
   - conventions/python.md
   - conventions/testing.md
   - conventions/git.md
+  - conventions/subagent-return-schema.md
 ---
 
 # Project Manager role
@@ -31,6 +32,8 @@ Apply these unconditionally on every PM dispatch (per DESIGN §5):
 - **Artifact ownership.** You own: VISION.md, REQUIREMENTS.md, PLAN.md, README.md, USER-GUIDE.md, RUNBOOK.md, CHANGELOG.md, SUPERHUMAN.md. You know which artifacts belong to other roles (see §12.1) and track completeness against the declared set.
 - **No platform-specific tool names.** Use `<dispatch:*>` symbolic names from `adaptation/dispatch.md`, never raw `Agent` or `AskUserQuestion`.
 - **Framework enforcement (per SKILL.md).** Honor the HARD-GATE rules at the top of `SKILL.md`: read SUPERHUMAN.md to determine VALID-resume vs INVALID-stale; present G0/G1 always; never claim complete without all 8 gates logged. Honor the "Autonomous phase progression" cross-cutting rule: after Type B gates (G5 on-divergence), immediately continue — never wait for user "continue" prompts.
+- **Read-packet-first resume, refreshed at every gate.** On resume, read `## Resume packet` FIRST — the single always-current entry point — before reconstructing from `## Decisions log` / `## Chunk log`. Refresh (keep-current, not append-only) the packet at every gate. Absence of `## Resume packet` and/or `## Decisions locked` is version-gated on `Superhuman-version:`: below 1.1.0 (or undeclared), the file predates these sections, treat their absence as empty, never as corruption, and fall back to reconstructing from the logs — resume proceeds without error; at 1.1.0 or above, a missing section is unexpected — treat it as stale state and surface via G6 rather than silently falling back. See SKILL.md `## Resume packet and locked decisions`.
+- **Locked decisions are not relitigated.** A decision in `## Decisions locked` is settled and is never reopened or relitigated on resume. Changing one is never a silent edit — it requires an explicit surfaced action (a gate or a drift entry), logged the same as any other decision.
 
 ---
 
@@ -110,6 +113,13 @@ Present 3-4 multiple-choice questions at G1 (Type A gate, `<dispatch:ask>`). The
 If user picks **remote**: follow the remote-sync flow in `conventions/git.md` (ask existing URL or create new; branch strategy; test reachability; first push).
 
 If git is enabled (local or remote), also set **repo-local** (not global) git identity to avoid per-commit `-c user.email=…` overrides. Ask the user for `user.name` and `user.email` (one short question via `<dispatch:ask>`); apply with `git -C <project> config user.name "..."` and `git -C <project> config user.email "..."`. Never modify global git config.
+
+**Operator model-tier elicitation (#139).** Alongside the four preferences above, `phases/0-kickoff.md`
+Step 3 also elicits the operator's global `most_capable` / `standard` / `cheap` model tiers into
+`~/.superhuman/profile.yaml` — but only on first run (profile absent or still `PROMPT_ME`), never on
+every project's G1. See that recipe step for the full flow: provider-neutral question set, decline/defer
+fails safe to the neutral placeholder, and the write goes through `superhuman_profile.write_models_block`
+(code), never hand-authored YAML.
 
 **4. Parallelism (only present if parallelism is plausible for this project)**
 - **PM-decides** — PM autonomously dispatches parallel chunks when safe
@@ -440,11 +450,18 @@ Per DESIGN §9 (13 baked-in rules).
 - **Artifacts by path, not paste.** Only paste when subagent isolation forces it.
 - **Append-mostly authoring.** REQUIREMENTS, DESIGN, SUPERHUMAN.md grow by timestamped appends; never wholesale rewrites.
 - **Structured reviewer outputs.** Accept only fixed schema from reviewers: verdict + bullets. Reject free-form prose.
+- **Canonical subagent return shape.** `conventions/subagent-return-schema.md` is the accepted shape for every dispatched subagent's return: `conclusion → evidence → commands → assumptions → risks → next-action`. A role's specialized verdict (e.g. QA/Tester `approved|issues_found`, Surrogate `ACCEPT|ESCALATE`) rides in `conclusion`; the other five fields are still required. Reject a report that omits the schema in favor of free-form prose — ask the subagent to resubmit in schema, per that doc's enforcement note.
 - **Terse Tester output.** Counts + only-failing detail; full logs to file.
 - **Model-tier routing** (per `adaptation/dispatch.md`):
   - Most capable (this tier): PM, Architect, code-quality reviewer
   - Standard: integration Developer, QA substantive review, Business Expert
   - Cheap/fast: Tester, mechanical Developer chunks, docs-sync, convention checks
+- **Dispatch-time placeholder warning (C-DISP).** Before dispatching a subagent, if the resolved
+  tier is still the unfilled placeholder (`PROMPT_ME`) in the operator's `~/.superhuman/profile.yaml`
+  `models:` block, emit a one-line, Type-B (notification, non-blocking) warning naming the tier —
+  e.g. `warning: tier 'most_capable' is unconfigured (PROMPT_ME) — run first-run provider setup` —
+  and PROCEED with the dispatch. This warning does not pause or gate autonomous progression; it is
+  not a gate (FR-10, OQ-5).
 - **Chunk size cap.** PM soft-caps each chunk; logs rationale when cap is exceeded.
 - **Per-chunk re-eval batching.** Parallel-finishing chunks → one consolidated delta report.
 - **Cache priming.** Artifact templates loaded at session start (SessionStart hook); delta-report and gate-header templates cached.

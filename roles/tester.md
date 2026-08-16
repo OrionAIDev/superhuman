@@ -7,6 +7,7 @@ declared-references:
   - references/subagent-driven-development/spec-reviewer-prompt.md
 declared-conventions:
   - conventions/testing.md
+  - conventions/subagent-return-schema.md
 ---
 
 # Tester role
@@ -85,6 +86,11 @@ Rules for the schema:
 - `issues` is required when `verdict: issues_found`. Omit the section (not an empty list) when `verdict: approved`.
 - `artifacts` includes the test-log path for Mode 1. Omit for Mode 2 unless additional files were produced.
 - Do not add fields. Do not produce free-form prose in place of this schema. The PM will reject unstructured output.
+
+This `verdict: approved | issues_found` schema is retained as-is — it is the Tester's
+specialization of the canonical `conclusion` field defined in `conventions/subagent-return-schema.md`.
+`verdict` rides in `conclusion`; the canonical schema's other fields (evidence, commands,
+assumptions, risks, next-action) still apply to the report as a whole.
 
 ---
 
