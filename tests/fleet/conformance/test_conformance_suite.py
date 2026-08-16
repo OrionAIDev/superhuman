@@ -82,12 +82,13 @@ class TestFullLifecycleUnderPortableAdapter:
         log_path, sessions_dir = fleet_dir
 
         # --- create: two sessions register through the Portable path only ---
+        # No Claude adapter anywhere in this flow (NFR-2, behaviorally). The
+        # load-bearing proof of that is NOT here — asserting isinstance right
+        # after construction would be tautological — it is the
+        # `harness == "portable"` check on every resulting node id below
+        # (a Claude path would bake `harness="claude"` into the id instead).
         primary_adapter = PortableAdapter(git_repo, "conformance-slug", local_id="primary-1")
         dependent_adapter = PortableAdapter(git_repo, "conformance-slug", local_id="dependent-1")
-        # No Claude adapter anywhere in this flow (NFR-2, behaviorally) —
-        # both adapters driving the lifecycle really are PortableAdapter.
-        assert isinstance(primary_adapter, PortableAdapter)
-        assert isinstance(dependent_adapter, PortableAdapter)
 
         primary = register_session(
             primary_adapter,
