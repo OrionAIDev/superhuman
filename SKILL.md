@@ -247,6 +247,10 @@ These are not phase gates. They produce findings only; they do not modify SUPERH
 
 **Conditional — `references/deprecating-a-system/`.** When a project's VISION declares removing / retiring / sunsetting an existing **product** system, the PM invokes this sub-skill at **G0** to shape the migration (advisory vs compulsory, Strangler / Adapter / Feature-flag, the Churn Rule, Zombie-code triage). Not one of the eight gates — conditional, like the roasting skills. It governs **product code only**; superhuman's own project artifacts remain archive-never-delete.
 
+## Related skills
+
+superhuman's session-tracking manifest relates to three other skills without being bundled with any of them — see `docs/superhuman/session-tracking/skill-relationships.md` for the full rationale (relationships, and the schema-contract-now-vs-bundle-later packaging decision).
+
 ## When NOT to use this skill
 
 - Single trivial actions: "show me X", "run Y", "explain Z".
