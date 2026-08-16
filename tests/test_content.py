@@ -1066,7 +1066,37 @@ def test_kickoff_decline_path_is_neutral_and_fails_safe(skill_root: Path) -> Non
     )
 
 
-def test_license_and_notice_present(skill_root: Path) -> None:
+# --- C-DISP: dispatch-time placeholder warning ---
+
+
+def test_dispatch_documents_placeholder_warning(skill_root: Path) -> None:
+    """Dispatch-time placeholder warning is documented in both consumers (OQ-5, FR-10).
+
+    When a dispatch's resolved tier is still C-PROF's unfilled placeholder
+    (``PROMPT_ME``) in the operator's profile, the PM must emit a one-line
+    warning naming the tier and PROCEED — never pause or gate. The rule must
+    be documented in both `adaptation/dispatch.md` (the model-selection
+    mechanism) and `roles/pm.md` (the PM behavior), and explicitly
+    characterized as Type B (notification, non-blocking).
+    """
+    dispatch_text = (skill_root / "adaptation" / "dispatch.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+
+    for label, text in (("adaptation/dispatch.md", dispatch_text), ("roles/pm.md", pm_text)):
+        lower = text.lower()
+        assert "prompt_me" in lower, (
+            f"{label} must name the unfilled placeholder (PROMPT_ME) the warning keys on"
+        )
+        assert "one-line" in lower or "one line" in lower, (
+            f"{label} must characterize the warning as one-line"
+        )
+        assert "type b" in lower or "type-b" in lower, (
+            f"{label} must characterize the warning as Type B (notification, no pause)"
+        )
+        assert "non-blocking" in lower or "does not" in lower or "not a gate" in lower, (
+            f"{label} must state the warning does not pause or gate autonomous progression"
+        )
+
     """A publishable repo must carry both a LICENSE and upstream attribution."""
     licence = skill_root / "LICENSE"
     notice = skill_root / "NOTICE.md"

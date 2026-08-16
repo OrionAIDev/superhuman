@@ -456,6 +456,12 @@ Per DESIGN §9 (13 baked-in rules).
   - Most capable (this tier): PM, Architect, code-quality reviewer
   - Standard: integration Developer, QA substantive review, Business Expert
   - Cheap/fast: Tester, mechanical Developer chunks, docs-sync, convention checks
+- **Dispatch-time placeholder warning (C-DISP).** Before dispatching a subagent, if the resolved
+  tier is still the unfilled placeholder (`PROMPT_ME`) in the operator's `~/.superhuman/profile.yaml`
+  `models:` block, emit a one-line, Type-B (notification, non-blocking) warning naming the tier —
+  e.g. `warning: tier 'most_capable' is unconfigured (PROMPT_ME) — run first-run provider setup` —
+  and PROCEED with the dispatch. This warning does not pause or gate autonomous progression; it is
+  not a gate (FR-10, OQ-5).
 - **Chunk size cap.** PM soft-caps each chunk; logs rationale when cap is exceeded.
 - **Per-chunk re-eval batching.** Parallel-finishing chunks → one consolidated delta report.
 - **Cache priming.** Artifact templates loaded at session start (SessionStart hook); delta-report and gate-header templates cached.
