@@ -229,7 +229,7 @@ the project's lifetime:
 A surrogate-user role answers a subset of the Type A gates using the declared `GOAL.md` as the decision authority, while the PM runs a bounded, sequential try → measure → keep/rollback loop: each iteration proposes a change, runs tests, keeps the result if it strictly improves (ties roll back), and continues until the goal is met or the iteration cap is reached. The surrogate runs at `tier=standard`.
 
 - **Level 1:** the surrogate answers G2, G3, G4, G5, G7 conservatively — when in doubt, it escalates. G6 (moderate+), G8, G9, and G10 always go to you.
-- **Level 2:** the surrogate/PM also resolves G6 (any severity), G8, and G9 itself, by **precedent-mining** first — checking this project's own decisions log, sibling repos/ADRs via codebase-memory-mcp, and declared conventions — before deciding, then logging the decision and its basis to SUPERHUMAN.md instead of asking. Only G10 (a genuinely blocked PM) and an `ABORT` recommendation still reach you. The Phase 3.3 preflight GO/NO-GO stays a hard, non-overridable blocker at every level — precedent-mining can't wave through a NO-GO.
+- **Level 2:** the surrogate/PM also resolves G6 (any severity), G8, and G9 itself, by **precedent-mining** first — checking this project's own decisions log, sibling repos/ADRs via a code-memory tool if one is available (e.g. `codebase-memory-mcp`, or whichever code-memory plugin your setup declares — otherwise a targeted grep), and declared conventions — before deciding, then logging the decision and its basis to SUPERHUMAN.md instead of asking. Only G10 (a genuinely blocked PM) and an `ABORT` recommendation still reach you. The Phase 3.3 preflight GO/NO-GO stays a hard, non-overridable blocker at every level — precedent-mining can't wave through a NO-GO.
 
 ### Preconditions
 
@@ -280,6 +280,14 @@ The rollback script is slug-scoped: it locates the most recent `autonomous/<slug
 At **level 1**, the surrogate never answers G8. When the loop exits (goal met, cap hit, or stalled), control returns to you for G8 acceptance sign-off before any result is considered final.
 
 At **level 2**, once the Phase 3.3 preflight reaches GO (or all Blockers are closed), the PM self-accepts — it composes the acceptance summary, logs the G8 decision and its basis to SUPERHUMAN.md, and emits the PROJECT COMPLETE terminator itself. If the PM's own fix attempt can't clear a NO-GO, that's the one point a level-2 run pauses for you — via G10, not a separate acceptance gate.
+
+## Sharing or forking this skill
+
+Superhuman is self-contained: every sub-skill it uses (brainstorming, TDD, systematic-debugging, the roasting skills, and so on) is vendored under `references/`, and the SessionStart hook reads only files inside the skill bundle. There is no hard dependency on any external or private skill. Two touchpoints are worth knowing about when you run your own copy:
+
+- **Code-memory tool (optional).** At HITL Level 2 the surrogate/PM mines precedent from sibling repos and prior ADRs. It will use a code-memory MCP if you have one — `codebase-memory-mcp`, or whichever code-memory/indexing plugin your setup declares — and **falls back to a targeted grep when none is present**. Nothing to configure to get the grep floor; point it at your own tool simply by having that tool available in the session. (A structured, declarable `code_memory:` profile field is on the roadmap.)
+
+- **Publication guard (`.publication-tokens`).** The test suite scans every tracked file for infrastructure leaks (server paths, IPs, keys) and for your own environment vocabulary. Organisation-specific words are **not** baked into the shared tests — instead, copy `.publication-tokens.example` to `.publication-tokens` (gitignored) and list your codenames, host prefixes, and internal names, one per line. The guard then fails the suite if any of them appear in a tracked file. When the file is absent the vocabulary check skips silently, so seeding it is opt-in — but doing so is what keeps your fork's internal vocabulary out of the published tree.
 
 ## Known limitations
 
