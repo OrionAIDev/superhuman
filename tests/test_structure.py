@@ -210,6 +210,44 @@ def test_session_start_hook_executable(skill_root: Path) -> None:
         assert os.access(hook, os.X_OK), "hooks/session-start not executable"
 
 
+# Shell scripts that are executed directly — each carries a `#!/usr/bin/env bash`
+# shebang and is documented (MIGRATION.md, README.md, SKILL.md, the phase recipes,
+# the smoke checklists) as invoked bare, e.g. `scripts/release.sh`, not `bash
+# scripts/release.sh`. git-hooks/pre-commit is additionally installed as
+# .git/hooks/pre-commit, which git only runs when it is executable. On POSIX all
+# must ship with the exec bit or they fail with "permission denied" at the point
+# of use. examples/promote.sh.example is deliberately excluded: it is a template to
+# copy and adapt, never run in place.
+EXECUTABLE_SHELL_SCRIPTS = [
+    "scripts/autonomous-iter.sh",
+    "scripts/autonomous-precondition.sh",
+    "scripts/autonomous-rollback.sh",
+    "scripts/autonomous-summary.sh",
+    "scripts/cleanup-project.sh",
+    "scripts/git-hooks/pre-commit",
+    "scripts/install-hooks.sh",
+    "scripts/release.sh",
+]
+
+
+@pytest.mark.parametrize("rel_path", EXECUTABLE_SHELL_SCRIPTS)
+def test_shell_script_executable(skill_root: Path, rel_path: str) -> None:
+    """Each directly-executed shell script exists; on POSIX, it's executable.
+
+    Mirrors test_session_start_hook_executable. The guard is POSIX-only because git
+    does not track the exec bit on Windows and os.access(X_OK) returns True there for
+    any file — so the check is meaningful only where the bit exists. On a fresh Linux
+    CI checkout the file inherits its git index mode, so a 100644 regression fails here.
+    """
+    import os
+    import sys
+
+    script = skill_root / rel_path
+    assert script.is_file(), f"{rel_path} missing"
+    if sys.platform != "win32":
+        assert os.access(script, os.X_OK), f"{rel_path} not executable"
+
+
 def test_migration_doc_present_and_substantive(skill_root: Path) -> None:
     """MIGRATION.md exists, is substantive, and references the release scripts."""
     doc = skill_root / "MIGRATION.md"
