@@ -1107,3 +1107,216 @@ def test_dispatch_documents_placeholder_warning(skill_root: Path) -> None:
     assert "MIT" in text and "references/" in text, (
         "NOTICE.md must state the upstream licence and which paths it covers"
     )
+
+
+# --- C-HYG: hygiene — VERSION/CHANGELOG/README (TC-17, TC-18) ---
+
+#: Narrower than `_VENDOR_NAME_FRAGMENTS` above. TC-14 scans a single
+#: provider-neutral elicitation doc where even bare "google"/"meta"/"claude"
+#: are suspect. TC-17 scans a much wider file set that legitimately says
+#: "Claude Code" (the harness name), "Google-style docstrings" (a style
+#: name), "meta-gate" (an unrelated PM concept), etc. — bare substrings there
+#: would be false positives unrelated to NFR-1. TC-17 instead matches actual
+#: model-FAMILY product names, word-bounded: that is what the immutable
+#: constraint (LD-1) cares about — a concrete *model* baked in as a default,
+#: not the word "Google" or "Claude" appearing inside an unrelated compound
+#: term or the harness's own product name.
+_TC17_VENDOR_TOKENS = (
+    "opus", "sonnet", "haiku",
+    r"gpt-\d", "chatgpt",
+    "gemini",
+    "llama",
+    "mistral", "cohere", "grok", "xai",
+)
+_TC17_TOKEN_RE = re.compile(r"\b(?:" + "|".join(_TC17_VENDOR_TOKENS) + r")\b", re.IGNORECASE)
+
+#: In addition to `_EXAMPLE_MARKERS` (e.g./for example/such as), these phrases
+#: also clearly mark a vendor mention as illustrative/non-default across the
+#: wider TC-17 file set: "go stale" (SKILL.md/README.md's staleness warning
+#: about concrete model names), "or your harness's alias" (the profile.yaml
+#: snippet's own inline comment marking the value as swappable), "legacy"
+#: (the ADR-6 bare-string-normalization docstring example), and
+#: "forbidden"/"do not reliably honor" (the PM-tier denylist, which names
+#: what NOT to use — structurally the opposite of a default).
+_TC17_EXTRA_MARKERS = (
+    "go stale",
+    "or your harness's alias",
+    "legacy",
+    "forbidden",
+    "do not reliably honor",
+    "does not reliably honor",
+    "not reliably honor",
+)
+
+#: The full set of files this project (#165 fidelity + #139 provider setup)
+#: created or modified, per PLAN.md's "File structure" list — minus
+#: `adaptation/dispatch.md`, excluded for the reason below, and
+#: `CHANGELOG.md`, handled separately because only its NEW section is this
+#: project's content (see the docstring).
+_TC17_FILES = (
+    "conventions/subagent-return-schema.md",
+    "templates/SUPERHUMAN.md.tpl",
+    "roles/pm.md",
+    "roles/architect.md",
+    "roles/developer.md",
+    "roles/qa.md",
+    "roles/tester.md",
+    "roles/business-expert.md",
+    "roles/surrogate-user.md",
+    "SKILL.md",
+    "scripts/superhuman_profile.py",
+    "phases/0-kickoff.md",
+    "VERSION",
+    "README.md",
+)
+
+#: README.md subsections documenting Claude-Code-native config, pre-existing
+#: since v0.1.3. Claude Code is single-provider (`adaptation/dispatch.md`:
+#: "no fallback path") and its `settings.json` literally only accepts
+#: Anthropic's own shortnames — this is harness-specific MECHANISM, not a
+#: superhuman-authored default, exactly analogous to the
+#: `adaptation/dispatch.md` tier table this test excludes outright below.
+#: Relitigating either is out of this project's charter.
+_TC17_EXCLUDED_README_HEADINGS = ("### Claude Code config",)
+
+
+def _tc17_strip_excluded_readme_sections(text: str) -> str:
+    """Remove `_TC17_EXCLUDED_README_HEADINGS` subsections from README.md text.
+
+    Args:
+        text: full README.md contents.
+
+    Returns:
+        The text with each excluded H3 subsection (heading through the line
+        before the next H2/H3 heading) removed.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.rstrip("\n").rstrip("\r")
+        if stripped in _TC17_EXCLUDED_README_HEADINGS:
+            skipping = True
+            continue
+        if skipping and (stripped.startswith("## ") or stripped.startswith("### ")):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def _tc17_scan(label: str, text: str, offenders: list[str]) -> None:
+    """Scan text for unmarked vendor/model defaults and record offenders.
+
+    Args:
+        label: file label used in the offender message.
+        text: text to scan.
+        offenders: list to append `"label:pos: detail"` strings to.
+    """
+    for match in _TC17_TOKEN_RE.finditer(text):
+        start, end = match.span()
+        window = text[max(0, start - 160):end + 80].lower()
+        if any(m in window for m in _EXAMPLE_MARKERS) or any(
+            m in window for m in _TC17_EXTRA_MARKERS
+        ):
+            continue
+        lineno = text.count("\n", 0, start) + 1
+        offenders.append(f"{label}:{lineno}: {match.group(0)!r} not clearly marked as an example")
+
+
+def test_no_vendor_baked_as_default_in_changed_files(skill_root: Path) -> None:
+    """No concrete vendor/model name is baked in as an unmarked default (TC-17).
+
+    Full-project grep gate over every file this project (#165 fidelity +
+    #139 provider setup) created or modified, per NFR-1/FR-10/LD-1: a vendor
+    name may appear only as a clearly-marked illustrative example, never as
+    *the* default/required value in a template, generator, or elicitation.
+
+    Scoping decisions (documented per the chunk-8 spec's explicit ask):
+
+    - `adaptation/dispatch.md` is excluded entirely. Its "Tier -> model
+      (Claude Code -- Anthropic only)" table is pre-existing, single-harness
+      MECHANISM -- the concrete model aliases Claude Code itself resolves a
+      tier to on a single-provider harness with "no fallback path" -- not a
+      superhuman-authored default. `test_dispatch_documents_placeholder_warning`
+      (TC-16) already covers the content this project actually added to that
+      file (the placeholder-warning rule). Re-scanning the harness table
+      would relitigate a pre-existing, intentionally concrete, per-harness
+      fact table outside this project's charter.
+    - `CHANGELOG.md` is checked only for the section this chunk adds (the
+      dated `## [1.1.0]` release notes), not the file's full history.
+      Historical dated entries document real past incidents (e.g. a prior
+      smoke run's model choice) and are factual record, not a default this
+      project proposes -- scanning them would produce noise unrelated to
+      NFR-1.
+    - Within `README.md`, the pre-existing (v0.1.3) "### Claude Code config"
+      subsection is excluded for the same single-harness-mechanism reason as
+      `adaptation/dispatch.md` (see `_TC17_EXCLUDED_README_HEADINGS`).
+    - The vendor-token list (`_TC17_VENDOR_TOKENS`) is deliberately narrower
+      than `_VENDOR_NAME_FRAGMENTS` (used by TC-14 against a single
+      provider-neutral doc): bare "claude"/"google"/"meta" collide with this
+      wider file set's legitimate, unrelated prose ("Claude Code" the
+      harness, "Google-style docstrings", "meta-gate") and would be noise,
+      not signal, for the "baked in as a default" question this test asks.
+    """
+    offenders: list[str] = []
+
+    for rel in _TC17_FILES:
+        path = skill_root / rel
+        assert path.is_file(), f"expected shipped file missing: {rel}"
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if rel == "README.md":
+            text = _tc17_strip_excluded_readme_sections(text)
+        _tc17_scan(rel, text, offenders)
+
+    changelog_text = (skill_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"^## \[1\.1\.0\].*?(?=^## \[|\Z)", changelog_text, re.MULTILINE | re.DOTALL
+    )
+    assert section, "CHANGELOG.md must have a ## [1.1.0] release section (see TC-18)"
+    _tc17_scan("CHANGELOG.md (## [1.1.0] section)", section.group(0), offenders)
+
+    detail = "\n  ".join(offenders)
+    assert not offenders, (
+        "vendor/model name(s) appear as an unmarked default in shipped files:\n  " + detail
+    )
+
+
+def test_changelog_entry_names_165_and_139(skill_root: Path) -> None:
+    """VERSION is bumped and CHANGELOG.md documents both #165 and #139 (TC-18, NFR-4/NFR-6).
+
+    VERSION must be a valid semver strictly greater than the pre-project
+    value (1.0.3); CHANGELOG.md must carry a dated release entry naming both
+    roadmap items; and that entry must carry no AI/model/provider
+    attribution — role names only, per NFR-6.
+    """
+    version_text = (skill_root / "VERSION").read_text(encoding="utf-8").strip()
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-[A-Za-z0-9.-]+)?", version_text)
+    assert match, f"Invalid semver: {version_text}"
+    assert tuple(int(g) for g in match.groups()[:3]) > (1, 0, 3), (
+        f"VERSION must be bumped above the pre-project value 1.0.3, got {version_text}"
+    )
+
+    changelog_text = (skill_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"^## \[" + re.escape(version_text) + r"\].*? - \d{4}-\d{2}-\d{2}.*?(?=^## \[|\Z)",
+        changelog_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert section, (
+        f"CHANGELOG.md must have a dated '## [{version_text}] - YYYY-MM-DD' entry matching VERSION"
+    )
+    entry = section.group(0)
+
+    assert "#165" in entry, "CHANGELOG entry must name #165 (fidelity)"
+    assert "#139" in entry, "CHANGELOG entry must name #139 (provider setup)"
+
+    entry_lower = entry.lower()
+    for forbidden in (
+        "anthropic", "claude", "openai", "chatgpt", "gpt-", "gemini",
+        "generated with", "generated by", "co-authored-by", "written by claude",
+    ):
+        assert forbidden not in entry_lower, (
+            f"CHANGELOG #165/#139 entry must carry no AI/model/provider attribution "
+            f"(NFR-6) — found {forbidden!r}"
+        )

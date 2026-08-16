@@ -70,17 +70,20 @@ The PM orchestrator role is `tier: most-capable` (see `roles/pm.md` and `adaptat
 
 **Reference by alias, not by version.** Concrete model names (gpt-5.5, claude-opus-4-7, gemini-2.5-pro) go stale as providers ship newer versions. Reference by **alias** — your environment's stable name for "the current best model of family X" — so this skill keeps working without doc churn whenever the underlying model is upgraded.
 
-**Where the mapping lives.** Tier → model is account-specific, so it belongs in your profile, not in this skill:
+**Where the mapping lives.** Tier → model is account-specific, so it belongs in your profile, not in this skill. Each tier carries both a primary and a fallback alias (ADR-6); a legacy bare-string tier value still loads and is normalized to this shape at read time:
 
 ```yaml
 # ~/.superhuman/profile.yaml
 models:
-  most_capable: opus      # or your harness's alias for "current best"
-  standard:     sonnet
-  cheap:        haiku
+  most_capable: { primary: <your-most-capable-alias>, fallback: <your-fallback-alias> }
+  standard:     { primary: <your-standard-alias>,     fallback: <your-fallback-alias> }
+  cheap:        { primary: <your-cheap-alias>,         fallback: <your-fallback-alias> }
 ```
 
-`adaptation/dispatch.md` supplies a per-harness default when the profile declares none.
+On first run, `phases/0-kickoff.md` Step 3 elicits these per-tier primary/fallback aliases and
+writes this block for you via `scripts/superhuman_profile.py`; declining leaves a neutral
+`PROMPT_ME` placeholder rather than assuming a provider. `adaptation/dispatch.md` supplies a
+per-harness default when the profile declares none.
 
 **Acceptable** for the PM thread: any alias resolving to a current top-tier model of any provider.
 
