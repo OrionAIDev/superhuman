@@ -96,38 +96,73 @@ consulted: [business-expert]
      - **Decline/defer.** The operator may decline or defer any or all tiers (e.g. "not sure yet",
        "skip for now"). This must never block kickoff — proceed regardless of how many tiers were
        answered.
+     - **Resolve the interpreter by EXECUTING candidates, not by testing for their existence.**
+       `command -v python` only checks that something named `python` is on `PATH` and marked
+       executable — on Windows that can resolve to the Microsoft Store "app execution alias" stub,
+       which exists, is executable, and exits 49 with an advert instead of running Python. Mirror
+       the execute-probe loop `scripts/autonomous-precondition.sh` already uses (see that script's
+       "Prefer the bundle's venv interpreter…" comment): try each candidate by actually running it,
+       and take the first one that succeeds, before invoking the CLI:
+       ```
+       PY=""
+       for candidate in \
+         ".venv/bin/python" \
+         ".venv/Scripts/python.exe" \
+         "$(command -v python3 || true)" \
+         "$(command -v python || true)"
+       do
+         [ -n "$candidate" ] || continue
+         if "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+           PY="$candidate"
+           break
+         fi
+       done
+       if [ -z "$PY" ] && command -v py >/dev/null 2>&1; then
+         for candidate in "py -3" "py"; do
+           if $candidate -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+             PY="$candidate"
+             break
+           fi
+         done
+       fi
+       if [ -z "$PY" ]; then
+         echo "kickoff: no working python interpreter found (tried .venv, python3, python, py -3, py)." >&2
+         exit 1
+       fi
+       ```
+       (`<dispatch:bash>`). Do not shortcut this with `command -v python || command -v python3` —
+       that finds a name on `PATH`, not a working interpreter, and would silently select the
+       Store-stub instead of failing loud.
      - **Write, don't hand-write.** Elicitation is inference (this recipe); writing the profile is
        code (dev-principle #5). Call the deterministic writer's CLI entry point — `models set`,
        which wraps `write_models_block(profile_path, answers, decline=...)` — never author the YAML
        by hand and never call `write_models_block` directly as Python (it has no `<dispatch:bash>`
        seam). Never interpolate an operator alias or an elicited answer directly into a shell word
        (dev-principle #5) — a value containing a quote, `$`, or a backtick would break the quoting
-       or inject shell. Instead, write the answers JSON to a temp file through a QUOTED heredoc (a
-       quoted delimiter disables all shell expansion inside it) and pass that file's path to
-       `--answers-json-file`, with the profile path itself quoted too:
+       or inject shell. Instead, pipe the answers JSON directly to the command's STDIN through a
+       QUOTED heredoc (a quoted delimiter disables all shell expansion inside it) using
+       `--answers-json-file -`, with the profile path itself quoted too — no temp file, so there is
+       nothing to clean up and nothing left behind in `/tmp` carrying operator model aliases:
        ```
-       tmp="$(mktemp)"
-       cat > "$tmp" <<'JSON'
+       "$PY" scripts/superhuman_profile.py models set --profile "<profile-path>" \
+         --answers-json-file - \
+         --decline "<comma-separated declined/deferred tier names>" <<'JSON'
        {"most_capable": {"primary": "...", "fallback": "..."}, ...}
        JSON
-       PY="$(command -v python || command -v python3 || true)"  # Windows may only have `python`
-       "$PY" scripts/superhuman_profile.py models set --profile "<profile-path>" \
-         --answers-json-file "$tmp" \
-         --decline "<comma-separated declined/deferred tier names>"
        ```
        (`<dispatch:bash>`). No operator string is ever interpolated into a shell word — the answers
-       travel through the quoted-heredoc file, and the CLI reads them from there via
-       `--answers-json-file` (path may be `-` to read from stdin instead). `--answers-json-file`
-       carries the answered tiers as a JSON object (`{tier: {"primary": ..., "fallback": ...}}`);
-       `--decline` carries the declined/deferred tier names (omit it, or pass all three tier names,
-       to defer everything — if every tier is declined and none are answered, the heredoc/temp file
-       may be skipped and `--decline` alone is enough). A declined or deferred tier — and any tier
-       the operator never reaches — is written by the command as the neutral `PROMPT_ME`
-       placeholder, never a vendor assumption: this **fails safe** and the operator is prompted
-       again on a later first run once the profile still shows placeholders. A malformed answers
-       JSON or an unrecognized tier name exits non-zero with a `ProfileError` message, never a
-       silent no-op or a traceback — treat a non-zero exit here as a kickoff blocker, same as any
-       other failed `<dispatch:bash>` step.
+       travel over stdin inside the quoted heredoc, and the CLI reads them from there because
+       `--answers-json-file -` means "read JSON from stdin". `--answers-json-file` carries the
+       answered tiers as a JSON object (`{tier: {"primary": ..., "fallback": ...}}`); `--decline`
+       carries the declined/deferred tier names (omit it, or pass all three tier names, to defer
+       everything — if every tier is declined and none are answered, the heredoc may be an empty
+       `{}` and `--decline` alone is enough). A declined or deferred tier — and any tier the
+       operator never reaches — is written by the command as the neutral `PROMPT_ME` placeholder,
+       never a vendor assumption: this **fails safe** and the operator is prompted again on a later
+       first run once the profile still shows placeholders. A malformed answers JSON or an
+       unrecognized tier name exits non-zero with a `ProfileError` message, never a silent no-op or
+       a traceback — treat a non-zero exit here as a kickoff blocker, same as any other failed
+       `<dispatch:bash>` step.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On

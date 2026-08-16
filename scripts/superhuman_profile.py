@@ -1809,6 +1809,48 @@ def _write_profile_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
+def _semantic_top_level_models_key_count(text: str, profile_path: Path) -> int:
+    """Count top-level ``models`` keys the way ``yaml.safe_load`` actually sees them.
+
+    The column-0 ``^models:`` regex (:data:`_MODELS_KEY_RE`) only recognises the
+    one canonical spelling this writer's targeted splice can edit. YAML itself
+    is far more permissive: a quoted ``"models":`` or ``'models':`` key is a
+    perfectly ordinary mapping key that resolves to the same scalar value
+    ``"models"`` and therefore collides with a canonical ``models:`` key under
+    ``yaml.safe_load``'s last-key-wins duplicate handling — a collision the
+    regex-only count cannot see (post-review FIX D, round 3.5).
+
+    This walks the document's parse tree with ``yaml.compose`` (which builds
+    nodes without resolving Python objects, so it is cheap and side-effect
+    free) rather than re-parsing with regex, and counts key nodes at the root
+    mapping whose scalar value is exactly ``"models"`` — catching every
+    YAML-equivalent spelling, not just the ones a regex happens to anticipate.
+
+    Args:
+        text: The raw profile YAML text.
+        profile_path: Source file, used only to build error messages.
+
+    Returns:
+        The number of top-level mapping keys that resolve to ``"models"``.
+        ``0`` for an empty document or a non-mapping root (both are guarded
+        elsewhere; this helper simply has nothing to count in those cases).
+
+    Raises:
+        ProfileError: If ``text`` is not parseable YAML at all.
+    """
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise ProfileError(f"{profile_path}: invalid YAML — {exc}") from exc
+    if root is None or not isinstance(root, yaml.MappingNode):
+        return 0
+    return sum(
+        1
+        for key_node, _value_node in root.value
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == "models"
+    )
+
+
 def write_models_block(
     profile_path: Path,
     answers: dict[str, dict[str, str | None]] | None = None,
@@ -1892,42 +1934,37 @@ def write_models_block(
         text = ""
         existing = {}
 
-    # Post-review FIX 3: `yaml.safe_load` silently keeps only the LAST of two
-    # top-level `models:` keys (PyYAML does not reject duplicate mapping
-    # keys), while `_find_models_span`/`_splice_models_block` locate and
-    # replace only the FIRST. Left unchecked, that mismatch makes a write
-    # against a malformed two-`models:` profile silently ineffective — the
-    # visible (first) block gets patched, the shadowed (last, actually-read)
-    # one does not. Fail loud instead of guessing which block the operator
-    # meant.
+    # Post-review FIX 3 / FIX C (round 3), unified into one semantic check
+    # (round 3.5): a regex-only count of the canonical `^models:` spelling
+    # cannot see a YAML-equivalent duplicate — e.g. one canonical `models:`
+    # plus one quoted `"models":` — because `yaml.safe_load` resolves both to
+    # the SAME key (`"models"`) and keeps only the last, while the regex count
+    # stays at 1 and the old guard passed. The writer would then patch the
+    # canonical (first, now-shadowed) block and leave the quoted duplicate
+    # untouched, silently producing a profile whose `models:` the loader and
+    # the file on disk disagree about.
+    #
+    # `model_key_count` (the canonical, EDITABLE span count) and
+    # `semantic_count` (every top-level key that YAML resolves to `"models"`,
+    # any spelling) must both be exactly 1, or both be 0 (no `models:` key at
+    # all — nothing to guard). Any other combination — two canonical keys, a
+    # canonical key shadowed by a quoted one, or a quoted-only key with no
+    # canonical span to splice into — means the targeted patch below cannot
+    # safely edit this file, so fail loud rather than guess.
     model_key_count = sum(1 for line in text.splitlines(keepends=True) if _MODELS_KEY_RE.match(line))
-    if model_key_count > 1:
+    semantic_count = _semantic_top_level_models_key_count(text, profile_path)
+    if (semantic_count, model_key_count) not in {(0, 0), (1, 1)}:
         raise ProfileError(
-            f"{profile_path}: {model_key_count} top-level 'models:' keys found — malformed "
-            "profile (YAML would silently keep only the last while this writer patches only "
-            "the first); remove the duplicate before writing"
+            f"{profile_path}: expected exactly one top-level 'models:' key, found "
+            f"{semantic_count} that YAML resolves to 'models' (any spelling) and "
+            f"{model_key_count} in the canonical, unquoted 'models:' spelling this writer's "
+            "targeted patch can edit — remove the duplicate, or rewrite the key as a plain, "
+            "unquoted 'models:', before writing"
         )
 
     raw_models = existing.get("models")
     if raw_models is not None and not isinstance(raw_models, dict):
         raise ProfileError(f"{profile_path}: 'models:' must be a mapping")
-
-    # Post-review FIX C (round 3): `yaml.safe_load` accepts YAML-equivalent
-    # spellings of the key — e.g. a quoted `"models":` — that the targeted,
-    # column-0 `^models:` regex above does not match. In that case
-    # `raw_models` is non-None (safe_load found the mapping) but
-    # `model_key_count` is 0, so `_splice_models_block` cannot find a span to
-    # replace and instead APPENDS a second, canonical `models:` block —
-    # silently producing the exact two-top-level-keys shape the check above
-    # exists to reject. Fail loud instead: the loaded profile has a
-    # `models:` key in a form this targeted splice cannot safely edit.
-    if raw_models is not None and model_key_count != 1:
-        raise ProfileError(
-            f"{profile_path}: 'models:' key found by the YAML loader but not in the exact "
-            "'models:' column-0 spelling this writer can target (found "
-            f"{model_key_count} matching span(s)) — rewrite the key as a plain, unquoted "
-            "'models:' before writing"
-        )
 
     models_block: dict[str, Any] = dict(raw_models or {})
     for tier in MODEL_TIERS:

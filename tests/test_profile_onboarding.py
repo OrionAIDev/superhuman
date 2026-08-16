@@ -1041,6 +1041,115 @@ def test_write_models_block_rejects_yaml_equivalent_quoted_models_key(tmp_path: 
     )
 
 
+def test_write_models_block_rejects_canonical_plus_quoted_models_key(tmp_path: Path) -> None:
+    """Round 3.5 FIX 1: one canonical `models:` PLUS one quoted `"models":` must fail loud.
+
+    The pre-existing guard counted only the canonical `^models:` spelling, so
+    this shape passed it (canonical count == 1) even though `yaml.safe_load`
+    sees TWO top-level `models` keys and keeps only the last — the writer
+    would patch the canonical (now-shadowed) block and leave the quoted
+    duplicate, which the loader actually reads, untouched. The semantic
+    counter (`yaml.compose`) must catch this even though the old regex-only
+    count could not.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        '"models":\n'
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original_text, (
+        "a failed write must leave the profile byte-untouched"
+    )
+
+
+def test_write_models_block_rejects_two_canonical_models_keys_still(tmp_path: Path) -> None:
+    """Round 3.5: the semantic rewrite must not regress the plain two-`models:` case.
+
+    Same shape as `test_write_models_block_rejects_duplicate_top_level_models_key`
+    above, re-asserted here to pin the semantic check's behaviour on the
+    simplest duplicate shape (both keys canonical, no quoting involved).
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+        "models:\n"
+        "  standard:\n"
+        "    primary: vendor-a/mid\n"
+        "    fallback: null\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(sp.ProfileError, match="top-level 'models:'"):
+        sp.write_models_block(dest, decline=True)
+
+
+def test_write_models_block_accepts_normal_single_models_key(tmp_path: Path) -> None:
+    """Round 3.5: a normal, single, unquoted `models:` key must still succeed.
+
+    The semantic guard must not be so strict it rejects the overwhelmingly
+    common case — one canonical `models:` key and nothing shadowing it — and
+    every tier must still end up populated (FR-10).
+    """
+    dest = tmp_path / "profile.yaml"
+    dest.write_text(
+        "version: 1\n"
+        "models:\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n",
+        encoding="utf-8",
+    )
+    sp.write_models_block(dest, decline=True)
+
+    text = dest.read_text(encoding="utf-8")
+    assert text.count("models:") == 1
+    profile = sp.load_profile(dest)
+    for tier in sp.MODEL_TIERS:
+        assert profile.models[tier]["primary"] == sp.MODEL_PLACEHOLDER
+
+
+def test_write_models_block_rejects_quoted_only_models_key(tmp_path: Path) -> None:
+    """Round 3.5: a lone `'models':` (single-quoted, no canonical spelling) must fail loud.
+
+    Semantically this is exactly one `models` key (`semantic_count == 1`), but
+    zero of them are in the canonical, editable spelling
+    (`model_key_count == 0`) — the targeted splice has no span to patch, and
+    appending would silently create a second, canonical `models:` key
+    alongside the quoted one. Fail loud instead of guessing.
+    """
+    dest = tmp_path / "profile.yaml"
+    original_text = (
+        "version: 1\n"
+        "'models':\n"
+        "  most_capable:\n"
+        "    primary: vendor-a/big\n"
+        "    fallback: null\n"
+    )
+    dest.write_text(original_text, encoding="utf-8")
+
+    with pytest.raises(sp.ProfileError, match="models:"):
+        sp.write_models_block(dest, decline=True)
+
+    assert dest.read_text(encoding="utf-8") == original_text, (
+        "a failed write must leave the profile byte-untouched"
+    )
+
+
 def test_write_models_block_preserves_indented_tier_after_column0_comment_inside_block(
     tmp_path: Path,
 ) -> None:

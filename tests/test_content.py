@@ -1427,16 +1427,22 @@ def test_hard_gate_resume_bullet_is_version_gated(skill_root: Path) -> None:
 
 
 def test_kickoff_models_set_invocation_is_injection_proof(skill_root: Path) -> None:
-    """FIX B: phases/0-kickoff.md Step 3 must not interpolate elicited/operator
-    JSON directly into a single-quoted shell word.
+    """FIX B (round 3) / FIX 3 (round 3.5): phases/0-kickoff.md Step 3 must not
+    interpolate elicited/operator JSON directly into a single-quoted shell
+    word, and must not leak a temp file.
 
-    Before this fix, the recipe built `--answers-json '{...}'` with the JSON
+    Before FIX B, the recipe built `--answers-json '{...}'` with the JSON
     payload written straight into a quoted shell argument — an operator alias
     or elicited answer containing a quote, `$`, or backtick would break the
     quoting or inject shell (dev-principle #5: no LLM-marshalled data into a
-    shell word). The fix routes the JSON through a quoted heredoc to a temp
-    file and passes that file via `--answers-json-file`, and quotes the
-    profile path.
+    shell word). FIX B routed the JSON through a quoted heredoc into a
+    `mktemp` temp file passed via `--answers-json-file <path>` — injection-proof,
+    but the temp file was never removed, leaking operator model aliases into
+    `/tmp` on every kickoff. Round 3.5 drops the temp file entirely: the CLI
+    already supports `--answers-json-file -` (read JSON from stdin), so the
+    quoted heredoc is piped directly into the command's stdin — no
+    intermediate file, no cleanup/trap needed, and the profile path is still
+    quoted.
     """
     text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
 
@@ -1444,11 +1450,17 @@ def test_kickoff_models_set_invocation_is_injection_proof(skill_root: Path) -> N
         "kickoff recipe must not interpolate --answers-json with an inline "
         "single-quoted JSON literal containing operator/elicited values"
     )
-    assert "--answers-json-file" in text, (
-        "kickoff recipe must use --answers-json-file to avoid shell interpolation"
+    assert "--answers-json-file -" in text, (
+        "kickoff recipe must use --answers-json-file - to read the answers JSON "
+        "from stdin, avoiding both shell interpolation and a temp file"
+    )
+    assert "mktemp" not in text, (
+        "kickoff recipe must not write the answers JSON to a mktemp temp file — "
+        "that file is never cleaned up and leaks operator model aliases into /tmp; "
+        "use --answers-json-file - (stdin) instead"
     )
     assert "<<'JSON'" in text or "<<'EOF'" in text, (
-        "kickoff recipe must write the answers JSON via a QUOTED heredoc "
+        "kickoff recipe must pipe the answers JSON via a QUOTED heredoc "
         "(quoted delimiter disables shell expansion inside it)"
     )
     assert '--profile "<profile-path>"' in text, (
