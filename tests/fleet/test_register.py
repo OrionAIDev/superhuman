@@ -333,6 +333,45 @@ class TestCliRegisterSubcommand:
         assert "session-id" in captured.err
         assert not (fleet_dir / "events.jsonl").exists()
 
+    def test_claude_harness_register_with_blank_session_id_fails_closed_via_cli(
+        self, git_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """10th-round preflight, BLOCKING, PM-reproduced (R10-3): round-9's
+        fix only caught a missing `--session-id`; `--session-id ""` (e.g. an
+        unset shell var interpolated into the flag) passed the `is None`
+        check outright and used to mint `node_id="claude/<ws>/demo-slug/"`
+        — an EMPTY trailing `local_id` component. Must now fail closed the
+        same way absence does: nonzero exit, actionable stderr, no
+        traceback, no events.jsonl written."""
+        fleet_dir = tmp_path / "fleet"
+        exit_code = main(
+            [
+                "register",
+                "--project-id",
+                "proj-abc123",
+                "--slug",
+                "demo-slug",
+                "--workspace",
+                str(git_repo),
+                "--harness",
+                "claude",
+                "--origination",
+                "relayed",
+                "--writer-role",
+                "session",
+                "--fleet-dir",
+                str(fleet_dir),
+                "--session-id",
+                "",
+            ]
+        )
+
+        assert exit_code != 0
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.err
+        assert "session-id" in captured.err
+        assert not (fleet_dir / "events.jsonl").exists()
+
     def test_main_returns_nonzero_on_lock_timeout(
         self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

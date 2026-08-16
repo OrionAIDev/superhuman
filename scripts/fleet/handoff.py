@@ -334,6 +334,53 @@ class _HandoffRow:
     branch: str
 
 
+#: Event types that permanently close a handoff row. Checked atomically,
+#: under the lock, by `_not_terminated` — the pre-lock `current.lifecycle`
+#: read in `self_register` cannot make this guarantee on its own, since a
+#: racing `cancel()` can commit in the window between that read and the
+#: lock actually being acquired for the launch write (review FIX #2). Also
+#: reused by `_HANDOFF_CLOSING_EVENT_TYPES` below.
+_TERMINAL_HANDOFF_EVENT_TYPES = frozenset({"handoff_cancelled", "handoff_expired"})
+
+#: Event types that move a handoff row's `lifecycle` away from
+#: `"awaiting-launch"` — a launch (to `"active"`) or either terminal event.
+#: `_log_open_handoff_node_ids` uses this (not `_TERMINAL_HANDOFF_EVENT_TYPES`
+#: alone) because a *launched* row is just as closed, for pool-membership
+#: purposes, as a cancelled/expired one.
+_HANDOFF_CLOSING_EVENT_TYPES = _TERMINAL_HANDOFF_EVENT_TYPES | {"handoff_launched"}
+
+
+def _log_open_handoff_node_ids(log_path: Path | str) -> set[str]:
+    """Return every node id the LOG says is still `awaiting-launch`.
+
+    10th-round preflight, BLOCKING, PM-reproduced (R10-2): the fragment-only
+    candidate pool in `_open_awaiting_launch_rows` reflects whatever fragment
+    files happen to exist on disk, not the log (the source of truth) — so a
+    fragment deleted out from under a still-open row silently drops that row
+    with no exception at all (unlike a *corrupt* fragment, an *absent* one
+    raises nothing from `iter_fragments`). This derives the "should be open"
+    set directly from the log, independent of the fragment cache, so the
+    caller can detect exactly that discrepancy and recover.
+
+    Args:
+        log_path: path to the project's event log.
+
+    Returns:
+        set[str]: node ids with a `handoff_emitted` event and no later
+        `handoff_launched`/`handoff_cancelled`/`handoff_expired` event for
+        that same node — i.e. every row the log alone says is still open,
+        regardless of what is or is not cached on disk.
+    """
+    emitted: set[str] = set()
+    closed: set[str] = set()
+    for event in read_all(log_path):
+        if event.type == "handoff_emitted":
+            emitted.add(event.node_id)
+        elif event.type in _HANDOFF_CLOSING_EVENT_TYPES:
+            closed.add(event.node_id)
+    return emitted - closed
+
+
 def _open_awaiting_launch_rows(
     log_path: Path | str, sessions_dir: Path | str
 ) -> list[_HandoffRow]:
@@ -383,14 +430,45 @@ def _open_awaiting_launch_rows(
     it does not reintroduce the P5-2 silent-drop of a real, log-backed
     awaiting-launch row, since a real row is always rebuilt to a valid
     fragment and never lands in the skipped set.
+
+    Nor must an ABSENT (not corrupt) cached fragment silently drop a live
+    candidate (10th-round preflight, BLOCKING, PM-reproduced, R10-2): the
+    round-9 fix above only covers a fragment that *exists but is corrupt* —
+    `iter_fragments` simply never sees a file that was deleted, so it raises
+    nothing and the row vanishes from `open_node_ids` with no signal at all,
+    the same silent-wrong-decision class P5-2 fixed for the corrupt case.
+    This closes that gap by deriving a second, independent "should be open"
+    set straight from the log (`_log_open_handoff_node_ids`, the source of
+    truth) and comparing it against `open_node_ids`: any node the log says
+    is still open but that has no fragment on disk at all triggers the same
+    bounded single `rebuild()` + retry as the corrupt branch above (never
+    more than one rebuild total, whichever branch triggers it first) — the
+    candidate pool always ends up reflecting the log, not just whatever
+    happens to survive on disk. A row still absent after a full rebuild
+    (e.g. no matching `handoff_emitted` event at all) is provably not a
+    real candidate and is correctly excluded, matching `rebuild()`'s own
+    "only rewrites log-backed nodes" contract.
     """
+    already_rebuilt = False
     try:
         current_fragments = iter_fragments(sessions_dir, skip_corrupt=False)
     except FragmentCorrupt:
         rebuild(log_path, sessions_dir)
+        already_rebuilt = True
         current_fragments = iter_fragments(sessions_dir, skip_corrupt=True)
 
     open_node_ids = {f.node_id for f in current_fragments if f.lifecycle == "awaiting-launch"}
+
+    if not already_rebuilt:
+        log_open_node_ids = _log_open_handoff_node_ids(log_path)
+        missing = log_open_node_ids - open_node_ids
+        if missing and any(read_fragment(nid, sessions_dir) is None for nid in missing):
+            rebuild(log_path, sessions_dir)
+            current_fragments = iter_fragments(sessions_dir, skip_corrupt=True)
+            open_node_ids = {
+                f.node_id for f in current_fragments if f.lifecycle == "awaiting-launch"
+            }
+
     if not open_node_ids:
         return []
 
@@ -407,14 +485,6 @@ def _open_awaiting_launch_rows(
             )
         )
     return rows
-
-
-#: Event types that permanently close a handoff row. Checked atomically,
-#: under the lock, by `_not_terminated` — the pre-lock `current.lifecycle`
-#: read in `self_register` cannot make this guarantee on its own, since a
-#: racing `cancel()` can commit in the window between that read and the
-#: lock actually being acquired for the launch write (review FIX #2).
-_TERMINAL_HANDOFF_EVENT_TYPES = frozenset({"handoff_cancelled", "handoff_expired"})
 
 
 def _not_terminated(node_id: str) -> Callable[[list[Event]], bool]:

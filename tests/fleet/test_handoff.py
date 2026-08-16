@@ -1557,3 +1557,121 @@ class TestCorruptCachedFragmentRecovery:
         assert result.status == "launched"
         assert result.node_id == emission.node_id
         assert result.match_method == "fuzzy"
+
+    def test_fuzzy_self_register_recovers_from_absent_awaiting_launch_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """10th-round preflight, BLOCKING, PM-reproduced (R10-2): the round-9
+        fix recovered a merely-ABSENT fragment on the exact-id path only.
+        The fuzzy path's candidate pool (`_open_awaiting_launch_rows`) still
+        built itself purely from `iter_fragments`, which never raises for a
+        file that simply does not exist — so a deleted fragment for a
+        log-backed, still-open row silently vanished from the pool and this
+        returned `not_found` instead of `launched`."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-absent-fuzzy")
+        fragment_path(emission.node_id, sessions_dir).unlink()
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "launched"
+        assert result.node_id == emission.node_id
+        assert result.match_method == "fuzzy"
+
+    def test_fuzzy_self_register_stays_ambiguous_when_one_of_two_fragments_is_absent(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """R10-2: with two open rows sharing the same `(cwd, branch)`, one of
+        which has had its fragment deleted, the fix must not silently narrow
+        the candidate pool down to the single surviving fragment and pick it
+        — that would be a wrong, unrefused auto-flip (TC-20's false-merge
+        risk). Recovering the missing fragment via `rebuild()` restores both
+        rows to the pool, so this must still report `ambiguous` with both
+        node ids, never a silent single pick."""
+        log_path, sessions_dir = fleet_dir
+        first = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-ambig-1")
+        second = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-ambig-2")
+        fragment_path(first.node_id, sessions_dir).unlink()
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "ambiguous"
+        assert result.candidates == tuple(sorted([first.node_id, second.node_id]))
+
+    def test_fuzzy_self_register_does_not_resurrect_a_cancelled_row_with_absent_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        """R10-2: a cancelled row's fragment being deleted must NOT make the
+        recovery path treat it as still-open — `_log_open_handoff_node_ids`
+        excludes any node with a `handoff_cancelled` event, so this row is
+        never a candidate for rebuild-and-resurrect, and the fuzzy match
+        correctly reports `not_found` (no open row for this cwd/branch)."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-cancelled")
+        handoff.cancel(
+            emission.node_id,
+            project_id="proj-abc123",
+            writer_role="Project Manager",
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+        )
+        fragment_path(emission.node_id, sessions_dir).unlink()
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "not_found"
+        events = read_all(log_path)
+        assert len([e for e in events if e.type == "handoff_launched"]) == 0
+
+    def test_open_awaiting_launch_rows_rebuilds_at_most_once_for_absent_fragment(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R10-2: the recovery must be a single bounded retry, mirroring
+        `test_exact_id_self_register_rebuilds_at_most_once_for_a_persistently_absent_fragment`
+        for the fuzzy pool-building path — never a loop, and never a double
+        rebuild when the corrupt-fragment branch already ran."""
+        log_path, sessions_dir = fleet_dir
+        emission = _emit(git_repo, fleet_dir, branch="feature/x", handoff_id="hid-count-rebuild")
+        fragment_path(emission.node_id, sessions_dir).unlink()
+
+        rebuild_calls = {"n": 0}
+        real_rebuild = handoff.rebuild
+
+        def _counting_rebuild(*args: object, **kwargs: object) -> object:
+            rebuild_calls["n"] += 1
+            return real_rebuild(*args, **kwargs)
+
+        monkeypatch.setattr(handoff, "rebuild", _counting_rebuild)
+
+        result = handoff.self_register(
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            writer_role="session",
+            handoff_id=None,
+            cwd=git_repo,
+            branch="feature/x",
+        )
+
+        assert result.status == "launched"
+        assert rebuild_calls["n"] == 1

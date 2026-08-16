@@ -46,3 +46,24 @@ def test_different_workspace_slug_pairs_never_collide() -> None:
 def test_node_id_is_a_plain_string() -> None:
     node_id = make_node_id("claude", "ws", "slug", "local-1")
     assert isinstance(node_id, str)
+
+
+class TestMakeNodeIdRejectsBlankComponents:
+    """10th-round preflight, BLOCKING, PM-reproduced (R10-3): the real
+    class-killer for a blank `local_id` (or any other component) reaching a
+    node id at all — not just at the one call site an adapter happened to
+    guard, but structurally, for every current and future adapter. An empty
+    or whitespace-only component must be rejected here, independent of
+    which caller supplied it."""
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    @pytest.mark.parametrize("index", [0, 1, 2, 3])
+    def test_blank_component_is_rejected(self, blank: str, index: int) -> None:
+        parts = ["claude", "ws", "slug", "local-1"]
+        parts[index] = blank
+        with pytest.raises(ValueError):
+            make_node_id(*parts)
+
+    def test_valid_components_still_construct_and_parse_unchanged(self) -> None:
+        node_id = make_node_id("claude", "ws", "slug", "local-1")
+        assert parse_node_id(node_id) == ("claude", "ws", "slug", "local-1")

@@ -120,6 +120,20 @@ class TestValidateEventRejectsMalformed:
         event = validate_event(data)
         assert event.schema_version == 1
 
+    @pytest.mark.parametrize("bad_bool", [True, False])
+    def test_bool_schema_version_is_rejected(self, bad_bool: bool, tmp_path) -> None:
+        """10th-round preflight, BLOCKING, PM-reproduced: `bool` is a
+        subclass of `int` in Python (`True == 1`), so a loose
+        `isinstance(x, int)` check accepted `schema_version=True` and
+        replayed it as valid v1 truth. Both `True` (which equals `1`, the
+        real `SCHEMA_VERSION_V1`) and `False` must be rejected outright —
+        neither is a legitimate int, regardless of its numeric value."""
+        data = _valid_event()
+        data["schema_version"] = bad_bool
+        with pytest.raises(ValidationError):
+            validate_event(data)
+        assert list(tmp_path.iterdir()) == []
+
 
 class TestFiveDecomposedStatusFields:
     """TC-2 (FR-5): the five fields are orthogonal; collapsing them is rejected."""

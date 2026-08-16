@@ -123,13 +123,26 @@ class ClaudeAdapter(SessionAdapter):
         different node_ids — duplicate `session_registered` rows for the
         same session, breaking NFR-1 idempotency on the primary harness.
 
+        10th-round preflight, BLOCKING, PM-reproduced (R10-3): round 9's
+        guard only tested `current_session_id is None` — `--session-id ""`
+        (e.g. an unset shell var interpolated into the flag) is not `None`,
+        so it passed straight through and minted a node id with an EMPTY
+        trailing `local_id` component (`node_id="claude/<ws>/demo/"`). A
+        blank (empty or whitespace-only) id is exactly as unresolved as a
+        missing one for this method's purposes and must fail the same way.
+        This check alone is defense-in-depth, not the sole guard: even if
+        a blank slipped past it, `core.nodes.make_node_id` itself now
+        structurally rejects any blank component (R10-3(b)), so no adapter
+        can ever mint a node id with an empty segment.
+
         Returns:
             SessionInfo: always `origination="relayed"` — reaching this
-            point proves `current_session_id` was supplied.
+            point proves `current_session_id` was supplied and non-blank.
 
         Raises:
             SessionIdentityUnresolved: if `current_session_id` was never
-                supplied at construction. The caller must supply the real
+                supplied at construction, or was supplied but is empty or
+                whitespace-only. The caller must supply the real, non-blank
                 id (`--session-id` on the CLI, or `current_session_id=` on
                 the constructor) — this adapter does not guess.
         """
@@ -139,6 +152,13 @@ class ClaudeAdapter(SessionAdapter):
                 "supply the real Claude session id via --session-id (CLI) "
                 "or current_session_id= (constructor); it cannot be "
                 "determined automatically on the Claude harness."
+            )
+        if not self._current_session_id.strip():
+            raise SessionIdentityUnresolved(
+                f"ClaudeAdapter's current_session_id is blank ({self._current_session_id!r}) "
+                "— supply the real, non-empty Claude session id via "
+                "--session-id (CLI) or current_session_id= (constructor); "
+                "a blank id is treated the same as a missing one."
             )
         facts = self.git_facts()
         local_id = self._current_session_id

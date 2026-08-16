@@ -18,6 +18,19 @@ _COMPONENT_COUNT = 4
 def make_node_id(harness: str, workspace: str, slug: str, local_id: str) -> str:
     """Build a namespaced node id from its four components.
 
+    10th-round preflight, BLOCKING, PM-reproduced (R10-3): this is the
+    structural class-killer for an empty namespaced component reaching a
+    node id at all. Round 9 fixed `ClaudeAdapter.current_session()` to
+    fail closed on a missing/blank `current_session_id`, but that guard
+    lives in exactly one caller — any other adapter (present or future,
+    Claude, Portable, or a third-party one) that ever passes an empty or
+    whitespace-only component straight through would reproduce the same
+    hole (e.g. `node_id="claude/<ws>/demo/"`, a node id with an empty
+    trailing identity component) without ever touching that one guarded
+    call site. Rejecting a blank component HERE, in the one function every
+    adapter must funnel through to mint a node id, closes the whole class
+    rather than the one reported instance.
+
     Args:
         harness: the harness this session runs under (e.g. "claude", "portable").
         workspace: the workspace/repo root identifying this checkout.
@@ -28,7 +41,18 @@ def make_node_id(harness: str, workspace: str, slug: str, local_id: str) -> str:
         str: `<harness>/<workspace>/<slug>/<local_id>`, each component
         percent-encoded so it round-trips through `parse_node_id` exactly,
         even if a component itself contains `/`.
+
+    Raises:
+        ValueError: if any of the four components is empty or
+            whitespace-only.
     """
+    parts = {"harness": harness, "workspace": workspace, "slug": slug, "local_id": local_id}
+    for name, value in parts.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"make_node_id: {name} must be a non-empty, non-blank string, "
+                f"got {value!r}"
+            )
     return "/".join(quote(part, safe="") for part in (harness, workspace, slug, local_id))
 
 

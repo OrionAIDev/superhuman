@@ -177,3 +177,21 @@ class TestClaudeAdapterEmitPrompt:
 
         assert "Pick up where the last session left off." in prompt
         assert f"FLEET-HANDOFF-ID: {handoff_id}" in prompt
+
+class TestClaudeAdapterBlankSessionIdFailsClosed:
+    """10th-round preflight, BLOCKING, PM-reproduced (R10-3): round-9's fix
+    only tested `current_session_id is None`. `--session-id ""` (e.g. an
+    unset shell var interpolated into the flag) passes that check outright
+    — `"" is not None` — and used to mint `node_id="claude/<ws>/demo/"`
+    with an EMPTY trailing `local_id` component. Blank must fail closed
+    exactly like absent."""
+
+    def test_empty_string_session_id_fails_closed(self, tmp_path: Path) -> None:
+        adapter = ClaudeAdapter(tmp_path, "demo-slug", current_session_id="")
+        with pytest.raises(SessionIdentityUnresolved):
+            adapter.current_session()
+
+    def test_whitespace_only_session_id_fails_closed(self, tmp_path: Path) -> None:
+        adapter = ClaudeAdapter(tmp_path, "demo-slug", current_session_id="   ")
+        with pytest.raises(SessionIdentityUnresolved):
+            adapter.current_session()

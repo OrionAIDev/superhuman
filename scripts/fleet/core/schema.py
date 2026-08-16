@@ -200,6 +200,32 @@ class Fragment:
     done_level: str
 
 
+def _assert_strict_int(value: Any, what: str) -> None:
+    """Raise ValidationError unless `value` is a strict `int`, not a `bool`.
+
+    10th-round preflight, BLOCKING, PM-reproduced: ``isinstance(x, int)`` is
+    `True` for `bool` (Python's `bool` subclasses `int`, and `True == 1`), so
+    a loose `isinstance(x, int)` check anywhere in this module would accept
+    `True`/`False` for an integer field and silently coerce it into `1`/`0`
+    on replay. This is the single, documented strict-int check every integer
+    field in this module routes through (currently `schema_version` only —
+    fragment fields are all non-empty strings, so `validate_fragment` has no
+    integer field to route), per the project's standing bias: distinguish
+    "absent" from "present-but-falsy", and never rely on a loose truthiness/
+    type check for a correctness or safety property.
+
+    Args:
+        value: the candidate value.
+        what: noun/description used in the error message (e.g. the field
+            name), so the caller controls how the offending value is named.
+
+    Raises:
+        ValidationError: if `value` is a `bool`, or is not an `int` at all.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{what} must be an int (not bool), got {value!r}")
+
+
 def _require_dict(data: Any, what: str) -> None:
     """Raise ValidationError unless `data` is a plain dict.
 
@@ -257,8 +283,7 @@ def validate_event(data: dict[str, Any]) -> Event:
             raise ValidationError(f"{key} must be a non-empty string")
 
     schema_version = data["schema_version"]
-    if not isinstance(schema_version, int):
-        raise ValidationError(f"schema_version must be an int, got {schema_version!r}")
+    _assert_strict_int(schema_version, "schema_version")
     if schema_version != SCHEMA_VERSION_V1:
         raise ValidationError(
             f"schema_version must be {SCHEMA_VERSION_V1}, got {schema_version!r}"
