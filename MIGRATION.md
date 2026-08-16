@@ -5,8 +5,9 @@
 This is the end-to-end workflow doc for the **superhuman skill maintainer**: how to
 get a change from your editor onto a deployed environment, verified, and tagged.
 
-`superhuman` is a single-author skill repo. Its "CI/CD" is not GitHub Actions — it
-is **three scripts** under `scripts/`, driven by hand from the laptop:
+`superhuman` is a single-author skill repo. Its **release/deploy** path is not
+GitHub Actions — it is **three scripts** under `scripts/`, driven by hand from the
+laptop:
 
 | Script | Role |
 |---|---|
@@ -32,8 +33,21 @@ container names — so superhuman ships an example rather than a script. Copy
 `examples/promote.sh.example` into your own profile repo, adapt it, and point
 the rung's `promote: { command: ... }` at it.
 
-There is no GitHub Actions workflow; the three scripts above are the whole
-automation surface.
+GitHub Actions covers **verification only**: `.github/workflows/ci.yml` runs
+`pytest tests/` on every pull request and on every push to `main`, across Python
+3.11–3.14 on Linux. It cuts no tags and deploys nothing — releasing and promoting
+remain the three scripts above.
+
+The division of labour is deliberate:
+
+| Gate | Runs | Covers |
+|---|---|---|
+| `scripts/git-hooks/pre-commit` | every commit, on the laptop | fast suite, Windows |
+| `.github/workflows/ci.yml` | every PR + push to `main` | full suite, Linux, py3.11–3.14 |
+| `scripts/release.sh` | by hand, at release time | full suite + hook smoke, then signs the tag |
+
+CI closes the gap the local loop cannot: the laptop only ever proves the suite on
+Windows against one interpreter, while the deployed rungs are Linux.
 
 ## 2. One-time setup
 

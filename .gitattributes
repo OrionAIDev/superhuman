@@ -1,3 +1,6 @@
+# Force LF for files whose `run:` blocks execute on POSIX CI runners
+.github/workflows/*.yml text eol=lf
+
 # Force LF for files that must be executable on POSIX systems
 hooks/session-start text eol=lf
 scripts/cleanup-project.sh text eol=lf
