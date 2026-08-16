@@ -21,6 +21,7 @@ from typing import Any
 from uuid import uuid4
 
 from .. import superhuman_profile
+from . import observe as fleet_observe
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
@@ -148,6 +149,7 @@ def _append_with_bounded_retry(
     *,
     attempts: int,
     backoff: float,
+    timeout: float | None = None,
 ) -> Event | None:
     """Call `core.events.append`, retrying a bounded number of times on lock contention.
 
@@ -163,6 +165,12 @@ def _append_with_bounded_retry(
         event_dict: the raw event dict to append.
         attempts: total attempts, including the first (must be >= 1).
         backoff: seconds to sleep between attempts.
+        timeout: per-attempt lock-acquisition timeout, passed to
+            `core.events.append`'s own `timeout` parameter (additive
+            passthrough, fleet-wiring Chunk 1, W-NFR-7). `None` (the
+            default) omits the keyword entirely, so `append` uses its own
+            default (10.0s) exactly as every pre-wiring caller already
+            observes — this must never change existing behavior.
 
     Returns:
         Event | None: as `core.events.append`.
@@ -172,10 +180,11 @@ def _append_with_bounded_retry(
             this exactly like a single `append` timeout — nothing was
             written.
     """
+    kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     last_exc: LockTimeoutError | None = None
     for attempt in range(attempts):
         try:
-            return append(log_path, event_dict)
+            return append(log_path, event_dict, **kwargs)
         except LockTimeoutError as exc:
             last_exc = exc
             if attempt < attempts - 1 and backoff > 0:
@@ -195,6 +204,7 @@ def register_session(
     target_session_id: str | None = None,
     lock_retry_attempts: int = _DEFAULT_LOCK_RETRY_ATTEMPTS,
     lock_retry_backoff: float = _DEFAULT_LOCK_RETRY_BACKOFF,
+    lock_timeout: float | None = None,
 ) -> Fragment:
     """Register one session as a `session_registered` event and project its fragment.
 
@@ -224,6 +234,11 @@ def register_session(
             `append`'s own internal retry/timeout (see
             `_append_with_bounded_retry`).
         lock_retry_backoff: seconds to sleep between registrar-level retries.
+        lock_timeout: per-attempt lock-acquisition timeout (additive
+            passthrough, fleet-wiring Chunk 1). `None` (the default,
+            unchanged for every existing caller) uses `append`'s own
+            default (10.0s); only `observe.py`'s own calls pass a smaller
+            value explicitly (W-NFR-7).
 
     Returns:
         Fragment: the session's fragment after the registration is applied.
@@ -251,7 +266,11 @@ def register_session(
     )
 
     appended = _append_with_bounded_retry(
-        log_path, event_dict, attempts=lock_retry_attempts, backoff=lock_retry_backoff
+        log_path,
+        event_dict,
+        attempts=lock_retry_attempts,
+        backoff=lock_retry_backoff,
+        timeout=lock_timeout,
     )
 
     if appended is None:
@@ -853,6 +872,123 @@ def _cmd_gen_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_observe_dispatch(args: argparse.Namespace) -> int:
+    """Handle `fleet observe dispatch` (fleet-wiring Chunk 1, W-FR-1).
+
+    Fail-soft wrapper over `observe.observe_dispatch` — see `observe.py`'s
+    module docstring for the fail-soft/fail-closed boundary this crosses.
+    Prints nothing on the normal path (DESIGN's Loudness tiers: `observe`
+    subcommands other than `handoff-emit`/`status` carry no stdout payload).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — `observe.py` never raises and never signals
+        failure through the exit code (Decision A).
+    """
+    adapter = _build_adapter(args)
+    fleet_observe.observe_dispatch(
+        adapter,
+        workspace=args.workspace,
+        slug=args.slug,
+        dispatch_id=args.dispatch_id,
+        writer_role=args.writer_role,
+    )
+    return 0
+
+
+def _cmd_observe_relay(args: argparse.Namespace) -> int:
+    """Handle `fleet observe relay` (fleet-wiring Chunk 1, W-FR-2).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` (see `_cmd_observe_dispatch`).
+    """
+    adapter = _build_adapter(args)
+    fleet_observe.observe_relay(
+        adapter, workspace=args.workspace, slug=args.slug, writer_role=args.writer_role
+    )
+    return 0
+
+
+def _cmd_observe_handoff_emit(args: argparse.Namespace) -> int:
+    """Handle `fleet observe handoff-emit` (fleet-wiring Chunk 1, W-FR-3).
+
+    Unlike `dispatch`/`relay`/`launch`, this always carries a stdout (or
+    `--output-file`) payload — the deliverable prompt — even when fleet is
+    disabled or the write fails (DESIGN's "single most important fail-soft
+    behavior"; see `observe.observe_handoff_emit`'s docstring).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0`.
+    """
+    adapter = _build_adapter(args)
+    prompt_text = args.prompt_file.read_text(encoding="utf-8")
+    result = fleet_observe.observe_handoff_emit(
+        adapter,
+        workspace=args.workspace,
+        slug=args.slug,
+        prompt_text=prompt_text,
+        cwd=args.cwd,
+        branch=args.branch,
+        writer_role=args.writer_role,
+    )
+    delivered = result.prompt_text if result.prompt_text is not None else prompt_text
+    if args.output_file is not None:
+        args.output_file.write_text(delivered, encoding="utf-8")
+    else:
+        print(delivered)
+    return 0
+
+
+def _cmd_observe_launch(args: argparse.Namespace) -> int:
+    """Handle `fleet observe launch` (fleet-wiring Chunk 1, W-FR-4).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` (see `_cmd_observe_dispatch`).
+    """
+    adapter = _build_adapter(args)
+    prompt_text = (
+        args.prompt_file.read_text(encoding="utf-8") if args.prompt_file is not None else None
+    )
+    fleet_observe.observe_launch(
+        adapter,
+        workspace=args.workspace,
+        slug=args.slug,
+        handoff_id=args.handoff_id,
+        prompt_text=prompt_text,
+        cwd=args.cwd,
+        branch=args.branch,
+        writer_role=args.writer_role,
+    )
+    return 0
+
+
+def _cmd_observe_status(args: argparse.Namespace) -> int:
+    """Handle `fleet observe status` (fleet-wiring Chunk 1, W-FR-8).
+
+    The one `observe` subcommand whose entire purpose is its stdout payload
+    — the human-readable enablement/activity report.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — a read-only report has nothing to reject.
+    """
+    print(fleet_observe.observe_status(args.workspace, args.slug))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `fleet` argument parser.
 
@@ -943,8 +1079,139 @@ def build_parser() -> argparse.ArgumentParser:
     _add_done_subparsers(subparsers)
     _add_query_subparsers(subparsers)
     _add_view_subparsers(subparsers)
+    _add_observe_subparsers(subparsers)
 
     return parser
+
+
+def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach the shared `--harness`/session-identity arguments `_build_adapter` needs.
+
+    Factored out of `_add_observe_subparsers` since every `observe`
+    subcommand needs the identical set (matching `register`'s equivalent
+    flags exactly, per `_build_adapter`).
+
+    Args:
+        parser: the subcommand parser to attach the arguments to.
+    """
+    parser.add_argument(
+        "--harness",
+        choices=("claude", "portable"),
+        default="portable",
+        help="which SessionAdapter implementation to use (default: portable)",
+    )
+    parser.add_argument(
+        "--session-id", default=None, help="--harness claude only: see `register`'s equivalent flag"
+    )
+    parser.add_argument("--sessions-json", type=Path, default=None, help="--harness claude only")
+    parser.add_argument(
+        "--session-relay-script", type=Path, default=None, help="--harness claude only"
+    )
+    parser.add_argument("--local-id", default=None, help="--harness portable only")
+
+
+def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `observe dispatch|relay|handoff-emit|launch|status` verb group.
+
+    The fail-soft observation façade's CLI surface (fleet-wiring Chunk 1,
+    Decision A/B) — every subcommand always exits `0` and calls straight
+    into `observe.py`, which never raises. This is the boundary every
+    origination seam (spawned dispatch, relay, manual handoff emit/launch)
+    is meant to invoke, whether triggered by portable prose or an optional
+    operator-installed hook (both call the identical entry point).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    observe_parser = subparsers.add_parser(
+        "observe",
+        help="Fail-soft observation façade: dispatch, relay, handoff-emit, launch, status. "
+        "Always exits 0.",
+    )
+    observe_subparsers = observe_parser.add_subparsers(dest="observe_command", required=True)
+
+    dispatch_parser = observe_subparsers.add_parser(
+        "dispatch", help="Observe a spawned role dispatch (W-FR-1). Always exits 0."
+    )
+    dispatch_parser.add_argument("--workspace", required=True, type=Path)
+    dispatch_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    dispatch_parser.add_argument(
+        "--dispatch-id", required=True, help="the PM-minted id identifying the dispatch unit"
+    )
+    dispatch_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    _add_harness_arguments(dispatch_parser)
+    dispatch_parser.set_defaults(func=_cmd_observe_dispatch)
+
+    relay_parser = observe_subparsers.add_parser(
+        "relay", help="Observe a session-relay handoff (W-FR-2). Always exits 0."
+    )
+    relay_parser.add_argument("--workspace", required=True, type=Path)
+    relay_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    relay_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    _add_harness_arguments(relay_parser)
+    relay_parser.set_defaults(func=_cmd_observe_relay)
+
+    handoff_emit_parser = observe_subparsers.add_parser(
+        "handoff-emit",
+        help="Observe a manual-handoff emission; always delivers the prompt (W-FR-3). "
+        "Always exits 0.",
+    )
+    handoff_emit_parser.add_argument("--workspace", required=True, type=Path)
+    handoff_emit_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    handoff_emit_parser.add_argument(
+        "--prompt-file", required=True, type=Path, help="path to the draft prompt body"
+    )
+    handoff_emit_parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=None,
+        help="write the deliverable prompt here instead of stdout",
+    )
+    handoff_emit_parser.add_argument(
+        "--cwd",
+        type=Path,
+        default=None,
+        help="the target working directory for the launched session (defaults to --workspace)",
+    )
+    handoff_emit_parser.add_argument("--branch", default=None, help="the target git branch")
+    handoff_emit_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    _add_harness_arguments(handoff_emit_parser)
+    handoff_emit_parser.set_defaults(func=_cmd_observe_handoff_emit)
+
+    launch_parser = observe_subparsers.add_parser(
+        "launch", help="Observe a handoff launch flip (W-FR-4). Always exits 0."
+    )
+    launch_parser.add_argument("--workspace", required=True, type=Path)
+    launch_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    launch_parser.add_argument(
+        "--handoff-id", default=None, help="the id recovered from this session's own prompt"
+    )
+    launch_parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="grep this file's FLEET-HANDOFF-ID line when --handoff-id is not given directly",
+    )
+    launch_parser.add_argument("--cwd", type=Path, default=None, help="override the fuzzy cwd anchor")
+    launch_parser.add_argument("--branch", default=None, help="override the fuzzy branch anchor")
+    launch_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    _add_harness_arguments(launch_parser)
+    launch_parser.set_defaults(func=_cmd_observe_launch)
+
+    status_parser = observe_subparsers.add_parser(
+        "status", help="Report enablement/activity for a workspace (W-FR-8). Always exits 0."
+    )
+    status_parser.add_argument("--workspace", required=True, type=Path)
+    status_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    status_parser.set_defaults(func=_cmd_observe_status)
 
 
 def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:

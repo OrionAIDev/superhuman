@@ -33,12 +33,17 @@ _FALLBACK_DEFAULT_BRANCHES = ("main", "master")
 _GIT_TIMEOUT_SECONDS = 30
 
 
-def run_git(cwd: Path, args: list[str]) -> str | None:
+def run_git(cwd: Path, args: list[str], *, timeout: float = _GIT_TIMEOUT_SECONDS) -> str | None:
     """Run one git plumbing command, returning stripped stdout or None on failure.
 
     Args:
         cwd: directory to run the command in.
         args: git arguments, excluding the `git` executable itself.
+        timeout: seconds to allow the subprocess before killing it. Additive
+            passthrough (fleet-wiring Chunk 1, W-NFR-7) — defaults to
+            `_GIT_TIMEOUT_SECONDS` (30.0s) unchanged for every existing
+            caller; only `observe.py`'s own bounded calls pass a smaller
+            value explicitly.
 
     Returns:
         str | None: stripped stdout on success; None if git exited non-zero,
@@ -51,7 +56,7 @@ def run_git(cwd: Path, args: list[str]) -> str | None:
             ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -61,11 +66,17 @@ def run_git(cwd: Path, args: list[str]) -> str | None:
     return proc.stdout.strip()
 
 
-def collect_git_facts(cwd: Path) -> GitFacts:
+def collect_git_facts(cwd: Path, *, git_timeout: float = _GIT_TIMEOUT_SECONDS) -> GitFacts:
     """Gather real git plumbing facts for `cwd`.
 
     Args:
         cwd: the working tree to inspect.
+        git_timeout: seconds allowed per subprocess call (additive
+            passthrough, fleet-wiring Chunk 1 — defaults to
+            `_GIT_TIMEOUT_SECONDS` (30.0s) unchanged for every existing
+            caller). Up to 7 subprocess calls may be made in the worst
+            case, so the observation façade passes a much smaller value
+            (0.25s) to stay inside its own wall-clock budget (W-NFR-7).
 
     Returns:
         GitFacts: `is_repo=False` if `cwd` does not exist or is not inside a
@@ -74,24 +85,28 @@ def collect_git_facts(cwd: Path) -> GitFacts:
     if not cwd.is_dir():
         return GitFacts(is_repo=False)
 
-    toplevel = run_git(cwd, ["rev-parse", "--show-toplevel"])
+    toplevel = run_git(cwd, ["rev-parse", "--show-toplevel"], timeout=git_timeout)
     if toplevel is None:
         return GitFacts(is_repo=False)
 
-    branch = run_git(cwd, ["branch", "--show-current"]) or None
+    branch = run_git(cwd, ["branch", "--show-current"], timeout=git_timeout) or None
 
-    status = run_git(cwd, ["status", "--porcelain"])
+    status = run_git(cwd, ["status", "--porcelain"], timeout=git_timeout)
     dirty = len([line for line in status.splitlines() if line.strip()]) if status else 0
 
     merge_base = None
-    default = run_git(cwd, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    default = run_git(
+        cwd, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], timeout=git_timeout
+    )
     if default is None:
         for name in _FALLBACK_DEFAULT_BRANCHES:
-            if name != branch and run_git(cwd, ["rev-parse", "--verify", "--quiet", name]):
+            if name != branch and run_git(
+                cwd, ["rev-parse", "--verify", "--quiet", name], timeout=git_timeout
+            ):
                 default = name
                 break
     if default and branch and default != branch:
-        merge_base = run_git(cwd, ["merge-base", default, branch])
+        merge_base = run_git(cwd, ["merge-base", default, branch], timeout=git_timeout)
 
     return GitFacts(
         is_repo=True,
@@ -116,6 +131,7 @@ class PortableAdapter(SessionAdapter):
         slug: str,
         *,
         local_id: str | None = None,
+        git_timeout: float | None = None,
     ) -> None:
         """Initialize a PortableAdapter.
 
@@ -126,10 +142,15 @@ class PortableAdapter(SessionAdapter):
                 to `str(os.getpid())` — the only portable, non-fabricated
                 identity a bare Python process has for itself with no
                 harness support.
+            git_timeout: seconds allowed per git subprocess call in
+                `git_facts()` (additive passthrough, fleet-wiring Chunk 1).
+                `None` (the default, unchanged for every existing caller)
+                uses `collect_git_facts`'s own default (30.0s).
         """
         self.workspace = Path(workspace)
         self.slug = slug
         self._local_id = local_id if local_id is not None else str(os.getpid())
+        self._git_timeout = git_timeout
 
     def current_session(self) -> SessionInfo:
         """Return this process's own identity, enriched with real git facts.
@@ -166,9 +187,13 @@ class PortableAdapter(SessionAdapter):
         """Return real git plumbing facts for `self.workspace`.
 
         Returns:
-            GitFacts: as `collect_git_facts(self.workspace)`.
+            GitFacts: as `collect_git_facts(self.workspace)`, honoring this
+            adapter's `git_timeout` override if one was given at
+            construction.
         """
-        return collect_git_facts(self.workspace)
+        if self._git_timeout is None:
+            return collect_git_facts(self.workspace)
+        return collect_git_facts(self.workspace, git_timeout=self._git_timeout)
 
     def emit_prompt(self, text: str, handoff_id: str) -> str:
         """Append the literal handoff-id marker line to `text`.
