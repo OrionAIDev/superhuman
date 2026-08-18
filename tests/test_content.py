@@ -18,7 +18,9 @@ import yaml
 from publication_patterns import (  # noqa: E402
     LEAK_PATTERNS,
     TOKENS_FILE,
+    find_tokens,
     is_scanned,
+    load_tokens,
 )
 
 
@@ -977,11 +979,7 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
     if not tokens_path.is_file():
         pytest.skip(f"no {TOKENS_FILE} — nothing operator-specific to check")
 
-    tokens = [
-        line.strip().lower()
-        for line in tokens_path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    tokens = load_tokens(tokens_path)
     assert tokens, f"{TOKENS_FILE} exists but lists no tokens"
 
     offenders: dict[str, list[str]] = {}
@@ -989,8 +987,7 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
         path = skill_root / rel
         if not path.is_file() or rel == TOKENS_FILE:
             continue
-        lowered = path.read_text(encoding="utf-8", errors="replace").lower()
-        hits = [t for t in tokens if t in lowered]
+        hits = find_tokens(path.read_text(encoding="utf-8", errors="replace"), tokens)
         if hits:
             offenders[rel] = hits
 
@@ -998,6 +995,85 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
     assert not offenders, (
         "operator-specific strings leaked into shipped files — this belongs in "
         "~/.superhuman/profile.yaml, not in the skill:\n" + detail
+    )
+
+
+def test_no_per_project_docs_are_tracked(skill_root: Path) -> None:
+    """Only ``docs/superhuman/specs/`` may be tracked under ``docs/superhuman/``.
+
+    This pins the exact failure that put operator vocabulary into the published
+    tree: a project's working docs (VISION / REQUIREMENTS / DESIGN / PLAN /
+    TEST / SUPERHUMAN / DECISIONS) were committed under
+    ``docs/superhuman/<project>/`` and carried the operator's environment names
+    with them. Those docs are meant to stay local — enforced by the
+    ``/docs/superhuman/*/`` rule in ``.gitignore`` — and ``specs/`` is the one
+    subtree published on purpose (scrubbed first).
+
+    Unlike ``test_operator_tokens_are_absent``, this needs no token list, so it
+    runs in CI on every pull request. It catches the leak by its shape rather
+    than by its vocabulary — the invariant, not the words.
+
+    Args:
+        skill_root: Repository root.
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files", "docs/superhuman/"],
+        cwd=skill_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+
+    # ``git ls-files docs/superhuman/`` returns only the repo-root subtree, so
+    # the intentionally-tracked fixture under tests/smoke/.../docs/superhuman/
+    # is out of scope by construction.
+    offenders = [rel for rel in tracked if not rel.startswith("docs/superhuman/specs/")]
+    assert not offenders, (
+        "per-project superhuman docs are tracked in a published repo — untrack "
+        "them (`git rm --cached`); they stay local per the .gitignore rule:\n"
+        + "\n".join(f"  {rel}" for rel in offenders)
+    )
+    # Guard against a future glob/path change silently matching nothing: the
+    # specs that are supposed to be published must actually be here.
+    assert any(rel.startswith("docs/superhuman/specs/") for rel in tracked), (
+        "expected docs/superhuman/specs/ to be tracked — either the specs were "
+        "removed or this check is no longer looking where it thinks it is"
+    )
+
+
+def test_operator_token_mechanism_detects_a_planted_token(skill_root: Path) -> None:
+    """The token load+match mechanism must still catch a planted synthetic token.
+
+    ``test_operator_tokens_are_absent`` skips in CI, because the real token list
+    is intentionally not in this repo — so the mechanism it depends on would
+    otherwise be exercised nowhere the build can see. This test closes that gap
+    with a committed synthetic fixture: invented tokens (no real vocabulary) and
+    two sample files, one seeded with a token and one clean. It calls the same
+    ``load_tokens``/``find_tokens`` the real guard calls, so a regression that
+    broke matching fails the build here even when the real guard is skipping.
+
+    Args:
+        skill_root: Repository root.
+    """
+    fixture = skill_root / "tests" / "fixtures" / "publication_guard_fixture"
+    tokens = load_tokens(fixture / "planted-tokens.txt")
+
+    # Comments and blank lines dropped, tokens lowercased for case-insensitivity.
+    assert tokens == ["quimby-sprocket", "vermillion7"], (
+        f"token parsing changed unexpectedly: {tokens!r}"
+    )
+
+    leaky = (fixture / "leaky-sample.md").read_text(encoding="utf-8")
+    hits = find_tokens(leaky, tokens)
+    assert "vermillion7" in hits, (
+        "the token-matching mechanism did not catch a planted token that is "
+        "present (in a different case) — the operator-vocabulary guard is broken"
+    )
+
+    clean = (fixture / "clean-sample.md").read_text(encoding="utf-8")
+    assert find_tokens(clean, tokens) == [], (
+        "the token-matching mechanism reported a hit in a file that contains "
+        "none of the planted tokens — the guard is over-firing"
     )
 
 
