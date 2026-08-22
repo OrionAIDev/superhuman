@@ -1,0 +1,29 @@
+# .publication-tokens — example
+#
+# Copy this file to `.publication-tokens` (same directory) and list the
+# environment-specific vocabulary that must NEVER appear in a shipped file:
+# organisation names, internal codenames, host prefixes, product names,
+# usernames — anything specific to YOUR setup rather than to superhuman.
+#
+#   cp .publication-tokens.example .publication-tokens
+#   # then edit .publication-tokens to list your own tokens
+#
+# The real `.publication-tokens` is gitignored, so your vocabulary never ships.
+# This `.example` file is tracked only to document the format.
+#
+# Format:
+#   - one token per line
+#   - blank lines and lines beginning with `#` are ignored
+#   - matching is case-insensitive substring matching
+#
+# The publication guard (tests/test_content.py :: test_operator_tokens_are_absent)
+# reads `.publication-tokens` and fails the suite if any listed token appears in a
+# tracked file. When `.publication-tokens` is absent the check skips silently, so
+# seeding this list is opt-in — but doing so is what keeps a fork's own internal
+# vocabulary out of the published tree.
+#
+# Example tokens (delete these and add your own):
+# acme-corp
+# project-nightingale
+# prod-gateway
+# jdoe
