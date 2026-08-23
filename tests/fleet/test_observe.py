@@ -16,7 +16,11 @@ import pytest
 
 from scripts.fleet import observe
 from scripts.fleet.adapter.portable import PortableAdapter
+from scripts.fleet.cli import build_parser
 from scripts.fleet.core.errors import LockTimeoutError, OwnershipError, ValidationError
+from scripts.fleet.core.nodes import parse_node_id
+from scripts.fleet.core.store import read_fragment
+from scripts.fleet.handoff import extract_handoff_id
 
 
 def _run_git(cwd: Path, *args: str) -> None:
@@ -123,8 +127,14 @@ class TestDisabledWorkspace:
         )
 
         assert result.disabled is True
+        # TC-9(a): the draft is delivered byte-for-byte — this equality is
+        # itself the strongest form of the two negatives below (no id line,
+        # no self-register instruction), since nothing was appended at all.
         assert result.prompt_text == draft
         assert "FLEET-HANDOFF-ID" not in result.prompt_text
+        assert extract_handoff_id(result.prompt_text) is None
+        assert "self-register" not in result.prompt_text.lower()
+        assert "observe launch" not in result.prompt_text.lower()
         assert not _fleet_dir(workspace, slug).exists()
 
 
@@ -194,6 +204,64 @@ class TestSuccessfulWrites:
         assert result.node_id is not None
         assert "FLEET-HANDOFF-ID:" in result.prompt_text
         assert draft.strip() in result.prompt_text
+
+    def test_handoff_emit_delivered_id_line_equals_written_row_handoff_id(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        """TC-8/W-FR-3: assert the delivered id *equals* the written row's id, not just presence."""
+        workspace, slug = enabled_project
+        adapter = PortableAdapter(workspace, slug)
+        draft = "Continue the chunk.\n"
+
+        result = observe.observe_handoff_emit(
+            adapter, workspace=workspace, slug=slug, prompt_text=draft, writer_role="pm"
+        )
+
+        assert result.ok is True
+        delivered_id = extract_handoff_id(result.prompt_text)
+        assert delivered_id is not None
+        _, _, _, local_id = parse_node_id(result.node_id)
+        assert local_id == f"handoff-{delivered_id}"
+
+    def test_handoff_emit_row_identity_matches_superhuman_md_not_passed_slug(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-8/W-FR-6: the row's project_id/slug are carried exactly from `SUPERHUMAN.md`.
+
+        The file's own `**Slug:**` line deliberately differs from the
+        `slug` argument used to *locate* the file (a rename in progress),
+        and `**Project-id:**` is a value nothing else in this fixture could
+        derive (no git remote, no cwd-basename match) — proving the row's
+        identity is carried from the file, not re-derived.
+        """
+        located_slug = "demo-project"
+        file_slug = "renamed-slug"
+        project_id = "fleet-carried-id-999"
+        profile = tmp_path / "profile.yaml"
+        profile.write_text(
+            "fleet:\n  enabled: true\n  observe_deadline_seconds: 5.0\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+        project_dir = git_repo / "docs" / "superhuman" / located_slug
+        project_dir.mkdir(parents=True)
+        (project_dir / "SUPERHUMAN.md").write_text(
+            f"**Slug:** {file_slug}\n**Project-id:** {project_id}\n", encoding="utf-8"
+        )
+        adapter = PortableAdapter(git_repo, located_slug)
+
+        result = observe.observe_handoff_emit(
+            adapter, workspace=git_repo, slug=located_slug, prompt_text="draft\n", writer_role="pm"
+        )
+
+        assert result.ok is True
+        harness, _workspace_component, node_slug, _local_id = parse_node_id(result.node_id)
+        assert harness == "handoff"
+        assert node_slug == file_slug
+        assert node_slug != located_slug
+
+        fragment = read_fragment(result.node_id, project_dir / "fleet" / "sessions")
+        assert fragment is not None
+        assert fragment.project_id == project_id
 
     def test_launch_flips_row_to_active(self, enabled_project: tuple[Path, str]) -> None:
         workspace, slug = enabled_project
@@ -422,6 +490,84 @@ class TestFaultInjectionMatrix:
         assert result.ok is False
         journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
         assert '"error_class": "identity_unresolved"' in journal
+
+
+class TestHandoffEmitCli:
+    """TC-9 exercised through the CLI path (`--prompt-file` -> `--output-file`).
+
+    The acceptance criterion is about the prompt *actually delivered*, and
+    the file write itself lives in `cli._cmd_observe_handoff_emit`, not in
+    `observe.observe_handoff_emit` — so the library-level assertions above
+    do not, by themselves, cover this path.
+    """
+
+    def test_cli_handoff_emit_still_delivers_prompt_when_disabled(
+        self, disabled_project: tuple[Path, str], tmp_path: Path
+    ) -> None:
+        workspace, slug = disabled_project
+        prompt_file = tmp_path / "prompt.md"
+        prompt_file.write_text("Please continue.\n", encoding="utf-8")
+        output_file = tmp_path / "output.md"
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "handoff-emit",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--prompt-file",
+                str(prompt_file),
+                "--output-file",
+                str(output_file),
+            ]
+        )
+
+        assert args.func(args) == 0
+
+        delivered = output_file.read_text(encoding="utf-8")
+        assert delivered == "Please continue.\n"
+        assert "FLEET-HANDOFF-ID" not in delivered
+        assert not _fleet_dir(workspace, slug).exists()
+
+    def test_cli_handoff_emit_still_delivers_prompt_when_manifest_write_fails(
+        self, enabled_project: tuple[Path, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace, slug = enabled_project
+        prompt_file = tmp_path / "prompt.md"
+        prompt_file.write_text("the deliverable prompt\n", encoding="utf-8")
+        output_file = tmp_path / "output.md"
+
+        def _raise_lock_timeout(*args: object, **kwargs: object) -> None:
+            raise LockTimeoutError("simulated lock contention")
+
+        monkeypatch.setattr(observe, "handoff_emit_impl", _raise_lock_timeout)
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "handoff-emit",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--prompt-file",
+                str(prompt_file),
+                "--output-file",
+                str(output_file),
+            ]
+        )
+
+        assert args.func(args) == 0
+
+        delivered = output_file.read_text(encoding="utf-8")
+        assert delivered == "the deliverable prompt\n"
+        assert "FLEET-HANDOFF-ID" not in delivered
+        journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
+        assert '"error_class": "lock_timeout"' in journal
 
 
 class TestAdditionalBranchCoverage:

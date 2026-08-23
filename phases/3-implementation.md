@@ -33,6 +33,16 @@ consulted: []
 
 Per DESIGN.md §11.6. Triggers from §7. PM classifies severity; trivial → log; minor → fold/accumulate; moderate+ → G6 (interrupts dispatch).
 
+## Chunk-boundary handoff emission (non-gating)
+
+When a chunk boundary produces a next-session handoff/kickoff prompt — e.g. PM pauses here to
+reassess restart-vs-continue and hands the next chunk to a fresh session — PM emits that prompt
+through `fleet observe handoff-emit --prompt-file ... --output-file ...` rather than handing it
+off by hand. This step never blocks the surrounding gate: it is purely observational, any failure
+(fleet disabled, a manifest write that cannot complete, or any other fault) is logged and
+execution proceeds exactly as if the step had not run, and the deliverable prompt handed to the
+next session is produced regardless of whether the observation itself succeeds.
+
 ## Outputs
 
 - Code commits (per chunk)
