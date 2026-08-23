@@ -298,3 +298,119 @@ class TestSpawnedDispatchSeamContent:
         subsection = _dispatch_subsection_text(_REPO_ROOT / "phases/3-implementation.md")
         assert not _GRANULARITY_RULE_RE.search(subsection)
         assert "roles/pm.md" in subsection
+
+
+# --- TC-15: `SKILL.md`'s launch-flip first-action step names the command,
+# and states — in its own words — that it is idempotent and inert-when-off
+# (W-FR-4, W-FR-7, Chunk 3/7). The behavioral half (fleet disabled -> zero
+# writes; no matching row -> journaled no-op, no exception) is covered in
+# `tests/fleet/test_observe.py::TestDisabledWorkspace::
+# test_launch_produces_zero_writes_when_disabled` and
+# `TestFuzzyLaunchFlip::test_launch_not_found_is_journaled` — this class adds
+# the missing content-level half: does SKILL.md's prose actually say so. ----
+
+_SKILL_MD_LAUNCH_COMMAND_RE = re.compile(r"fleet observe launch\b")
+_IDEMPOTENT_MARKERS = ("idempotent",)
+_INERT_WHEN_OFF_MARKERS = ("inert",)
+
+
+def _skill_md_launch_step_text() -> str:
+    """Extract SKILL.md's `## Fleet observation — launch flip` subsection body."""
+    return _new_subsection_text_by_heading(
+        _REPO_ROOT / "SKILL.md", "fleet observation", "launch"
+    )
+
+
+def _new_subsection_text_by_heading(file_path: Path, *substrings: str) -> str:
+    """Same extraction shape as `_find_heading_containing`, returned as text."""
+    lines, start, end = _find_heading_containing(file_path, *substrings)
+    return "\n".join(lines[start:end])
+
+
+class TestSkillMdLaunchStepSeamContent:
+    """TC-15: the additive `SKILL.md` first-action step names the literal
+    command, states it is idempotent, states it is inert-when-off, is
+    non-gating, and contains no operator token.
+    """
+
+    def test_subsection_names_the_literal_command(self) -> None:
+        subsection = _skill_md_launch_step_text()
+        assert _SKILL_MD_LAUNCH_COMMAND_RE.search(subsection), (
+            "SKILL.md launch-flip subsection does not name the literal "
+            "'fleet observe launch' command"
+        )
+
+    def test_subsection_states_idempotent(self) -> None:
+        subsection = _skill_md_launch_step_text().lower()
+        assert any(marker in subsection for marker in _IDEMPOTENT_MARKERS), (
+            "SKILL.md launch-flip subsection never states the step is idempotent"
+        )
+
+    def test_subsection_states_inert_when_off(self) -> None:
+        subsection = _skill_md_launch_step_text().lower()
+        assert any(marker in subsection for marker in _INERT_WHEN_OFF_MARKERS), (
+            "SKILL.md launch-flip subsection never states the step is inert when off"
+        )
+
+    def test_subsection_states_non_blocking_and_failure_logged_and_proceeds(self) -> None:
+        subsection = _skill_md_launch_step_text().lower()
+        assert any(marker in subsection for marker in _NON_BLOCKING_MARKERS), (
+            "SKILL.md launch-flip subsection never states it is non-blocking"
+        )
+        assert any(marker in subsection for marker in _LOGGED_AND_PROCEEDS_MARKERS), (
+            "SKILL.md launch-flip subsection never states a failure is logged"
+        )
+        assert any(marker in subsection for marker in _PROCEEDS_MARKERS), (
+            "SKILL.md launch-flip subsection never states execution proceeds"
+        )
+
+    def test_subsection_contains_no_operator_token(self) -> None:
+        subsection = _skill_md_launch_step_text()
+        for token in _OPERATOR_TOKENS:
+            assert token not in subsection, f"SKILL.md launch-flip subsection: operator token {token!r} found"
+
+
+# --- TC-28: `docs/fleet-observation.md` covers the required topics
+# (W-FR-8 doc-level, Decision E mitigation (iv), Chunk 7). ------------------
+
+_FLEET_OBSERVATION_DOC = _REPO_ROOT / "docs" / "fleet-observation.md"
+
+#: Each entry: (topic label, at-least-one-of markers, case-insensitive).
+_REQUIRED_DOC_TOPICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("enablement", ("enable", "opt-in", "fleet.enabled")),
+    ("fail-soft/fail-closed boundary", ("fail-soft", "fail-closed")),
+    ("granularity rule", ("granularity rule",)),
+    ("hook install", ("install", "session start", "pretooluse")),
+    ("observe status", ("observe status", "fleet observe status")),
+    (
+        "stale-output-is-candidates-not-verdicts caveat",
+        ("candidates to confirm, not a verdict", "candidates to confirm, not as a verdict"),
+    ),
+)
+
+
+class TestFleetObservationDocContent:
+    """TC-28: the shipped operator doc covers every required topic, and
+    carries no operator token (it is subject to the same publication guard
+    as every other shipped file).
+    """
+
+    def test_doc_exists(self) -> None:
+        assert _FLEET_OBSERVATION_DOC.is_file(), "docs/fleet-observation.md is missing"
+
+    @pytest.mark.parametrize("topic, markers", _REQUIRED_DOC_TOPICS, ids=[t for t, _ in _REQUIRED_DOC_TOPICS])
+    def test_doc_covers_required_topic(self, topic: str, markers: tuple[str, ...]) -> None:
+        # Collapse whitespace (including markdown's natural line-wrapping
+        # inside a paragraph) so a marker phrase that happens to wrap across
+        # source lines still matches — the guard checks prose content, not
+        # line layout.
+        raw = _FLEET_OBSERVATION_DOC.read_text(encoding="utf-8").lower()
+        text = re.sub(r"\s+", " ", raw)
+        assert any(marker in text for marker in markers), (
+            f"docs/fleet-observation.md does not appear to cover: {topic}"
+        )
+
+    def test_doc_contains_no_operator_token(self) -> None:
+        text = _FLEET_OBSERVATION_DOC.read_text(encoding="utf-8")
+        for token in _OPERATOR_TOKENS:
+            assert token not in text, f"docs/fleet-observation.md: operator token {token!r} found"
