@@ -194,3 +194,107 @@ class TestHookTemplateSeamContent:
         assert expected_verb in text, (
             f"{relative_path}: does not invoke the literal '{expected_verb}' entry point"
         )
+
+
+# --- TC-20: spawned-dispatch seam content — granularity rule stated once,
+# role-prompt predicate checkable (W-FR-1, Q3 / Decision C, Chunk 5) --------
+
+#: The literal command shape the two new subsections must name.
+_DISPATCH_COMMAND_SHAPE_RE = re.compile(r"fleet observe dispatch --harness subagent")
+
+#: The canonical granularity-rule statement (Decision C). Matched loosely
+#: enough to survive minor rewording, tightly enough that a drifted second
+#: copy in the other file would still be caught by the exact-count check
+#: below (TC-20's "not duplicated with drifting wording" requirement).
+_GRANULARITY_RULE_RE = re.compile(
+    r"registers?\s+iff\s+the\s+dispatched\s+prompt\s+leads\s+with\s+a\s+`roles/\*\.md`\s+block",
+    re.IGNORECASE,
+)
+
+
+def _find_heading_containing(file_path: Path, *substrings: str) -> tuple[list[str], int, int]:
+    """Return `(lines, start, end)` for the first `## ` heading whose text (lowercased)
+    contains every one of `substrings`, spanning from the heading line up to
+    (not including) the next `## ` heading or end of file.
+    """
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        lowered = line.lower()
+        if line.startswith("## ") and all(s in lowered for s in substrings):
+            start = i
+            break
+    assert start is not None, (
+        f"{file_path}: no '## ...' heading found containing all of {substrings!r}"
+    )
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    return lines, start, end
+
+
+def _dispatch_subsection_text(file_path: Path) -> str:
+    """Extract the new spawned-dispatch-observation subsection's body text."""
+    lines, start, end = _find_heading_containing(file_path, "dispatch", "observation")
+    return "\n".join(lines[start:end])
+
+
+class TestSpawnedDispatchSeamContent:
+    """TC-20: the granularity rule is stated exactly once, and each new dispatch
+    call-out names the literal `fleet observe dispatch --harness subagent` shape.
+    """
+
+    @pytest.mark.parametrize("relative_path", _EDITED_FILES)
+    def test_subsection_exists_and_names_the_command_shape(self, relative_path: str) -> None:
+        subsection = _dispatch_subsection_text(_REPO_ROOT / relative_path)
+        assert _DISPATCH_COMMAND_SHAPE_RE.search(subsection), (
+            f"{relative_path}: dispatch-observation subsection does not name the literal "
+            "command shape 'fleet observe dispatch --harness subagent'"
+        )
+
+    @pytest.mark.parametrize("relative_path", _EDITED_FILES)
+    def test_subsection_states_non_blocking_and_failure_logged_and_proceeds(
+        self, relative_path: str
+    ) -> None:
+        subsection = _dispatch_subsection_text(_REPO_ROOT / relative_path).lower()
+        assert any(marker in subsection for marker in _NON_BLOCKING_MARKERS), (
+            f"{relative_path}: dispatch-observation subsection never states it is non-blocking"
+        )
+        assert any(marker in subsection for marker in _LOGGED_AND_PROCEEDS_MARKERS), (
+            f"{relative_path}: dispatch-observation subsection never states a failure is logged"
+        )
+        assert any(marker in subsection for marker in _PROCEEDS_MARKERS), (
+            f"{relative_path}: dispatch-observation subsection never states execution proceeds"
+        )
+
+    @pytest.mark.parametrize("relative_path", _EDITED_FILES)
+    def test_subsection_contains_no_operator_token(self, relative_path: str) -> None:
+        subsection = _dispatch_subsection_text(_REPO_ROOT / relative_path)
+        for token in _OPERATOR_TOKENS:
+            assert token not in subsection, f"{relative_path}: operator token {token!r} found"
+
+    def test_granularity_rule_stated_exactly_once_across_the_shipped_seams(self) -> None:
+        """Q3 / Decision C: a single canonical statement — the dispatch call-out in the
+        other file cites it by reference rather than restating it, so a future edit
+        cannot update one copy and drift from the other.
+        """
+        total_matches = 0
+        for relative_path in _EDITED_FILES:
+            text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            total_matches += len(_GRANULARITY_RULE_RE.findall(text))
+        assert total_matches == 1, (
+            "expected the granularity rule ('registers iff the dispatched prompt leads "
+            f"with a `roles/*.md` block') to appear exactly once across {_EDITED_FILES}, "
+            f"found {total_matches}"
+        )
+
+    def test_non_canonical_file_cites_rather_than_restates(self) -> None:
+        """`phases/3-implementation.md`'s call-out references `roles/pm.md` by name
+        instead of restating the rule (the file that does NOT carry the canonical
+        statement, per the exact-count check above).
+        """
+        subsection = _dispatch_subsection_text(_REPO_ROOT / "phases/3-implementation.md")
+        assert not _GRANULARITY_RULE_RE.search(subsection)
+        assert "roles/pm.md" in subsection

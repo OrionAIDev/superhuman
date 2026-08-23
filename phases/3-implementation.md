@@ -43,6 +43,17 @@ off by hand. This step never blocks the surrounding gate: it is purely observati
 execution proceeds exactly as if the step had not run, and the deliverable prompt handed to the
 next session is produced regardless of whether the observation itself succeeds.
 
+## Per-chunk dispatch observation (non-gating)
+
+After PM dispatches Developer for a chunk (Step 2 above), PM calls
+`fleet observe dispatch --harness subagent --dispatch-id <role>-<chunk>-<n> --local-id
+<role>-<chunk>-<n> ...` to record the dispatch — per the granularity rule stated once in
+`roles/pm.md`'s "Fleet dispatch observation (spawned path)" subsection, not restated here. This
+step never blocks the surrounding gate: it is purely observational, any failure (fleet disabled, a
+manifest write that cannot complete, or any other fault) is logged and execution proceeds exactly
+as if the step had not run, and the chunk dispatch itself proceeds regardless of whether the
+observation succeeds.
+
 ## Outputs
 
 - Code commits (per chunk)
