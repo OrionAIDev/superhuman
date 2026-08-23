@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
 from scripts.fleet import observe
+from scripts.fleet.adapter.claude import ClaudeAdapter
 from scripts.fleet.adapter.portable import PortableAdapter
 from scripts.fleet.cli import build_parser
 from scripts.fleet.core.errors import LockTimeoutError, OwnershipError, ValidationError
@@ -1016,6 +1018,89 @@ class TestPassthroughDefaultsUnchanged:
         adapter.git_facts()
 
         assert "git_timeout" not in captured
+
+
+class TestRelayedPathSessionRelayPresence:
+    """TC-22 (fleet-wiring Chunk 6, W-FR-2/W-NFR-3): `observe_relay` with
+    `session-relay` present vs absent, exercised through `ClaudeAdapter` —
+    the one adapter that actually knows about `session-relay` (see its
+    module docstring). `TestSuccessfulWrites.test_relay_writes_a_validated_
+    relayed_entry` already proves the happy path through `PortableAdapter`;
+    this class adds the harness where `session-relay` concretely matters.
+    """
+
+    def test_relay_happy_path_with_session_relay_present(
+        self, enabled_project: tuple[Path, str], tmp_path: Path
+    ) -> None:
+        """TC-22(a): `session-relay` importable/present -> a validated
+        `relayed` entry, driven through the adapter `session-relay` itself
+        would construct (a real `current_session_id`, plus a configured
+        `session_relay_script` standing in for `session-relay`'s
+        `session_scan.py`)."""
+        workspace, slug = enabled_project
+        script = tmp_path / "fake_session_scan.py"
+        script.write_text("import sys\nprint('{\"sessions\": []}')\n", encoding="utf-8")
+        adapter = ClaudeAdapter(
+            workspace,
+            slug,
+            current_session_id="relay-session-1",
+            session_relay_script=script,
+        )
+
+        result = observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+
+        assert result.ok is True
+        assert result.node_id is not None
+        fragment = read_fragment(result.node_id, _fleet_dir(workspace, slug) / "sessions")
+        assert fragment is not None
+
+    def test_relay_degrades_to_journaled_failure_with_session_relay_absent(
+        self, enabled_project: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-22(b): `session-relay` absent, simulated two ways at once —
+        (1) `sys.modules` blocked for `session_relay`, following the same
+        proof-of-independence idiom `test_adapter_portable.py`'s
+        `TestPortableAdapterDegradesWithoutSessionRelay` already uses for
+        `PortableAdapter`/NFR-3; and (2) the concrete, harness-real analogue
+        for the *relayed* path specifically: a `ClaudeAdapter` built exactly
+        as it would be if `session-relay` were never installed to supply
+        `--session-id` in the first place — no `current_session_id`, no
+        `session_relay_script`.
+
+        FLAGGED FOR PM (see Chunk 6 dispatch report, not silently decided
+        here): TEST.md's TC-22(b) wording is "nothing raises, nothing is
+        written, no error surfaces -- inert, not broken", stronger than
+        Decision A's general fail-soft contract (journal-and-proceed).
+        `observe_relay` has no branch specific to "session-relay absent" --
+        an unresolvable session identity (this scenario) is handled exactly
+        like every other façade failure mode, per the pre-existing,
+        already-merged `test_session_identity_unresolved_from_adapter_is_
+        journaled` above: caught by the broad catch, classified
+        `identity_unresolved`, and JOURNALED (Loudness tier 1) -- not fully
+        inert. The only truly zero-I/O path in this module today is the
+        *disabled*-workspace one (`TestDisabledWorkspace`). This test
+        therefore asserts the actual, implemented, already-established
+        contract (never raises; no error surfaces to the caller; nothing is
+        added to the sessions manifest; the diagnostic journal, which is
+        explicitly not the manifest, does get a line) rather than silently
+        forcing a behavior change to match the stronger "inert" wording.
+        """
+        monkeypatch.setitem(sys.modules, "session_relay", None)
+        for name in list(sys.modules):
+            if "session_relay" in name and name != "session_relay":
+                monkeypatch.delitem(sys.modules, name, raising=False)
+
+        workspace, slug = enabled_project
+        adapter = ClaudeAdapter(workspace, slug)  # no current_session_id, no session_relay_script
+
+        result = observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+
+        assert result.ok is False
+        assert result.reason is not None  # never raises; the failure is returned, not surfaced
+        sessions_dir = _fleet_dir(workspace, slug) / "sessions"
+        assert not sessions_dir.exists() or not any(sessions_dir.iterdir())
+        journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
+        assert '"error_class": "identity_unresolved"' in journal
 
 
 class TestObserveStatus:
