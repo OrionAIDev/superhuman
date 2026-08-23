@@ -48,6 +48,37 @@ def format_handoff_line(handoff_id: str) -> str:
     return f"{HANDOFF_ID_LINE_PREFIX} {handoff_id}"
 
 
+#: The self-register instruction `emit_prompt` embeds adjacent to the
+#: `FLEET-HANDOFF-ID` line (fleet-wiring Chunk 3, Decision E). The prompt is
+#: the only context guaranteed to reach a launched session that never loads
+#: superhuman, so this is the strongest available carrier for the launch-flip
+#: trigger — stronger than the `SKILL.md` first-action step or an
+#: operator-installed hook, both of which are unreachable for a session that
+#: skips superhuman entirely. Kept here, not duplicated per adapter, so both
+#: implementations produce byte-identical framing (same rationale as
+#: `format_handoff_line`). Deliberately generic prose, not a fully-formed
+#: CLI invocation: `emit_prompt` has no `workspace`/`slug` to fill in, and
+#: this step is best-effort by construction — never worth blocking on.
+_LAUNCH_INSTRUCTION = (
+    "If this project uses fleet session observation, run "
+    "`fleet observe launch --workspace <this project's root> "
+    "--slug <this project's slug> --handoff-id <the id above>` as your first "
+    "action (see SKILL.md's first-action step). This is best-effort: if "
+    "fleet observation is disabled, unavailable, or the command fails, skip "
+    "it and proceed with the work above regardless — it never blocks."
+)
+
+
+def format_launch_instruction() -> str:
+    """Return the self-register instruction embedded next to the handoff-id line.
+
+    Returns:
+        str: prose telling a launched session how to flip its own row to
+        `active`, with no trailing newline.
+    """
+    return _LAUNCH_INSTRUCTION
+
+
 def workspace_component(workspace: Path | str) -> str:
     """Return a short, filesystem-safe, stable node-id component for `workspace`.
 

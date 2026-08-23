@@ -156,3 +156,41 @@ class TestAdditiveDiffInvariant:
             f"{relative_path}: diff against merge-base {merge_base} removed lines:\n"
             + "\n".join(removed_lines)
         )
+
+
+# --- TC-14: hook templates contain no operator tokens and call the shipped
+# entry point (W-NFR-5, Chunk 3) --------------------------------------------
+
+#: The two operator-neutral hook templates Chunk 3 ships. Each must invoke
+#: the identical `fleet observe <event>` verb the prose floor uses — never a
+#: parallel/divergent invocation (DESIGN's hybrid boundary).
+_HOOK_TEMPLATES: dict[str, str] = {
+    "templates/hooks/SessionStart": "fleet observe launch",
+    "templates/hooks/PreToolUse": "fleet observe dispatch",
+}
+
+
+class TestHookTemplateSeamContent:
+    """TC-14: templates/hooks/{SessionStart,PreToolUse} exist, are clean, and
+
+    invoke the same CLI verb group the portable prose floor invokes.
+    """
+
+    @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
+    def test_template_exists(self, relative_path: str) -> None:
+        path = _REPO_ROOT / relative_path
+        assert path.is_file(), f"{relative_path}: hook template missing"
+
+    @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
+    def test_template_contains_no_operator_token(self, relative_path: str) -> None:
+        text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        for token in _OPERATOR_TOKENS:
+            assert token not in text, f"{relative_path}: operator token {token!r} found"
+
+    @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
+    def test_template_invokes_the_shipped_entry_point_verbatim(self, relative_path: str) -> None:
+        text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        expected_verb = _HOOK_TEMPLATES[relative_path]
+        assert expected_verb in text, (
+            f"{relative_path}: does not invoke the literal '{expected_verb}' entry point"
+        )

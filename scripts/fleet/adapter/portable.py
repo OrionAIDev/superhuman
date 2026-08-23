@@ -21,7 +21,14 @@ import subprocess
 from pathlib import Path
 
 from ..core.nodes import make_node_id
-from .base import GitFacts, SessionAdapter, SessionInfo, format_handoff_line, workspace_component
+from .base import (
+    GitFacts,
+    SessionAdapter,
+    SessionInfo,
+    format_handoff_line,
+    format_launch_instruction,
+    workspace_component,
+)
 
 #: Local default-branch names tried when no remote-tracking ref exists —
 #: mirrors `session-relay`'s own `session_scan.default_branch` fallback list,
@@ -203,6 +210,10 @@ class PortableAdapter(SessionAdapter):
             handoff_id: the UUID minted for this handoff.
 
         Returns:
-            str: `text`, a blank line, then the `FLEET-HANDOFF-ID:` line.
+            str: `text`, a blank line, the `FLEET-HANDOFF-ID:` line, then the
+            self-register instruction (Chunk 3, Decision E).
         """
-        return f"{text}\n\n{format_handoff_line(handoff_id)}\n"
+        return (
+            f"{text}\n\n{format_handoff_line(handoff_id)}\n\n"
+            f"{format_launch_instruction()}\n"
+        )

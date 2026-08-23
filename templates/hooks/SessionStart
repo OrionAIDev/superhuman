@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# SessionStart — TEMPLATE hook for fleet session observation (fleet-wiring
+# Chunk 3, Decision E). Copy, adapt, and install under YOUR harness's own
+# hook mechanism (e.g. Claude Code's `SessionStart` hook in
+# `.claude/settings.json`). Never installed automatically by this skill —
+# `templates/hooks/` ships templates, not live hooks.
+#
+# Purpose: give the launch flip a DETERMINISTIC ceiling on top of the
+# portable prose floor. Every emitted handoff prompt already carries a
+# `FLEET-HANDOFF-ID:` line plus a self-register instruction (see
+# `scripts/fleet/adapter/base.py`'s `format_launch_instruction`), and
+# `SKILL.md` carries an additive first-action step that attempts the same
+# call. This hook is the strongest available option ON TOP of those: where
+# installed, it fires without depending on the launched session ever
+# reading its own prompt or loading superhuman at all.
+#
+# This hook calls the SAME entry point the prose floor calls —
+# `fleet observe launch` — never a parallel or divergent invocation. A
+# deterministic hook can never diverge from the portable prose floor because
+# both call the identical CLI verb.
+#
+# Best-effort by construction: this script's exit status is never allowed to
+# block session start. `fleet observe launch` itself always exits 0 (it is
+# fail-soft — see `scripts/fleet/observe.py`'s module docstring), and this
+# wrapper additionally never propagates a non-zero exit from anything else
+# it runs.
+#
+# --- adapt everything below this line --------------------------------------
+
+# The project working tree root. Most harnesses expose this as the hook's
+# own cwd; override if your harness passes it differently (e.g. via a JSON
+# payload on stdin).
+WORKSPACE="$(pwd)"
+
+# The superhuman project slug for this workspace. Fill this in — it is not
+# auto-derived because more than one slug may exist under one workspace.
+SLUG="REPLACE_WITH_YOUR_PROJECT_SLUG"
+
+# Locate the `fleet` CLI. Adjust if your install path differs.
+FLEET_CLI="$(command -v fleet || echo "${WORKSPACE}/scripts/fleet/cli.py")"
+
+# Best-effort: never let this block or fail session start.
+"$FLEET_CLI" observe launch --workspace "$WORKSPACE" --slug "$SLUG" >/dev/null 2>&1 || true
+
+exit 0

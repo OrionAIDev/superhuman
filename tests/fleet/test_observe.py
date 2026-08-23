@@ -264,6 +264,7 @@ class TestSuccessfulWrites:
         assert fragment.project_id == project_id
 
     def test_launch_flips_row_to_active(self, enabled_project: tuple[Path, str]) -> None:
+        """TC-11: id-anchored match, and idempotent on repeat."""
         workspace, slug = enabled_project
         adapter = PortableAdapter(workspace, slug)
         emitted = observe.observe_handoff_emit(
@@ -281,6 +282,60 @@ class TestSuccessfulWrites:
 
         assert result.ok is True
         assert result.node_id == emitted.node_id
+
+        # Idempotent: calling it again with the same prompt does not error
+        # and does not double-flip or duplicate the event (TC-11).
+        repeat = observe.observe_launch(
+            adapter,
+            workspace=workspace,
+            slug=slug,
+            prompt_text=emitted.prompt_text,
+            writer_role="pm",
+        )
+        assert repeat.ok is True
+        assert repeat.node_id == emitted.node_id
+        assert repeat.reason == "already_launched"
+
+    def test_launch_fuzzy_match_unambiguous_flips_row_when_id_line_is_corrupted(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        """TC-12: the id line is edited away/corrupted, but exactly one
+
+        `awaiting-launch` row uniquely matches by `(cwd, branch)` — the row
+        flips to active via the fuzzy path, not the id-anchored one.
+        """
+        workspace, slug = enabled_project
+        adapter = PortableAdapter(workspace, slug)
+        emitted = observe.observe_handoff_emit(
+            adapter,
+            workspace=workspace,
+            slug=slug,
+            prompt_text="draft\n",
+            cwd=workspace,
+            branch="trunk",
+            writer_role="pm",
+        )
+        assert emitted.ok is True
+        assert "FLEET-HANDOFF-ID" in emitted.prompt_text
+
+        # Simulate an operator-edited prompt: the id line is gone, but the
+        # rest of the prompt (and thus the (cwd, branch) anchors) survives.
+        corrupted_prompt = emitted.prompt_text.split("FLEET-HANDOFF-ID")[0]
+        assert extract_handoff_id(corrupted_prompt) is None
+
+        result = observe.observe_launch(
+            adapter,
+            workspace=workspace,
+            slug=slug,
+            prompt_text=corrupted_prompt,
+            cwd=workspace,
+            branch="trunk",
+            writer_role="pm",
+        )
+
+        assert result.ok is True
+        assert result.node_id == emitted.node_id
+        assert result.reason == "launched"
 
     def test_launch_ambiguous_fuzzy_match_refuses_and_journals(
         self, enabled_project: tuple[Path, str]

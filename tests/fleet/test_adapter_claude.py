@@ -178,6 +178,20 @@ class TestClaudeAdapterEmitPrompt:
         assert "Pick up where the last session left off." in prompt
         assert f"FLEET-HANDOFF-ID: {handoff_id}" in prompt
 
+    def test_emit_prompt_embeds_self_register_instruction_adjacent_to_id_line(
+        self, tmp_path: Path
+    ) -> None:
+        """Chunk 3, Decision E: the launched session sees the trigger in its own prompt."""
+        adapter = ClaudeAdapter(tmp_path, "demo-slug")
+        handoff_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        prompt = adapter.emit_prompt("Pick up where the last session left off.", handoff_id)
+
+        id_pos = prompt.index(f"FLEET-HANDOFF-ID: {handoff_id}")
+        assert "fleet observe launch" in prompt[id_pos:]
+        assert "best-effort" in prompt.lower()
+        assert "never blocks" in prompt.lower()
+
+
 class TestClaudeAdapterBlankSessionIdFailsClosed:
     """10th-round preflight, BLOCKING, PM-reproduced (R10-3): round-9's fix
     only tested `current_session_id is None`. `--session-id ""` (e.g. an
