@@ -301,7 +301,7 @@ These are not phase gates. They produce findings only; they do not modify SUPERH
 
 ## Related skills
 
-superhuman's session-tracking manifest relates to three other skills without being bundled with any of them — see `docs/superhuman/session-tracking/skill-relationships.md` for the full rationale (relationships, and the schema-contract-now-vs-bundle-later packaging decision).
+superhuman's session-tracking manifest relates to three other skills without being bundled with any of them — see `docs/skill-relationships.md` for the full rationale (relationships, and the schema-contract-now-vs-bundle-later packaging decision).
 
 ## When NOT to use this skill
 

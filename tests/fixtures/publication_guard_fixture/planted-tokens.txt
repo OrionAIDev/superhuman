@@ -1,0 +1,8 @@
+# Synthetic operator-token list for the guard's own fixture test.
+# These are invented words, NOT anyone's real vocabulary — the point is to
+# prove the load+match mechanism still works without shipping a real token.
+# Blank lines and comments (like these) must be ignored; matching is
+# case-insensitive, which the mixed-case second token exercises.
+
+quimby-sprocket
+Vermillion7

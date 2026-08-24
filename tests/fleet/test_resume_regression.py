@@ -60,7 +60,29 @@ def _merge_base_with_main() -> str | None:
     has already lived through one history rewrite that silently orphaned a
     pinned SHA. Returns `None` (never raises) if git or the ref is
     unavailable, so callers can skip cleanly instead of failing.
+
+    **Mid-merge correction:** a pre-commit hook runs before the merge commit
+    exists, so `HEAD` is still the pre-merge tip and `git merge-base HEAD
+    origin/main` resolves to the OLD (pre-merge) merge-base — which then
+    picks up `main`'s own independent commits (anything `main` itself
+    changed since branching) as if THIS branch had changed them, a false
+    positive discovered live merging `origin/main` into `fleet-wiring`. Once
+    the merge commit lands, `origin/main` becomes a direct parent and this
+    function's normal computation would return `origin/main`'s own tip — so
+    while `MERGE_HEAD` exists, this returns it directly rather than the
+    stale pre-merge value, matching what the post-commit answer will be.
     """
+    merge_head = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if merge_head.returncode == 0 and merge_head.stdout.strip():
+        return merge_head.stdout.strip()
+
     try:
         result = subprocess.run(
             ["git", "merge-base", "HEAD", "origin/main"],

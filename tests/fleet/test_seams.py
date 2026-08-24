@@ -31,7 +31,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # `sys.path` outside pytest's own rootdir-relative import; this mirrors how
 # `tests/test_content.py` (a sibling of publication_patterns.py) imports it.
 sys.path.insert(0, str(_REPO_ROOT / "tests"))
-from publication_patterns import TOKENS_FILE  # noqa: E402
+from publication_patterns import TOKENS_FILE, find_tokens, load_tokens  # noqa: E402
 
 #: The two prose files Chunk 2 is permitted to edit that actually carry the
 #: new handoff-emission subsection (`SKILL.md`/`phases/4-acceptance.md` were
@@ -51,21 +51,25 @@ _PROCEEDS_MARKERS = ("proceed", "continue", "unaffected")
 
 def _operator_tokens() -> list[str]:
     """Read operator tokens the same way `test_content.py`'s canonical
-    `test_operator_tokens_are_absent` guard does (W-NFR-5): from the
-    gitignored `.publication-tokens` file at the repo root, never hardcoded
-    in this tracked, shipped test file. Skips cleanly (matching the
-    canonical guard's own behavior) when the file is absent — the normal
-    case for anyone who is not maintaining a private fork with its own
-    operator vocabulary.
+    `test_operator_tokens_are_absent` guard does (W-NFR-5): via
+    `publication_patterns.load_tokens` against the gitignored
+    `.publication-tokens` file at the repo root, never hardcoded in this
+    tracked, shipped test file. Skips cleanly (matching the canonical
+    guard's own behavior) when the file is absent — the normal case for
+    anyone who is not maintaining a private fork with its own operator
+    vocabulary.
+
+    Delegating to `load_tokens` (rather than re-parsing the file here) keeps
+    this module's token *loading* on the same single code path as the
+    canonical guard — matching is likewise delegated to `find_tokens` at
+    each call site below, so this module's operator-token checks and
+    `test_operator_tokens_are_absent` share their entire mechanism, not
+    just their token source.
     """
     tokens_path = _REPO_ROOT / TOKENS_FILE
     if not tokens_path.is_file():
         pytest.skip(f"no {TOKENS_FILE} — nothing operator-specific to check")
-    tokens = [
-        line.strip()
-        for line in tokens_path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    tokens = load_tokens(tokens_path)
     if not tokens:
         pytest.skip(f"{TOKENS_FILE} exists but lists no tokens")
     return tokens
@@ -78,7 +82,29 @@ def _merge_base_with_main() -> str | None:
     hash: this project has already lived through one history rewrite that
     silently orphaned a pinned SHA. Returns `None` (never raises) if git or
     the ref is unavailable, so callers can skip cleanly instead of failing.
+
+    **Mid-merge correction:** a pre-commit hook runs before the merge commit
+    exists, so `HEAD` is still the pre-merge tip and `git merge-base HEAD
+    origin/main` resolves to the OLD (pre-merge) merge-base — which then
+    picks up `main`'s own independent commits (anything `main` itself
+    changed since branching) as if THIS branch had changed them, a false
+    positive discovered live merging `origin/main` into `fleet-wiring`. Once
+    the merge commit lands, `origin/main` becomes a direct parent and this
+    function's normal computation would return `origin/main`'s own tip — so
+    while `MERGE_HEAD` exists, this returns it directly rather than the
+    stale pre-merge value, matching what the post-commit answer will be.
     """
+    merge_head = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if merge_head.returncode == 0 and merge_head.stdout.strip():
+        return merge_head.stdout.strip()
+
     try:
         result = subprocess.run(
             ["git", "merge-base", "HEAD", "origin/main"],
@@ -147,8 +173,8 @@ class TestHandoffEmissionSeamContent:
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
     def test_subsection_contains_no_operator_token(self, relative_path: str) -> None:
         subsection = _new_subsection_text(_REPO_ROOT / relative_path)
-        for token in _operator_tokens():
-            assert token not in subsection, f"{relative_path}: operator token {token!r} found"
+        hits = find_tokens(subsection, _operator_tokens())
+        assert not hits, f"{relative_path}: operator token(s) found: {hits!r}"
 
 
 class TestAdditiveDiffInvariant:
@@ -208,8 +234,8 @@ class TestHookTemplateSeamContent:
     @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
     def test_template_contains_no_operator_token(self, relative_path: str) -> None:
         text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        for token in _operator_tokens():
-            assert token not in text, f"{relative_path}: operator token {token!r} found"
+        hits = find_tokens(text, _operator_tokens())
+        assert not hits, f"{relative_path}: operator token(s) found: {hits!r}"
 
     @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
     def test_template_invokes_the_shipped_entry_point_verbatim(self, relative_path: str) -> None:
@@ -308,8 +334,8 @@ class TestSpawnedDispatchSeamContent:
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
     def test_subsection_contains_no_operator_token(self, relative_path: str) -> None:
         subsection = _dispatch_subsection_text(_REPO_ROOT / relative_path)
-        for token in _operator_tokens():
-            assert token not in subsection, f"{relative_path}: operator token {token!r} found"
+        hits = find_tokens(subsection, _operator_tokens())
+        assert not hits, f"{relative_path}: operator token(s) found: {hits!r}"
 
     def test_granularity_rule_stated_exactly_once_across_the_shipped_seams(self) -> None:
         """Q3 / Decision C: a single canonical statement — the dispatch call-out in the
@@ -402,8 +428,8 @@ class TestSkillMdLaunchStepSeamContent:
 
     def test_subsection_contains_no_operator_token(self) -> None:
         subsection = _skill_md_launch_step_text()
-        for token in _operator_tokens():
-            assert token not in subsection, f"SKILL.md launch-flip subsection: operator token {token!r} found"
+        hits = find_tokens(subsection, _operator_tokens())
+        assert not hits, f"SKILL.md launch-flip subsection: operator token(s) found: {hits!r}"
 
 
 # --- TC-28: `docs/fleet-observation.md` covers the required topics
@@ -448,5 +474,5 @@ class TestFleetObservationDocContent:
 
     def test_doc_contains_no_operator_token(self) -> None:
         text = _FLEET_OBSERVATION_DOC.read_text(encoding="utf-8")
-        for token in _operator_tokens():
-            assert token not in text, f"docs/fleet-observation.md: operator token {token!r} found"
+        hits = find_tokens(text, _operator_tokens())
+        assert not hits, f"docs/fleet-observation.md: operator token(s) found: {hits!r}"

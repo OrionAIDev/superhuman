@@ -15,6 +15,8 @@ Kept in its own module for two reasons, both learned the hard way:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 #: Infrastructure leaks that no published repository should contain. These are
 #: patterns, not names, so the guard is useful to anyone publishing a fork — not
 #: only to whoever wrote it.
@@ -118,3 +120,42 @@ def is_scanned(rel: str) -> bool:
         True when the file should be read and scanned.
     """
     return not rel.startswith(PUBLICATION_EXEMPT) and not rel.endswith(SKIPPED_SUFFIXES)
+
+
+def load_tokens(tokens_path: Path) -> list[str]:
+    """Parse an operator token list into lowercased match terms.
+
+    One token per line; blank lines and ``#`` comments are ignored. Matching is
+    case-insensitive, so the terms are lowercased here — at the single point
+    that reads the file, so no caller can forget to.
+
+    Args:
+        tokens_path: Path to a ``.publication-tokens``-format file.
+
+    Returns:
+        Lowercased, non-empty tokens in file order.
+    """
+    return [
+        line.strip().lower()
+        for line in tokens_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+
+def find_tokens(text: str, tokens: list[str]) -> list[str]:
+    """Return which tokens appear as a case-insensitive substring of ``text``.
+
+    This is the whole operator-vocabulary matching mechanism, in one place so
+    that both the real guard (``test_operator_tokens_are_absent``) and its
+    synthetic-fixture test exercise the identical code path. A guard whose test
+    reimplements the guard proves only that the copy works.
+
+    Args:
+        text: File contents to scan.
+        tokens: Lowercased terms from :func:`load_tokens`.
+
+    Returns:
+        The subset of ``tokens`` found in ``text``.
+    """
+    lowered = text.lower()
+    return [t for t in tokens if t in lowered]
