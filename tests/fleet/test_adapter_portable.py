@@ -118,6 +118,19 @@ class TestPortableAdapterEmitPrompt:
         assert "Continue the work." in prompt
         assert f"FLEET-HANDOFF-ID: {handoff_id}" in prompt
 
+    def test_emit_prompt_embeds_self_register_instruction_adjacent_to_id_line(
+        self, git_repo: Path
+    ) -> None:
+        """Chunk 3, Decision E: the launched session sees the trigger in its own prompt."""
+        adapter = PortableAdapter(git_repo, "demo-slug")
+        handoff_id = "11111111-2222-3333-4444-555555555555"
+        prompt = adapter.emit_prompt("Continue the work.", handoff_id)
+
+        id_pos = prompt.index(f"FLEET-HANDOFF-ID: {handoff_id}")
+        assert "fleet observe launch" in prompt[id_pos:]
+        assert "best-effort" in prompt.lower()
+        assert "never blocks" in prompt.lower()
+
 
 class TestPortableAdapterDegradesWithoutSessionRelay:
     """NFR-3 (TC-16, adapter half) — session-relay is never importable here."""

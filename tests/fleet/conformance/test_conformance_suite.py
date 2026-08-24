@@ -27,6 +27,15 @@ path also drives. What actually matters — and what is asserted below — is
 that every ``SessionAdapter`` instance this suite constructs and passes
 through the lifecycle is a ``PortableAdapter``, and every resulting node id
 carries ``harness="portable"`` end to end.
+
+**Chunk 5 extension (TC-18, W-NFR-2, Decision C).** ``TestFullLifecycleUnderSubagentAdapter``
+below drives the identical create -> update -> validate -> query lifecycle a
+second time, this time through ``SubagentAdapter`` (``harness="subagent"``) —
+the fourth adapter, added for the spawned-dispatch path. Extending this
+existing module rather than adding a new file under ``conformance/`` is
+deliberate, per PLAN.md's Chunk 5 file map: the suite's whole point is that
+*no* adapter's harness-specific facts leak into ``core/``, so a new adapter
+belongs in the same proof, not a parallel one.
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ from pathlib import Path
 import pytest
 
 from scripts.fleet.adapter.portable import PortableAdapter
+from scripts.fleet.adapter.subagent import SubagentAdapter
 from scripts.fleet.cli import register_session
 from scripts.fleet.core.done import advance as done_advance
 from scripts.fleet.core.done import event_for as done_event_for
@@ -214,3 +224,77 @@ class TestFullLifecycleUnderPortableAdapter:
         events = read_all(log_path)
         assert len(events) == 6  # 2 registrations, lifecycle, block, done advance, edge
         assert {e.node_id for e in events} >= {primary.node_id, dependent.node_id}
+
+
+class TestFullLifecycleUnderSubagentAdapter:
+    """TC-18 (Chunk 5): create -> update -> validate -> query, driven entirely
+    by SubagentAdapter — the fourth adapter, added for the spawned-dispatch
+    path (Decision C). Same enforced write path as
+    ``TestFullLifecycleUnderPortableAdapter`` above; no shortcuts taken.
+    """
+
+    def test_register_update_and_query_round_trip(
+        self, git_repo: Path, fleet_dir: tuple[Path, Path]
+    ) -> None:
+        log_path, sessions_dir = fleet_dir
+
+        # --- create: a dispatch registers through the Subagent path only ---
+        # As with the Portable class above, the load-bearing proof is the
+        # `harness == "subagent"` check on the resulting node id, never a
+        # tautological isinstance() check right after construction.
+        dispatch_adapter = SubagentAdapter(git_repo, "conformance-slug", local_id="developer-5-1")
+
+        dispatch = register_session(
+            dispatch_adapter,
+            origination="spawned",
+            project_id=_PROJECT_ID,
+            writer_role=_WRITER_ROLE,
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            target_session_id="developer-5-1",
+        )
+
+        harness, _workspace, _slug, local_id = parse_node_id(dispatch.node_id)
+        assert harness == "subagent"
+        assert local_id == "developer-5-1"
+        assert dispatch.lifecycle == "active"
+        assert dispatch.done_level == "D0-code"
+
+        # --- update: decomposed status fields (FR-5), through the enforced
+        # append -> validate -> project path ---
+        lifecycle_event = {
+            "schema_version": 1,
+            "event_id": "bbbbbbbb-0000-0000-0000-000000000001",
+            "idempotency_key": f"lifecycle:{dispatch.node_id}:blocked",
+            "ts": "2026-08-16T12:00:00.000000Z",
+            "type": "lifecycle_changed",
+            "project_id": _PROJECT_ID,
+            "node_id": dispatch.node_id,
+            "writer_role": _WRITER_ROLE,
+            "payload": {"lifecycle": "blocked"},
+        }
+        appended_lifecycle = append(log_path, lifecycle_event)
+        assert appended_lifecycle is not None
+        updated_dispatch = project_event(appended_lifecycle, sessions_dir)
+        assert updated_dispatch.lifecycle == "blocked"
+
+        # --- query: read the write back through the query surface ---
+        sessions = list_sessions(sessions_dir, project_id=_PROJECT_ID)
+        queried = next(s for s in sessions if s.node_id == dispatch.node_id)
+        assert queried.lifecycle == "blocked"
+
+        # --- validate: the written log is schema-valid on replay ---
+        events = read_all(log_path)
+        assert dispatch.node_id in {e.node_id for e in events}
+
+        # --- repeat registration dedupes to the same node id (idempotency-key) ---
+        repeat = register_session(
+            dispatch_adapter,
+            origination="spawned",
+            project_id=_PROJECT_ID,
+            writer_role=_WRITER_ROLE,
+            log_path=log_path,
+            sessions_dir=sessions_dir,
+            target_session_id="developer-5-1",
+        )
+        assert repeat.node_id == dispatch.node_id

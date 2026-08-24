@@ -54,7 +54,14 @@ from typing import Any
 
 from ..core.errors import SessionIdentityUnresolved
 from ..core.nodes import make_node_id
-from .base import GitFacts, SessionAdapter, SessionInfo, format_handoff_line, workspace_component
+from .base import (
+    GitFacts,
+    SessionAdapter,
+    SessionInfo,
+    format_handoff_line,
+    format_launch_instruction,
+    workspace_component,
+)
 from .portable import collect_git_facts
 
 #: Bounded so a hung/misbehaving session_scan.py can never wedge registration.
@@ -79,6 +86,7 @@ class ClaudeAdapter(SessionAdapter):
         current_session_id: str | None = None,
         sessions: list[dict[str, Any]] | None = None,
         session_relay_script: Path | str | None = None,
+        git_timeout: float | None = None,
     ) -> None:
         """Initialize a ClaudeAdapter.
 
@@ -104,6 +112,10 @@ class ClaudeAdapter(SessionAdapter):
                 or the subprocess call fails for any reason, `sessions` are
                 used exactly as supplied — a missing/broken enrichment path
                 is never a hard failure.
+            git_timeout: seconds allowed per git subprocess call in
+                `git_facts()` (additive passthrough, fleet-wiring Chunk 1).
+                `None` (the default, unchanged for every existing caller)
+                uses `collect_git_facts`'s own default (30.0s).
         """
         self.workspace = Path(workspace)
         self.slug = slug
@@ -112,6 +124,7 @@ class ClaudeAdapter(SessionAdapter):
         self._session_relay_script = (
             Path(session_relay_script) if session_relay_script is not None else None
         )
+        self._git_timeout = git_timeout
 
     def current_session(self) -> SessionInfo:
         """Return this session's identity from the orchestrator-supplied id.
@@ -263,9 +276,13 @@ class ClaudeAdapter(SessionAdapter):
         Returns:
             GitFacts: as `adapter.portable.collect_git_facts(self.workspace)`
             — identical mechanism to `PortableAdapter`, since git plumbing is
-            equally Python-accessible on either harness.
+            equally Python-accessible on either harness. Honors this
+            adapter's `git_timeout` override if one was given at
+            construction.
         """
-        return collect_git_facts(self.workspace)
+        if self._git_timeout is None:
+            return collect_git_facts(self.workspace)
+        return collect_git_facts(self.workspace, git_timeout=self._git_timeout)
 
     def emit_prompt(self, text: str, handoff_id: str) -> str:
         """Append the literal handoff-id marker line to `text`.
@@ -275,6 +292,10 @@ class ClaudeAdapter(SessionAdapter):
             handoff_id: the UUID minted for this handoff.
 
         Returns:
-            str: `text`, a blank line, then the `FLEET-HANDOFF-ID:` line.
+            str: `text`, a blank line, the `FLEET-HANDOFF-ID:` line, then the
+            self-register instruction (Chunk 3, Decision E).
         """
-        return f"{text}\n\n{format_handoff_line(handoff_id)}\n"
+        return (
+            f"{text}\n\n{format_handoff_line(handoff_id)}\n\n"
+            f"{format_launch_instruction()}\n"
+        )

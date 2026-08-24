@@ -345,6 +345,16 @@ _TOP_KEYS = {
     "ladder",
     "conventions",
     "models",
+    # `fleet` is fleet-wiring's own opt-in observation block (Phase 1.1,
+    # G8-accepted 2026-08-24). This module never reads or validates its
+    # contents — that's `scripts/fleet/config.py::resolve_fleet_config`'s
+    # job — but a profile combining `fleet:` with a real `ladder:`/`models:`
+    # block must still pass `load_profile`'s own unknown-key check, or every
+    # OTHER consumer of this profile (done-level ceiling resolution,
+    # autonomous-precondition checks) fails closed the moment `fleet:` is
+    # present. Recognizing the key here, without validating it, is the
+    # minimal fix; deeper schema validation stays config.py's job.
+    "fleet",
 }
 
 

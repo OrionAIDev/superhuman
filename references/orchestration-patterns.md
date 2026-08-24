@@ -131,6 +131,12 @@ repeated summarization; debugging becomes multi-level. **Instead:** keep orchest
 > Superhuman's model is PM-orchestrated report-back subagents, not peer debate. If a task genuinely
 > needs adversarial peer investigation, that is a manual, out-of-framework choice — do not build it
 > into a phase recipe.
+>
+> Read that as a statement about the **orchestration shape** (peer debate vs. report-back), not as a
+> rule that a capability belonging to one harness is off-limits. A feature only one harness offers
+> may still be adopted: through the `adaptation/` seam, with a declared degradation path for
+> harnesses that lack it — never by naming a platform tool inside a phase recipe. Portability means
+> every harness keeps a working floor, not that every harness gets the identical ceiling.
 
 ---
 

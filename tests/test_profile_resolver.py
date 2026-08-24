@@ -97,6 +97,21 @@ def test_unknown_top_level_key_is_rejected(tmp_path: Path) -> None:
         sp.load_profile(path)
 
 
+def test_fleet_top_level_key_is_recognized_not_rejected(tmp_path: Path) -> None:
+    """`fleet:` (superhuman fleet-wiring, Phase 1.1) must NOT trip the
+    unknown-key rejection above, or every profile combining a real
+    `ladder:`/`models:` block with `fleet:` observation opt-in would fail
+    closed for every OTHER consumer of `load_profile` (done-level ceiling
+    resolution, autonomous-precondition checks) the moment `fleet:` is
+    added — discovered live when a real machine profile combined both.
+    `load_profile` deliberately does not validate `fleet:`'s own contents;
+    that is `scripts/fleet/config.py::resolve_fleet_config`'s job.
+    """
+    path = _write(tmp_path, "version: 1\nfleet:\n  enabled: true\n")
+    profile = sp.load_profile(path)  # must not raise
+    assert profile is not None
+
+
 def test_unknown_detector_is_rejected(tmp_path: Path) -> None:
     """A typo'd detector family is an error, not a rung that never matches."""
     path = _write(

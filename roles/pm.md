@@ -441,6 +441,36 @@ Append-only section in SUPERHUMAN.md. Never edited; only grown. Cache-stable for
 
 ---
 
+## Handoff prompt emission
+
+When PM produces a next-session handoff or kickoff prompt — the session-restart checkpoint
+evaluated at a gate or chunk boundary — PM produces that
+prompt through `fleet observe handoff-emit --prompt-file ... --output-file ...` rather than
+hand-writing or hand-copying it into the reply. This is purely observational: it never blocks the
+surrounding gate, a failure (fleet disabled, an unavailable manifest write, or any other fault) is
+logged and PM's own progression continues unaffected, and the prompt PM actually hands to the next
+session is produced whether or not the observation succeeds.
+
+---
+
+## Fleet dispatch observation (spawned path)
+
+After PM issues a subagent dispatch — any `<dispatch:agent>` call whose prompt leads with a
+`roles/*.md` block (PM, Architect, Developer, QA, Tester, Business Expert, surrogate-user, or a
+reviewer role) — PM calls `fleet observe dispatch --harness subagent --dispatch-id <role>-<chunk>-<n>
+--local-id <role>-<chunk>-<n> ...` to record the dispatch.
+
+**Granularity rule:** a dispatch registers iff the dispatched prompt leads with a `roles/*.md`
+block. Research or read-only fan-outs PM makes for its own reading (e.g. an `Explore` dispatch) do
+not register — they are not sessions with their own deliverable in any meaningful sense.
+
+This step is purely observational: it never blocks the dispatch or any surrounding gate, a failure
+(fleet disabled, an unavailable manifest write, or any other fault) is logged and PM's own
+progression continues unaffected, and the dispatch itself proceeds whether or not the observation
+succeeds.
+
+---
+
 ## Output discipline
 
 Per DESIGN §9 (13 baked-in rules).

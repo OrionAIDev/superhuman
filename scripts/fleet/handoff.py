@@ -143,6 +143,7 @@ def _append_with_bounded_retry(
     attempts: int,
     backoff: float,
     precondition: Callable[[list[Event]], bool] | None = None,
+    timeout: float | None = None,
 ) -> Event | None:
     """Call `core.events.append`, retrying a bounded number of times on lock contention.
 
@@ -162,6 +163,12 @@ def _append_with_bounded_retry(
         attempts: total attempts, including the first (must be >= 1).
         backoff: seconds to sleep between attempts.
         precondition: passed through to `core.events.append` unchanged.
+        timeout: per-attempt lock-acquisition timeout, passed to
+            `core.events.append`'s own `timeout` parameter (additive
+            passthrough, fleet-wiring Chunk 1, W-NFR-7). `None` (the
+            default) omits the keyword entirely, so `append` uses its own
+            default (10.0s) exactly as every pre-wiring caller already
+            observes.
 
     Returns:
         Event | None: as `core.events.append`.
@@ -171,10 +178,11 @@ def _append_with_bounded_retry(
         PreconditionUnmet: if `precondition` is given and rejects the write
             (propagates immediately, not retried).
     """
+    kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     last_exc: LockTimeoutError | None = None
     for attempt in range(attempts):
         try:
-            return append(log_path, event_dict, precondition=precondition)
+            return append(log_path, event_dict, precondition=precondition, **kwargs)
         except LockTimeoutError as exc:
             last_exc = exc
             if attempt < attempts - 1 and backoff > 0:
@@ -216,6 +224,7 @@ def emit(
     harness: str = "handoff",
     lock_retry_attempts: int = _DEFAULT_LOCK_RETRY_ATTEMPTS,
     lock_retry_backoff: float = _DEFAULT_LOCK_RETRY_BACKOFF,
+    lock_timeout: float | None = None,
 ) -> HandoffEmission:
     """Write an `awaiting-launch` intent row and embed a durable `handoff_id` (FR-1 3rd path / FR-2).
 
@@ -261,6 +270,10 @@ def emit(
             `_append_with_bounded_retry`).
         lock_retry_backoff: seconds to sleep between registrar-level
             retries.
+        lock_timeout: per-attempt lock-acquisition timeout (additive
+            passthrough, fleet-wiring Chunk 1). `None` (the default,
+            unchanged for every existing caller) uses `append`'s own
+            default (10.0s).
 
     Returns:
         HandoffEmission: the minted id, the intent row's node id, and the
@@ -297,7 +310,11 @@ def emit(
     }
 
     appended = _append_with_bounded_retry(
-        log_path, event_dict, attempts=lock_retry_attempts, backoff=lock_retry_backoff
+        log_path,
+        event_dict,
+        attempts=lock_retry_attempts,
+        backoff=lock_retry_backoff,
+        timeout=lock_timeout,
     )
     if appended is None:
         # Dedupe no-op (a repeat emit of the same handoff_id) — the event of
@@ -578,6 +595,7 @@ def self_register(
     branch: str | None = None,
     lock_retry_attempts: int = _DEFAULT_LOCK_RETRY_ATTEMPTS,
     lock_retry_backoff: float = _DEFAULT_LOCK_RETRY_BACKOFF,
+    lock_timeout: float | None = None,
 ) -> SelfRegisterResult:
     """Flip an `awaiting-launch` handoff row to `active` (FR-2).
 
@@ -631,6 +649,10 @@ def self_register(
         lock_retry_attempts: bounded registrar-level retry count.
         lock_retry_backoff: seconds to sleep between registrar-level
             retries.
+        lock_timeout: per-attempt lock-acquisition timeout (additive
+            passthrough, fleet-wiring Chunk 1). `None` (the default,
+            unchanged for every existing caller) uses `append`'s own
+            default (10.0s).
 
     Returns:
         SelfRegisterResult: see the class docstring for the status
@@ -742,6 +764,7 @@ def self_register(
             attempts=lock_retry_attempts,
             backoff=lock_retry_backoff,
             precondition=_not_terminated(node_id),
+            timeout=lock_timeout,
         )
     except PreconditionUnmet:
         # A cancel (or expiry) committed between the pre-lock fragment read

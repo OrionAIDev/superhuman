@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# PreToolUse — TEMPLATE hook for fleet session observation (fleet-wiring
+# Chunk 3 / Decision B's W-NFR-6 table, "Spawned — optional ceiling"). Copy,
+# adapt, and install under YOUR harness's own hook mechanism (e.g. Claude
+# Code's `PreToolUse` hook in `.claude/settings.json`). Never installed
+# automatically by this skill — `templates/hooks/` ships templates, not live
+# hooks.
+#
+# Purpose: give the spawned-dispatch registration a DETERMINISTIC ceiling on
+# top of the portable prose floor in `roles/pm.md` / `phases/3-implementation.md`
+# ("after each role dispatch, call `fleet observe dispatch`"). Where
+# installed, this hook fires without depending on the PM thread remembering
+# the prose call-out.
+#
+# This hook calls the SAME entry point the prose floor calls —
+# `fleet observe dispatch` — never a parallel or divergent invocation. A
+# deterministic hook can never diverge from the portable prose floor because
+# both call the identical CLI verb.
+#
+# Granularity rule (Decision C, stated once, shipped doc is authoritative):
+# a dispatch registers iff its prompt leads with a `roles/*.md` block — PM,
+# Architect, Developer, QA, Tester, Business Expert, surrogate-user, and
+# reviewer roles. Research / read-only fan-outs the PM makes for its own
+# reading do not. This template does not (and cannot, generically) decide
+# that for you — filter on your harness's own subagent-dispatch tool name
+# and, where available, its prompt payload before calling through.
+#
+# Best-effort by construction: this script's exit status is never allowed to
+# block the tool call it observes. `fleet observe dispatch` itself always
+# exits 0 (it is fail-soft — see `scripts/fleet/observe.py`'s module
+# docstring), and this wrapper additionally never propagates a non-zero exit
+# from anything else it runs.
+#
+# --- adapt everything below this line --------------------------------------
+
+# The project working tree root. Most harnesses expose this as the hook's
+# own cwd; override if your harness passes it differently (e.g. via a JSON
+# payload on stdin).
+WORKSPACE="$(pwd)"
+
+# The superhuman project slug for this workspace. Fill this in — it is not
+# auto-derived because more than one slug may exist under one workspace.
+SLUG="REPLACE_WITH_YOUR_PROJECT_SLUG"
+
+# A PM-minted id identifying the dispatch unit this tool call represents.
+# Replace with however your harness names/threads a subagent dispatch.
+DISPATCH_ID="REPLACE_WITH_A_DISPATCH_ID"
+
+# Locate the `fleet` CLI. Adjust if your install path differs.
+FLEET_CLI="$(command -v fleet || echo "${WORKSPACE}/scripts/fleet/cli.py")"
+
+# Best-effort: never let this block or fail the tool call it observes.
+# --harness subagent (with --local-id set to the dispatch id) is required here
+# — omitting it silently defaults to --harness portable (DESIGN's Decision C
+# names this exact semantic overloading as the reason a dispatch unit is never
+# represented by PortableAdapter).
+"$FLEET_CLI" observe dispatch \
+  --workspace "$WORKSPACE" \
+  --slug "$SLUG" \
+  --dispatch-id "$DISPATCH_ID" \
+  --harness subagent \
+  --local-id "$DISPATCH_ID" >/dev/null 2>&1 || true
+
+exit 0
