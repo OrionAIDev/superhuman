@@ -33,6 +33,23 @@ normal `superhuman kickoff` behaves exactly as it did before this project existe
 Enabling it does not change anything superhuman actually does. It only adds a parallel, best-effort
 record of what already happened.
 
+**Gitignore your own manifest directory.** The default `manifest_dir` (`<workspace>/docs/superhuman/
+<slug>/fleet`) sits inside your tracked tree. `events.jsonl`, the per-session fragments under
+`sessions/`, and `observe-failures.log` all carry absolute local paths from the machine that wrote
+them (workspace roots, git toplevels). Add `docs/superhuman/<slug>/fleet/` (or your configured
+`manifest_dir`, if you overrode it) to your own repo's `.gitignore` before enabling — otherwise those
+host-specific paths get committed. (Superhuman's own repo already ignores this pattern for its own
+use; a newly-enabling project does not inherit that for free.)
+
+**Scope: short-lived process invocation only.** `fleet observe` is designed and tested as a
+short-lived CLI process — invoked, does its bounded work, exits. That exit is load-bearing: on an
+internal timeout (`observe.py`'s `_run_bounded`), the abandoned worker thread is not cancelled, and
+relies on the process itself exiting soon after to release any manifest lock it might still be
+holding. A long-lived in-process/library caller that imports `observe.py` and keeps running past a
+timeout would not get that release for free, and could see a wedged lock persist for the rest of its
+lifetime. This is explicitly unsupported/undocumented usage; treat `fleet observe` as a CLI, not a
+library to embed in a long-running process.
+
 **The profile that enables this can be repo-carried.** `fleet:` is read from whichever profile
 `superhuman_profile.find_profile` resolves for the workspace, which can be a project-local
 `.superhuman/profile.yaml` — a file that travels inside a cloned repo, not just an operator's own
@@ -61,12 +78,22 @@ allowed to change the result of the operation being observed. `fleet observe <ev
 `0`. The deliverable superhuman was already producing — a dispatch, a handoff prompt, a launched
 session — is never held hostage to whether the manifest write behind it succeeded.
 
-Put differently: **the manifest may be incomplete, never wrong.** A missed observation means a row
-that should exist does not (an omission). It never means a row exists that misrepresents what
-happened (a commission). Coverage is fail-soft; the assertions the manifest does make about
-recorded rows are fail-closed, because they still flow through Phase 1's unchanged, validating
-write path. If fleet observation is disabled, misconfigured, or hits a fault, you get silence, not
-a wrong answer.
+Put differently: **the manifest may be incomplete, rarely wrong about whether a row was validly
+written.** A missed observation means a row that should exist does not (an omission) — that part
+holds unconditionally, because every row that exists flowed through Phase 1's unchanged, validating
+write path. If fleet observation is disabled, misconfigured, or hits a fault short of a write, you
+get silence, not a fabricated row.
+
+That guarantee is about *whether a row's write was valid* — it is not a guarantee about *which
+session a launch flip got bound to*. `fleet observe launch` resolves its target id by grepping the
+launched session's own prompt text for the first `FLEET-HANDOFF-ID:` line found anywhere
+(`handoff.extract_handoff_id`), or by a fuzzy `(cwd, branch)` match when no id line is present. A
+prompt that quotes or re-pastes an earlier handoff prompt — a user copies a kickoff prompt forward,
+or a prompt embeds an issue body that itself contains an old `FLEET-HANDOFF-ID:` line — can bind the
+launch flip to the *wrong* row: a real commission, a row asserting a launch that did not happen for
+that session, not merely a missing one. This is narrow (it requires a foreign id line literally
+present in the prompt, or an ambiguous fuzzy match) but real, and it is the one place this doc's
+"never wrong" framing needs qualifying — see the caveat in the next section.
 
 ## The granularity rule (which dispatches register)
 
@@ -147,6 +174,16 @@ This is also why the launch flip's fuzzy `(cwd, branch)` fallback exists: any la
 `fleet observe launch` call from the right checkout reconciles an `awaiting-launch` row even if the
 original id line was lost, so a false stale report is usually recoverable rather than permanent —
 but only once someone acts on the candidate.
+
+**The converse caveat: a row that has already flipped to `active` is not automatically trustworthy
+either.** The list above is about rows that stayed `awaiting-launch` when they shouldn't have
+(omission). The opposite failure is narrower but real: the id-matching described in "The fail-soft /
+fail-closed boundary" above means a session whose prompt happens to contain a *foreign*
+`FLEET-HANDOFF-ID:` line (a re-pasted or quoted earlier prompt), or an ambiguous fuzzy match, can
+flip the wrong row to `active` — which then reads as launched-and-fine and drops out of the stale
+list entirely, even though the row it displaced is the one still actually unlaunched. If a handoff
+you know was emitted is missing from `fleet handoff stale` and you did not expect it to have
+launched yet, that is worth checking too, not just the rows the command actually lists.
 
 ## Manual-smoke log
 

@@ -58,6 +58,41 @@ _JOURNAL_MAX_LINES = 500
 _JOURNAL_FILENAME = "observe-failures.log"
 
 
+def _validate_slug(slug: str) -> None:
+    """Reject a slug that could walk the fleet manifest path outside the project.
+
+    Phase 3.3 preflight FIX 4: `_default_fleet_dir` builds
+    `<workspace>/docs/superhuman/<slug>/fleet` from a raw CLI/caller-supplied
+    `slug` with no prior validation anywhere in this façade. A slug
+    containing a path separator or a `..` segment (e.g. `"../../escape"`)
+    would resolve outside the project tree — most dangerous on this
+    module's own error branches (`journal_early_cli_failure`, the
+    `_IdentityUnresolved` journal calls), which are the least-noticed paths
+    and the ones a hostile/malformed `--slug` is most likely to reach
+    unexamined. This is the single chokepoint every `_default_fleet_dir`
+    call in this module passes through, so one check here covers all of
+    them.
+
+    Raises the existing `_Disabled` sentinel rather than a new exception
+    type: every caller of `_default_fleet_dir` already has a "fleet is
+    disabled/unconfigured for this workspace" branch, so an invalid slug is
+    handled identically — no path is built, nothing is written, and the
+    caller reports `disabled`/`"not configured"` (or, for
+    `journal_early_cli_failure`'s bare `except Exception: pass`, silently
+    does nothing at all — still a clean rejection, never a path escape).
+
+    Args:
+        slug: the superhuman project slug to validate.
+
+    Raises:
+        _Disabled: if `slug` contains `/`, `\\`, or a `..` segment.
+    """
+    if "/" in slug or "\\" in slug or ".." in slug:
+        raise _Disabled(
+            f"invalid slug {slug!r}: path separators and '..' are not permitted"
+        )
+
+
 def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
     """Return the default per-project fleet manifest directory.
 
@@ -73,7 +108,13 @@ def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
 
     Returns:
         Path: `<workspace>/docs/superhuman/<slug>/fleet`.
+
+    Raises:
+        _Disabled: if `slug` fails `_validate_slug` (FIX 4) — a
+            path-traversal-shaped slug is rejected here, before any path is
+            built or any I/O happens.
     """
+    _validate_slug(slug)
     return Path(workspace) / "docs" / "superhuman" / slug / "fleet"
 
 
@@ -262,6 +303,20 @@ def _run_bounded(fn: Callable[[], _T], timeout_seconds: float) -> _T:
             own — it never blocks process exit, and this call itself always
             returns/raises within the bound.
         BaseException: whatever `fn()` itself raised, re-raised unchanged.
+
+    **Constraint (Phase 3.3 preflight FIX 5, documentation only — not a
+    behavior change).** On timeout the abandoned thread is not cancelled;
+    it keeps running in the background for as long as the process lives.
+    For every caller this module actually has — the `fleet` CLI's own
+    short-lived process invocations — this is harmless: the process exits
+    immediately after `fn` was bounded, which releases the OS-native
+    advisory lock the abandoned thread might still be holding mid-write. It
+    would NOT be harmless for a hypothetical long-lived in-process/library
+    caller: an abandoned thread stuck mid-write inside `core.events.append`
+    could hold that lock for the remaining process lifetime, wedging every
+    subsequent fleet write from that process. This module is supported for
+    short-lived process invocation only (see `docs/fleet-observation.md`);
+    long-lived in-process use is explicitly unsupported.
     """
     outcome: dict[str, Any] = {}
 
@@ -784,6 +839,26 @@ def journal_adapter_construction_failure(
     )
 
 
+def _journal_entry_ts(line: str) -> str | None:
+    """Return a journal line's `ts` field, or `None` if it can't be read.
+
+    Args:
+        line: one raw JSON line from `observe-failures.log`.
+
+    Returns:
+        str | None: the ISO-8601 `ts` string `_write_journal` stamped on the
+        entry, or `None` for a malformed/legacy line lacking one — treated
+        conservatively by the caller (an unknown failure time never loses
+        to a known success time).
+    """
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    ts = data.get("ts")
+    return ts if isinstance(ts, str) else None
+
+
 def observe_status(workspace: Path | str, slug: str) -> str:
     """Report fleet-observation enablement + activity for `workspace` (W-FR-8).
 
@@ -794,6 +869,18 @@ def observe_status(workspace: Path | str, slug: str) -> str:
     - `"configured and enabled, zero writes recorded for this project"`
     - `"configured and enabled, last write for this project succeeded"`
     - `"configured and enabled, last write for this project failed: <detail>"`
+
+    Phase 3.3 preflight FIX 1: the failed/succeeded verdict is **timestamp-
+    ordered**, not derived from "a failure was ever journaled." The journal
+    is a rolling, bounded tail (`_JOURNAL_MAX_LINES`) of *failures only* —
+    it carries no record of intervening successes — so the failed shape is
+    reported only when the most recent journaled failure is at least as
+    recent as the most recent successful write for this project (the latest
+    `ts` among this project's events in `events.jsonl`, since `Fragment`
+    itself carries no timestamp — see `core.query`'s module docstring).
+    Once a success lands after the last journaled failure, status reports
+    success again, even though the failure line itself is never removed
+    from the journal.
 
     Args:
         workspace: the working tree to report on.
@@ -806,7 +893,10 @@ def observe_status(workspace: Path | str, slug: str) -> str:
     if not cfg.enabled:
         return f"not configured: {cfg.reason}"
 
-    fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+    try:
+        fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+    except _Disabled as exc:
+        return f"not configured: {exc.reason}"
     journal_path = _journal_path(fleet_dir)
     last_failure: str | None = None
     if journal_path.is_file():
@@ -819,6 +909,7 @@ def observe_status(workspace: Path | str, slug: str) -> str:
 
     identity = fleet_project.read_project_identity(workspace, slug)
     has_writes = False
+    last_success_ts: str | None = None
     if identity is not None:
         project_id, _file_slug = identity
         sessions_dir = fleet_dir / "sessions"
@@ -828,9 +919,27 @@ def observe_status(workspace: Path | str, slug: str) -> str:
             has_writes = bool(list_sessions(sessions_dir, project_id))
         except Exception:  # noqa: BLE001 - a status report must never raise (W-FR-8)
             has_writes = False
+        try:
+            from .core.events import read_all
+
+            project_ts = [
+                event.ts for event in read_all(fleet_dir / "events.jsonl")
+                if event.project_id == project_id
+            ]
+            if project_ts:
+                last_success_ts = max(project_ts)
+        except Exception:  # noqa: BLE001 - a status report must never raise (W-FR-8)
+            last_success_ts = None
 
     if last_failure is not None:
-        return f"configured and enabled, last write for this project failed: {last_failure}"
+        last_failure_ts = _journal_entry_ts(last_failure)
+        # ISO-8601 strings of this module's fixed `_now_iso` shape compare
+        # correctly as plain strings — no datetime parsing needed. A
+        # success only wins when its ts is a strictly later moment than the
+        # failure's; an unparseable failure ts (last_failure_ts is None)
+        # conservatively still counts as the most recent failure.
+        if last_success_ts is None or last_failure_ts is None or last_success_ts <= last_failure_ts:
+            return f"configured and enabled, last write for this project failed: {last_failure}"
     if not has_writes:
         return "configured and enabled, zero writes recorded for this project"
     return "configured and enabled, last write for this project succeeded"

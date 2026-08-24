@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.fleet import cli as fleet_cli
 from scripts.fleet import observe
 from scripts.fleet.adapter.claude import ClaudeAdapter
 from scripts.fleet.adapter.portable import PortableAdapter
@@ -1331,6 +1332,100 @@ class TestObserveStatus:
         report = observe.observe_status(workspace, slug)
 
         assert "failed" in report
+
+    def test_status_reports_success_after_a_later_successful_write(
+        self, enabled_project: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Phase 3.3 preflight FIX 1 regression.
+
+        `observe_status` previously derived its verdict from "was ANY
+        failure ever journaled" with no timestamp comparison, so a single,
+        long-recovered failure pinned status to "failed" forever. Journal a
+        failure, then perform a successful write, and assert status flips
+        back to "succeeded" — the exact scenario the finding describes.
+        """
+        workspace, slug = enabled_project
+        adapter = PortableAdapter(workspace, slug)
+
+        def _raise_lock_timeout(*args: object, **kwargs: object) -> None:
+            raise LockTimeoutError("simulated")
+
+        real_register_session = fleet_cli.register_session
+        monkeypatch.setattr(fleet_cli, "register_session", _raise_lock_timeout)
+        failed_result = observe.observe_relay(
+            adapter, workspace=workspace, slug=slug, writer_role="pm"
+        )
+        assert failed_result.ok is False
+        assert "failed" in observe.observe_status(workspace, slug)
+
+        # Restore the real implementation (not `monkeypatch.undo()`, which
+        # would also revert `enabled_project`'s shared SUPERHUMAN_PROFILE
+        # env var and re-disable fleet for this workspace).
+        monkeypatch.setattr(fleet_cli, "register_session", real_register_session)
+        succeeded_result = observe.observe_relay(
+            adapter, workspace=workspace, slug=slug, writer_role="pm"
+        )
+        assert succeeded_result.ok is True
+
+        report = observe.observe_status(workspace, slug)
+
+        assert "succeeded" in report
+        assert "failed" not in report
+
+
+class TestObserveStatusSlugValidation:
+    """Phase 3.3 preflight FIX 4: a path-traversal-shaped slug is rejected."""
+
+    def test_dispatch_with_traversal_slug_is_disabled_not_a_path_escape(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "../../escape"
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+        adapter = PortableAdapter(git_repo, slug)
+
+        result = observe.observe_dispatch(
+            adapter, workspace=git_repo, slug=slug, dispatch_id="child-1", writer_role="pm"
+        )
+
+        assert result.disabled is True
+        assert result.ok is False
+        assert not (git_repo / "escape").exists()
+        assert not (git_repo / "docs").exists()
+
+    def test_status_with_traversal_slug_reports_not_configured(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "../../escape"
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        report = observe.observe_status(git_repo, slug)
+
+        assert report.startswith("not configured:")
+        assert not (git_repo / "escape").exists()
+        assert not (git_repo / "docs").exists()
+
+    def test_journal_early_cli_failure_with_traversal_slug_writes_nothing(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "../../escape"
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        observe.journal_early_cli_failure(
+            git_repo,
+            slug,
+            event="dispatch",
+            error_class="adapter_construction_failed",
+            error_text="boom",
+        )
+
+        assert not (git_repo / "escape").exists()
+        assert not (git_repo / "docs").exists()
 
 
 class TestCoreUntouched:
