@@ -50,9 +50,15 @@ DISPATCH_ID="REPLACE_WITH_A_DISPATCH_ID"
 FLEET_CLI="$(command -v fleet || echo "${WORKSPACE}/scripts/fleet/cli.py")"
 
 # Best-effort: never let this block or fail the tool call it observes.
+# --harness subagent (with --local-id set to the dispatch id) is required here
+# — omitting it silently defaults to --harness portable (DESIGN's Decision C
+# names this exact semantic overloading as the reason a dispatch unit is never
+# represented by PortableAdapter).
 "$FLEET_CLI" observe dispatch \
   --workspace "$WORKSPACE" \
   --slug "$SLUG" \
-  --dispatch-id "$DISPATCH_ID" >/dev/null 2>&1 || true
+  --dispatch-id "$DISPATCH_ID" \
+  --harness subagent \
+  --local-id "$DISPATCH_ID" >/dev/null 2>&1 || true
 
 exit 0

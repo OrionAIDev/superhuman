@@ -627,6 +627,189 @@ class TestHandoffEmitCli:
         assert '"error_class": "lock_timeout"' in journal
 
 
+class TestMalformedHarnessSubagentJournaled:
+    """Phase 3.3 preflight FIX 4: a malformed `--harness subagent` call (missing
+    `--local-id`) must reach `observe-failures.log`, not just stderr — before
+    this fix `cli._safe_build_adapter_for_observe` printed one stderr line and
+    returned `None`, invisible to `fleet observe status` (W-FR-8, W-NFR-1).
+    """
+
+    def test_dispatch_with_missing_local_id_is_journaled(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        workspace, slug = enabled_project
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "dispatch",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--dispatch-id",
+                "child-1",
+                "--harness",
+                "subagent",
+                # deliberately omitted: --local-id
+            ]
+        )
+
+        assert args.func(args) == 0
+
+        journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
+        assert '"error_class": "adapter_construction_failed"' in journal
+        assert '"event": "dispatch"' in journal
+
+    def test_launch_with_missing_local_id_is_journaled(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        workspace, slug = enabled_project
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "launch",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--handoff-id",
+                "abc",
+                "--harness",
+                "subagent",
+                # deliberately omitted: --local-id
+            ]
+        )
+
+        assert args.func(args) == 0
+
+        journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
+        assert '"error_class": "adapter_construction_failed"' in journal
+        assert '"event": "launch"' in journal
+
+    def test_dispatch_with_missing_local_id_writes_nothing_when_disabled(
+        self, disabled_project: tuple[Path, str]
+    ) -> None:
+        """W-FR-7 must still hold at this earlier failure point: disabled
+        means zero I/O, even for an otherwise-journal-worthy failure.
+        """
+        workspace, slug = disabled_project
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "dispatch",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--dispatch-id",
+                "child-1",
+                "--harness",
+                "subagent",
+                # deliberately omitted: --local-id
+            ]
+        )
+
+        assert args.func(args) == 0
+        assert not _fleet_dir(workspace, slug).exists()
+
+
+class TestUnreadablePromptFileNeverCrashes:
+    """Phase 3.3 preflight FIX 5: `--prompt-file` reads in
+    `_cmd_observe_handoff_emit` / `_cmd_observe_launch` had no exception
+    handling — a missing/unreadable file crashed the process with a
+    non-zero exit, violating the façade's "always exits 0" contract
+    (Decision A / W-NFR-1). Both commands must survive this cleanly.
+    """
+
+    def test_handoff_emit_with_missing_prompt_file_exits_0_and_is_journaled(
+        self, enabled_project: tuple[Path, str], tmp_path: Path
+    ) -> None:
+        workspace, slug = enabled_project
+        missing_prompt_file = tmp_path / "does-not-exist.md"
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "handoff-emit",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--prompt-file",
+                str(missing_prompt_file),
+            ]
+        )
+
+        # Must not raise — this is the crash Phase 3.3 preflight FIX 5 caught.
+        assert args.func(args) == 0
+
+        journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
+        assert '"error_class": "prompt_file_unreadable"' in journal
+        assert '"event": "handoff-emit"' in journal
+
+    def test_handoff_emit_with_missing_prompt_file_writes_nothing_when_disabled(
+        self, disabled_project: tuple[Path, str], tmp_path: Path
+    ) -> None:
+        workspace, slug = disabled_project
+        missing_prompt_file = tmp_path / "does-not-exist.md"
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "handoff-emit",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--prompt-file",
+                str(missing_prompt_file),
+            ]
+        )
+
+        assert args.func(args) == 0
+        assert not _fleet_dir(workspace, slug).exists()
+
+    def test_launch_with_missing_prompt_file_exits_0_and_falls_back_to_fuzzy_match(
+        self, enabled_project: tuple[Path, str], tmp_path: Path
+    ) -> None:
+        """A read failure on `launch`'s optional `--prompt-file` is not
+        terminal: it degrades to "no prompt text supplied" and the fuzzy
+        (cwd, branch) match still runs, same as omitting the flag entirely.
+        """
+        workspace, slug = enabled_project
+        missing_prompt_file = tmp_path / "does-not-exist.md"
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "launch",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--prompt-file",
+                str(missing_prompt_file),
+            ]
+        )
+
+        # Must not raise, and must still attempt the fuzzy fallback (which,
+        # with no matching awaiting-launch row, resolves to a journaled
+        # "not_found" — not a crash).
+        assert args.func(args) == 0
+
+        journal = (_fleet_dir(workspace, slug) / "observe-failures.log").read_text(encoding="utf-8")
+        assert '"event": "launch"' in journal
+
+
 class TestAdditionalBranchCoverage:
     """Fills the remaining branches DESIGN's error-handling table names."""
 

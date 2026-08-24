@@ -179,6 +179,56 @@ def test_pyyaml_unavailable_resolves_to_disabled(
     assert "PyYAML" in cfg.reason
 
 
+def test_manifest_dir_escaping_the_workspace_resolves_to_disabled(tmp_path: Path) -> None:
+    """Phase 3.3 preflight FIX 2: a relative escape (`../../outside`) must disable,
+    never write anywhere outside `workspace`.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = workspace / "profile.yaml"
+    profile.write_text(
+        "fleet:\n  enabled: true\n  manifest_dir: ../../outside\n", encoding="utf-8"
+    )
+
+    cfg = resolve_fleet_config(workspace, profile_path=profile)
+
+    assert cfg.enabled is False
+    assert "outside the workspace" in cfg.reason
+    assert not (tmp_path / "outside").exists()
+
+
+def test_manifest_dir_absolute_escape_resolves_to_disabled(tmp_path: Path) -> None:
+    """An absolute path escape must also disable, not silently confine or clamp."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "elsewhere"
+    profile = workspace / "profile.yaml"
+    profile.write_text(
+        f"fleet:\n  enabled: true\n  manifest_dir: {outside.as_posix()}\n", encoding="utf-8"
+    )
+
+    cfg = resolve_fleet_config(workspace, profile_path=profile)
+
+    assert cfg.enabled is False
+    assert "outside the workspace" in cfg.reason
+    assert not outside.exists()
+
+
+def test_manifest_dir_inside_workspace_still_resolves_to_enabled(tmp_path: Path) -> None:
+    """A confined override (the normal case) must keep working unchanged."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = workspace / "profile.yaml"
+    profile.write_text(
+        "fleet:\n  enabled: true\n  manifest_dir: nested/fleet-dir\n", encoding="utf-8"
+    )
+
+    cfg = resolve_fleet_config(workspace, profile_path=profile)
+
+    assert cfg.enabled is True
+    assert cfg.manifest_dir == (workspace / "nested" / "fleet-dir").resolve()
+
+
 def test_non_positive_overrides_fall_back_to_defaults(tmp_path: Path) -> None:
     profile = tmp_path / "profile.yaml"
     profile.write_text(

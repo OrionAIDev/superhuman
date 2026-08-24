@@ -887,7 +887,9 @@ def _cmd_gen_view(args: argparse.Namespace) -> int:
     return 0
 
 
-def _safe_build_adapter_for_observe(args: argparse.Namespace) -> SessionAdapter | None:
+def _safe_build_adapter_for_observe(
+    args: argparse.Namespace, *, event: str
+) -> SessionAdapter | None:
     """Build an adapter for an `observe` subcommand without ever raising (Decision A).
 
     `_build_adapter` legitimately raises `ValueError` for a malformed
@@ -900,8 +902,16 @@ def _safe_build_adapter_for_observe(args: argparse.Namespace) -> SessionAdapter 
     `observe.py` entirely and violate the exit-0 contract every other
     failure mode of this verb group already honors.
 
+    Phase 3.3 preflight FIX 4: this rejection is now also routed through
+    `observe.journal_adapter_construction_failure` — before this fix, it was
+    printed to stderr only and never reached `observe-failures.log`,
+    invisible to `fleet observe status` (contradicting W-FR-8 and
+    W-NFR-1's "recorded, not swallowed silently").
+
     Args:
         args: parsed CLI arguments for one `observe` subcommand.
+        event: which `observe` verb this is (`"dispatch"` | `"relay"` |
+            `"handoff-emit"` | `"launch"`), forwarded to the journal entry.
 
     Returns:
         SessionAdapter | None: the built adapter, or `None` if construction
@@ -914,6 +924,9 @@ def _safe_build_adapter_for_observe(args: argparse.Namespace) -> SessionAdapter 
         return _build_adapter(args)
     except ValueError as exc:
         print(f"fleet observe: {exc}", file=sys.stderr)
+        fleet_observe.journal_adapter_construction_failure(
+            args.workspace, args.slug, event=event, error_text=str(exc)
+        )
         return None
 
 
@@ -932,7 +945,7 @@ def _cmd_observe_dispatch(args: argparse.Namespace) -> int:
         int: always `0` — `observe.py` never raises and never signals
         failure through the exit code (Decision A).
     """
-    adapter = _safe_build_adapter_for_observe(args)
+    adapter = _safe_build_adapter_for_observe(args, event="dispatch")
     if adapter is None:
         return 0
     fleet_observe.observe_dispatch(
@@ -954,7 +967,7 @@ def _cmd_observe_relay(args: argparse.Namespace) -> int:
     Returns:
         int: always `0` (see `_cmd_observe_dispatch`).
     """
-    adapter = _safe_build_adapter_for_observe(args)
+    adapter = _safe_build_adapter_for_observe(args, event="relay")
     if adapter is None:
         return 0
     fleet_observe.observe_relay(
@@ -971,14 +984,36 @@ def _cmd_observe_handoff_emit(args: argparse.Namespace) -> int:
     disabled or the write fails (DESIGN's "single most important fail-soft
     behavior"; see `observe.observe_handoff_emit`'s docstring).
 
+    Phase 3.3 preflight FIX 5: `--prompt-file` is required for this verb, so
+    a missing/unreadable/non-UTF-8 file is a genuine terminal failure — there
+    is no draft to deliver. Unlike every other failure mode of this façade,
+    this one has no fallback prompt to hand back; it is journaled and
+    reported clearly on stderr, and still exits `0` (Decision A / W-NFR-1's
+    "always exits 0" contract), never an unhandled exception.
+
     Args:
         args: parsed CLI arguments.
 
     Returns:
         int: always `0`.
     """
-    prompt_text = args.prompt_file.read_text(encoding="utf-8")
-    adapter = _safe_build_adapter_for_observe(args)
+    try:
+        prompt_text = args.prompt_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            f"fleet observe handoff-emit: could not read --prompt-file "
+            f"{args.prompt_file}: {exc}",
+            file=sys.stderr,
+        )
+        fleet_observe.journal_early_cli_failure(
+            args.workspace,
+            args.slug,
+            event="handoff-emit",
+            error_class="prompt_file_unreadable",
+            error_text=f"could not read --prompt-file {args.prompt_file}: {exc}",
+        )
+        return 0
+    adapter = _safe_build_adapter_for_observe(args, event="handoff-emit")
     if adapter is None:
         # DESIGN's "single most important fail-soft behavior" still applies
         # to a bad --harness invocation: the draft is delivered untouched
@@ -1009,18 +1044,34 @@ def _cmd_observe_handoff_emit(args: argparse.Namespace) -> int:
 def _cmd_observe_launch(args: argparse.Namespace) -> int:
     """Handle `fleet observe launch` (fleet-wiring Chunk 1, W-FR-4).
 
+    Phase 3.3 preflight FIX 5: unlike `handoff-emit`, `--prompt-file` is
+    optional here (`observe_launch`'s `prompt_text` parameter is optional,
+    used only to recover a `FLEET-HANDOFF-ID` when `--handoff-id` was not
+    given directly) — a missing/unreadable/non-UTF-8 file is not a terminal
+    failure. It is treated exactly like "no --prompt-file was given at all":
+    `prompt_text` falls back to `None`, and `handoff_self_register`'s own
+    `(cwd, branch)` fuzzy-match path takes over unchanged, never an
+    unhandled exception past this function.
+
     Args:
         args: parsed CLI arguments.
 
     Returns:
         int: always `0` (see `_cmd_observe_dispatch`).
     """
-    adapter = _safe_build_adapter_for_observe(args)
+    adapter = _safe_build_adapter_for_observe(args, event="launch")
     if adapter is None:
         return 0
-    prompt_text = (
-        args.prompt_file.read_text(encoding="utf-8") if args.prompt_file is not None else None
-    )
+    prompt_text: str | None = None
+    if args.prompt_file is not None:
+        try:
+            prompt_text = args.prompt_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(
+                f"fleet observe launch: could not read --prompt-file "
+                f"{args.prompt_file}, falling back to (cwd, branch) fuzzy match: {exc}",
+                file=sys.stderr,
+            )
     fleet_observe.observe_launch(
         adapter,
         workspace=args.workspace,

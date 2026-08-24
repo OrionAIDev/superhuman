@@ -241,7 +241,14 @@ class TestObserveDispatchViaSubagentAdapter:
     def test_cli_observe_dispatch_with_harness_subagent_missing_local_id_never_raises(
         self, enabled_project: tuple[Path, str]
     ) -> None:
-        """A malformed `--harness subagent` call (no `--local-id`) still exits 0 (Decision A)."""
+        """A malformed `--harness subagent` call (no `--local-id`) still exits 0 (Decision A).
+
+        Phase 3.3 preflight FIX 4: this failure is now routed through
+        `observe.py`'s journal (`error_class="adapter_construction_failed"`),
+        so it is surfaced by `observe status` rather than being invisible
+        beyond a single stderr line — see
+        `test_observe.py::TestMalformedHarnessSubagentJournaled`.
+        """
         workspace, slug = enabled_project
         parser = build_parser()
         args = parser.parse_args(
@@ -263,4 +270,5 @@ class TestObserveDispatchViaSubagentAdapter:
 
         assert args.func(args) == 0
         status = observe.observe_status(workspace, slug)
-        assert "zero writes" in status
+        assert "last write for this project failed" in status
+        assert "adapter_construction_failed" in status

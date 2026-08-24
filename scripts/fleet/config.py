@@ -110,6 +110,9 @@ def resolve_fleet_config(
     - the parsed profile is not a mapping
     - the profile has no `fleet:` block, or `fleet:` is not a mapping
     - `fleet.enabled` is not literally `true`
+    - `fleet.manifest_dir` is set but resolves outside `workspace` (Phase
+      3.3 preflight FIX 2 — a project-local profile must not be able to
+      redirect manifest writes elsewhere on disk)
 
     Args:
         workspace: the working tree to resolve configuration for — passed to
@@ -160,7 +163,27 @@ def resolve_fleet_config(
         return _disabled(f"profile at {path} does not set `fleet.enabled: true`")
 
     manifest_dir_raw = fleet_cfg.get("manifest_dir")
-    manifest_dir = Path(manifest_dir_raw) if isinstance(manifest_dir_raw, str) else None
+    manifest_dir: Path | None = None
+    if isinstance(manifest_dir_raw, str):
+        # Confinement check (Phase 3.3 preflight FIX 2): `path` above may be a
+        # PROJECT-LOCAL `.superhuman/profile.yaml` — a file that travels
+        # inside a cloned repo. A careless or malicious profile must not be
+        # able to point `manifest_dir` outside `workspace` and have
+        # `observe.py` create directories / write JSON there unconditionally.
+        # Resolve relative to `workspace` and require the result stays
+        # inside it; an escaping path disables fleet observation entirely
+        # rather than silently clamping or ignoring the override, so the
+        # failure is loud (surfaced via `reason`) rather than quietly wrong.
+        candidate = (Path(workspace) / manifest_dir_raw).resolve()
+        workspace_resolved = Path(workspace).resolve()
+        if candidate.is_relative_to(workspace_resolved):
+            manifest_dir = candidate
+        else:
+            return _disabled(
+                f"profile at {path} sets `fleet.manifest_dir` ({manifest_dir_raw!r}) "
+                f"which resolves outside the workspace ({workspace_resolved}) — refusing "
+                "to write manifest state outside the project"
+            )
 
     return FleetConfig(
         enabled=True,

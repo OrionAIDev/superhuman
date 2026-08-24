@@ -33,6 +33,15 @@ normal `superhuman kickoff` behaves exactly as it did before this project existe
 Enabling it does not change anything superhuman actually does. It only adds a parallel, best-effort
 record of what already happened.
 
+**The profile that enables this can be repo-carried.** `fleet:` is read from whichever profile
+`superhuman_profile.find_profile` resolves for the workspace, which can be a project-local
+`.superhuman/profile.yaml` — a file that travels inside a cloned repo, not just an operator's own
+`~/.superhuman/profile.yaml`. In other words, a repo you check out can itself switch fleet
+observation on for you. `manifest_dir` is confined to stay inside `workspace` (an override that
+would resolve outside it disables observation instead of writing there), but the enablement switch
+itself is still something a project-local profile controls — know this before trusting an unfamiliar
+repo's profile blindly.
+
 ## The fail-soft / fail-closed boundary
 
 This is the single most important thing to understand before relying on fleet observation for

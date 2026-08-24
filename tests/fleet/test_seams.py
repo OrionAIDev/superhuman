@@ -20,11 +20,18 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# `tests/` (where publication_patterns.py lives) is not itself a package on
+# `sys.path` outside pytest's own rootdir-relative import; this mirrors how
+# `tests/test_content.py` (a sibling of publication_patterns.py) imports it.
+sys.path.insert(0, str(_REPO_ROOT / "tests"))
+from publication_patterns import TOKENS_FILE  # noqa: E402
 
 #: The two prose files Chunk 2 is permitted to edit that actually carry the
 #: new handoff-emission subsection (`SKILL.md`/`phases/4-acceptance.md` were
@@ -42,9 +49,26 @@ _NON_BLOCKING_MARKERS = ("never block", "non-gating", "non-blocking")
 _LOGGED_AND_PROCEEDS_MARKERS = ("logged", "log")
 _PROCEEDS_MARKERS = ("proceed", "continue", "unaffected")
 
-#: Operator tokens that must never appear in shipped prose (W-NFR-5) — kept
-#: intentionally narrow (this is a structural smoke check, not a scanner).
-_OPERATOR_TOKENS = ("Chris", "orionlab", "oriontest", "OrionAIDev", "trapezia-llc")
+def _operator_tokens() -> list[str]:
+    """Read operator tokens the same way `test_content.py`'s canonical
+    `test_operator_tokens_are_absent` guard does (W-NFR-5): from the
+    gitignored `.publication-tokens` file at the repo root, never hardcoded
+    in this tracked, shipped test file. Skips cleanly (matching the
+    canonical guard's own behavior) when the file is absent — the normal
+    case for anyone who is not maintaining a private fork with its own
+    operator vocabulary.
+    """
+    tokens_path = _REPO_ROOT / TOKENS_FILE
+    if not tokens_path.is_file():
+        pytest.skip(f"no {TOKENS_FILE} — nothing operator-specific to check")
+    tokens = [
+        line.strip()
+        for line in tokens_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if not tokens:
+        pytest.skip(f"{TOKENS_FILE} exists but lists no tokens")
+    return tokens
 
 
 def _merge_base_with_main() -> str | None:
@@ -123,7 +147,7 @@ class TestHandoffEmissionSeamContent:
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
     def test_subsection_contains_no_operator_token(self, relative_path: str) -> None:
         subsection = _new_subsection_text(_REPO_ROOT / relative_path)
-        for token in _OPERATOR_TOKENS:
+        for token in _operator_tokens():
             assert token not in subsection, f"{relative_path}: operator token {token!r} found"
 
 
@@ -184,7 +208,7 @@ class TestHookTemplateSeamContent:
     @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
     def test_template_contains_no_operator_token(self, relative_path: str) -> None:
         text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        for token in _OPERATOR_TOKENS:
+        for token in _operator_tokens():
             assert token not in text, f"{relative_path}: operator token {token!r} found"
 
     @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
@@ -193,6 +217,18 @@ class TestHookTemplateSeamContent:
         expected_verb = _HOOK_TEMPLATES[relative_path]
         assert expected_verb in text, (
             f"{relative_path}: does not invoke the literal '{expected_verb}' entry point"
+        )
+
+    def test_pretooluse_names_harness_subagent(self) -> None:
+        """Phase 3.3 preflight FIX 3: PreToolUse must not silently default to
+        `--harness portable` — a dispatch unit is represented by
+        `--harness subagent`, per DESIGN's Decision C, or every registration
+        this template produces is mislabeled.
+        """
+        text = (_REPO_ROOT / "templates/hooks/PreToolUse").read_text(encoding="utf-8")
+        assert "--harness subagent" in text, (
+            "templates/hooks/PreToolUse does not name '--harness subagent' — "
+            "it will silently default to --harness portable"
         )
 
 
@@ -272,7 +308,7 @@ class TestSpawnedDispatchSeamContent:
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
     def test_subsection_contains_no_operator_token(self, relative_path: str) -> None:
         subsection = _dispatch_subsection_text(_REPO_ROOT / relative_path)
-        for token in _OPERATOR_TOKENS:
+        for token in _operator_tokens():
             assert token not in subsection, f"{relative_path}: operator token {token!r} found"
 
     def test_granularity_rule_stated_exactly_once_across_the_shipped_seams(self) -> None:
@@ -366,7 +402,7 @@ class TestSkillMdLaunchStepSeamContent:
 
     def test_subsection_contains_no_operator_token(self) -> None:
         subsection = _skill_md_launch_step_text()
-        for token in _OPERATOR_TOKENS:
+        for token in _operator_tokens():
             assert token not in subsection, f"SKILL.md launch-flip subsection: operator token {token!r} found"
 
 
@@ -412,5 +448,5 @@ class TestFleetObservationDocContent:
 
     def test_doc_contains_no_operator_token(self) -> None:
         text = _FLEET_OBSERVATION_DOC.read_text(encoding="utf-8")
-        for token in _OPERATOR_TOKENS:
+        for token in _operator_tokens():
             assert token not in text, f"docs/fleet-observation.md: operator token {token!r} found"

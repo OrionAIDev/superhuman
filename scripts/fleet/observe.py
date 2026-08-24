@@ -709,6 +709,81 @@ def observe_launch(
     )
 
 
+def journal_early_cli_failure(
+    workspace: Path | str, slug: str, *, event: str, error_class: str, error_text: str
+) -> None:
+    """Journal a failure `cli.py` catches before any `observe_*` context exists.
+
+    Phase 3.3 preflight FIXES 4 and 5. Some `observe` subcommand failures —
+    a malformed `--harness subagent` invocation (`cli._build_adapter`), an
+    unreadable/missing `--prompt-file` (`cli._cmd_observe_handoff_emit` /
+    `cli._cmd_observe_launch`) — happen one or more lines *before* any
+    `observe_*` function in this module runs, too early for that function's
+    own context/broad-catch/journal machinery to see them. Without this
+    helper such a failure was visible only as a stderr line from `cli.py`,
+    invisible to `fleet observe status` and contradicting W-FR-8
+    ("auditable ... without reading source") and this module's own W-NFR-1
+    ("recorded, not swallowed silently") — and, compounded with the hook
+    templates' `>/dev/null 2>&1 || true` redirect, a hook-triggered instance
+    of either failure was fully silent end-to-end.
+
+    Never raises (this module's documented broad-catch posture — see the
+    module docstring). Mirrors `_resolve_context`'s own disabled-workspace
+    short-circuit: if fleet observation is disabled/unconfigured for
+    `workspace`, this writes nothing at all — W-FR-7's zero-I/O guarantee
+    holds even for this earlier, pre-context failure point.
+
+    Args:
+        workspace: the project's working tree root.
+        slug: the superhuman project slug.
+        event: which `observe` verb this is (`"dispatch"` | `"relay"` |
+            `"handoff-emit"` | `"launch"`) — journaled as-is, matching every
+            other `_write_journal` call site in this module.
+        error_class: a short machine-stable failure-mode tag, matching
+            `_write_journal`'s convention (e.g.
+            `"adapter_construction_failed"`, `"prompt_file_unreadable"`).
+        error_text: a short human-readable detail.
+    """
+    try:
+        cfg = fleet_config.resolve_fleet_config(workspace)
+        if not cfg.enabled:
+            return
+        fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+        _write_journal(
+            fleet_dir,
+            event=event,
+            error_class=error_class,
+            error_text=error_text,
+            elapsed_ms=0.0,
+        )
+    except Exception:  # noqa: BLE001 - never allowed to raise past this helper (see module docstring)
+        pass
+
+
+def journal_adapter_construction_failure(
+    workspace: Path | str, slug: str, *, event: str, error_text: str
+) -> None:
+    """Journal a malformed `--harness` invocation caught during adapter construction.
+
+    Phase 3.3 preflight FIX 4. See `journal_early_cli_failure` for the full
+    rationale; this is the `error_class="adapter_construction_failed"`
+    specialization `cli._safe_build_adapter_for_observe` calls.
+
+    Args:
+        workspace: the project's working tree root.
+        slug: the superhuman project slug.
+        event: which `observe` verb this is, forwarded as-is.
+        error_text: the caught `ValueError`'s message.
+    """
+    journal_early_cli_failure(
+        workspace,
+        slug,
+        event=event,
+        error_class="adapter_construction_failed",
+        error_text=error_text,
+    )
+
+
 def observe_status(workspace: Path | str, slug: str) -> str:
     """Report fleet-observation enablement + activity for `workspace` (W-FR-8).
 
