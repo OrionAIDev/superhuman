@@ -1428,20 +1428,49 @@ class TestObserveStatusSlugValidation:
         assert not (git_repo / "docs").exists()
 
 
+# The vendored-core baseline: PR #3's squash-merge as it exists on `main`.
+# Pinned as a full 40-char SHA on purpose — the original pin was an abbreviated
+# revision on a branch that a later history rewrite orphaned, which broke this
+# test permanently (roadmap #184). Bump this only when the vendored core is
+# deliberately re-synced, and only to a commit reachable from `main`.
+CORE_BASELINE = "ac9d1dd08ddbf4bd7d45ce81d4b8fa1db7a549d8"
+
+
 class TestCoreUntouched:
     """TC-7: `scripts/fleet/core/*` is byte-unchanged and imports no harness module."""
 
     def test_core_diff_against_merge_base_is_empty(self) -> None:
         skill_root = Path(__file__).resolve().parents[2]
-        result = subprocess.run(
-            ["git", "diff", "3cec365", "--", "scripts/fleet/core/"],
+
+        # Resolve the baseline before diffing against it. Without this, a clone
+        # that lacks the commit fails as an opaque `assert 128 == 0` rather than
+        # saying which commit is missing.
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", CORE_BASELINE + "^{commit}"],
             cwd=skill_root,
             capture_output=True,
             text=True,
             check=False,
         )
-        assert result.returncode == 0
-        assert result.stdout.strip() == ""
+        assert resolved.returncode == 0, (
+            f"baseline unresolvable: {CORE_BASELINE} is not present in this clone. "
+            "CI needs actions/checkout with fetch-depth: 0; a shallow local clone "
+            "needs `git fetch --unshallow`. This is a missing commit, not a "
+            "modification of scripts/fleet/core/."
+        )
+
+        result = subprocess.run(
+            ["git", "diff", CORE_BASELINE, "--", "scripts/fleet/core/"],
+            cwd=skill_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"git diff failed: {result.stderr.strip()}"
+        assert result.stdout.strip() == "", (
+            "scripts/fleet/core/ has been modified against the vendored "
+            f"baseline {CORE_BASELINE}:\n{result.stdout}"
+        )
 
     def test_no_harness_native_import_in_core(self) -> None:
         skill_root = Path(__file__).resolve().parents[2]
