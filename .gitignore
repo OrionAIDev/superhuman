@@ -27,3 +27,11 @@ Thumbs.db
 /docs/superhuman/*/
 # Deliberately published, and scrubbed of operator specifics before they were:
 !/docs/superhuman/specs/
+
+# Golden POLICY fixtures pin one operator's real environment names and their
+# expected verdicts. ladder-generic.yaml pins mechanism and IS published; these
+# are the installation-specific counterpart and must stay local — the original
+# design called them "on the pre-publication removal list" (see that file's
+# header), and this rule is what enforces it mechanically. The test that reads
+# them skips when absent.
+/tests/fixtures/golden/
