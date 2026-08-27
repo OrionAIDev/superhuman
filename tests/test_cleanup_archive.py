@@ -11,7 +11,6 @@ cannot resolve Windows absolute paths. On POSIX any bash will do.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys

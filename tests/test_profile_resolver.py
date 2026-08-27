@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -562,3 +563,51 @@ def _cli_out(args: list[str], profile: Path | None) -> str:
     )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+
+GOLDEN_CURRENT = (
+    Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "golden" / "ladder-current.yaml"
+)
+LIVE_PROFILE = Path.home() / ".superhuman" / "profile.yaml"
+
+
+def test_golden_ladder_mirrors_the_live_profile() -> None:
+    """The golden POLICY fixture must not drift from the live machine profile.
+
+    ``~/.superhuman/profile.yaml`` claims to be "mirrored by
+    tests/fixtures/golden/ladder-current.yaml ... edit both together". Nothing
+    enforced that claim, so the mirror silently went missing altogether. This
+    fails the build when the two disagree on anything that changes a VERDICT —
+    rung order, any rung's detectors or approvals, or the fleet opt-in.
+
+    Comments and formatting are deliberately NOT compared: the fixture carries
+    its own local-only preamble, and the drift that matters is semantic. Skips
+    when either file is absent, which is the normal case for anyone who is not
+    this operator — the fixture is local-only by design (see the
+    ``/tests/fixtures/golden/`` rule in .gitignore).
+    """
+    if not GOLDEN_CURRENT.is_file() or not LIVE_PROFILE.is_file():
+        pytest.skip("golden policy fixture or live profile absent — nothing to pin")
+
+    golden = yaml.safe_load(GOLDEN_CURRENT.read_text(encoding="utf-8"))
+    live = yaml.safe_load(LIVE_PROFILE.read_text(encoding="utf-8"))
+
+    assert golden["version"] == live["version"], "schema version drifted"
+    assert golden["citation"] == live["citation"], "citation drifted"
+    assert (golden.get("fleet") or {}).get("enabled") == (live.get("fleet") or {}).get(
+        "enabled"
+    ), "fleet opt-in drifted"
+
+    # Rung ORDER is load-bearing (deny rungs first breaks path-segment ties to
+    # the safer verdict), so compare as an ordered list, not a set.
+    def _policy(entry: dict) -> tuple:
+        return (
+            entry["name"],
+            entry.get("kind"),
+            entry.get("detect"),
+            entry.get("approvals"),
+        )
+
+    assert [_policy(r) for r in golden["ladder"]] == [_policy(r) for r in live["ladder"]], (
+        "ladder policy drifted between the golden fixture and the live profile"
+    )
