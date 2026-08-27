@@ -502,7 +502,7 @@ def test_kickoff_offers_autonomous_when_preconditions_met(skill_root: Path) -> N
 def test_pm_has_autonomous_mode_section(skill_root: Path) -> None:
     """pm.md documents when to dispatch the surrogate vs human, and loop tracking."""
     text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
-    sections = {l[3:].strip() for l in text.splitlines() if l.startswith("## ")}
+    sections = {line[3:].strip() for line in text.splitlines() if line.startswith("## ")}
     assert any("HITL-M" in s or "HITL-L" in s for s in sections), "pm.md needs an HITL-M/L behavior H2"
     assert "surrogate-user" in text
     assert "iter-" in text and "rollback" in text.lower()
