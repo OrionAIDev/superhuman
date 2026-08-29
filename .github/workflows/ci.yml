@@ -24,7 +24,11 @@ jobs:
         # 3.11 and 3.14 are verified locally; the middle versions are covered here.
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
+      # Full history: TC-7 diffs scripts/fleet/core/ against a historical
+      # baseline commit, which a default depth-1 checkout does not fetch.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
