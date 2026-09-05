@@ -51,13 +51,19 @@ def iter_core_files(core_dir: Path = CORE_DIR) -> list[Path]:
 
 
 def digest(path: Path) -> str:
-    """Return the SHA-256 of `path`'s bytes.
+    """Return the SHA-256 of `path`'s content, with line endings normalized.
 
-    Hashed as BYTES, never as decoded text: a line-ending translation must
-    register as a change, because it is one to every consumer that reads the
-    file as bytes.
+    Read as bytes, never as decoded text — an encoding guess would make the
+    digest depend on the reader's locale. But CRLF and lone CR are folded to
+    LF first, because git REWRITES line endings on checkout (`core.autocrlf`,
+    `.gitattributes`): the raw bytes on disk are a property of the checkout,
+    not of the content. Hashing them unnormalized pins the manifest to the
+    platform that generated it — a manifest built on Windows fails on every
+    POSIX runner and vice versa, which is a guard that reports the wrong
+    thing everywhere except its author's machine.
     """
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(content).hexdigest()
 
 
 def build_manifest(core_dir: Path = CORE_DIR) -> dict[str, str]:
