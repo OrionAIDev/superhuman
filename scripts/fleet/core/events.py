@@ -564,7 +564,7 @@ def append(
 
     # Ownership applies to the event's TYPE as well as its payload fields
     # (GPT-5 review finding #1): FIELD_OWNERS marks `observation` and
-    # `recommendation` ceo-owned, and schema.py documents them as
+    # `recommendation` cto-owned, and schema.py documents them as
     # "ownership-checked the same way" — but only checking `ev.payload` keys
     # left `ev.type` itself unchecked, so a superhuman-side writer could
     # forge `type="observation"` and it would sail through untouched.

@@ -8,13 +8,31 @@ owned field is rejected — raised, not merely logged or warned.
 from __future__ import annotations
 
 from .errors import OwnershipError
+from typing import Final
+
 from .schema import FIELD_OWNERS
 
-#: The literal role class DESIGN calls "ceo" — the sole non-superhuman writer
-#: class in Phase 1. Matched case-insensitively against the whole role
-#: string, so "CEO" matches but "Developer" (which owns neither "ceo" as a
-#: substring) does not.
-_CEO_ROLE_NAME = "ceo"
+#: The ownership-class id for the sole non-superhuman writer class. The role's
+#: NAME is CTO (org chart, and the specs since roadmap #189); this constant is
+#: the class id used in `FIELD_OWNERS`, which is internal to this package and
+#: never persisted or emitted — renaming it needed no data migration.
+CTO_OWNER_CLASS: Final[str] = "cto"
+
+#: The ownership-class id for every superhuman project role (Project Manager,
+#: Developer, Architect, QA, Tester, ...).
+SUPERHUMAN_OWNER_CLASS: Final[str] = "superhuman"
+
+#: Role names that resolve to `CTO_OWNER_CLASS`. Matched case-insensitively
+#: against the WHOLE role string (never as a substring), so "CTO" matches but
+#: "Developer" does not.
+#:
+#: "ceo" is retained as a LEGACY ALIAS, not a synonym worth writing: the role
+#: was called "CEO overseer" through Phase 1/1.1, and `writer_role` IS
+#: persisted verbatim in manifest fragments. Dropping it would silently
+#: reclassify every already-written "CEO" row as `superhuman` — the exact
+#: fail-open this module exists to prevent (roadmap #207). New writers should
+#: introduce themselves as "CTO"; old rows keep classifying correctly forever.
+_CTO_ROLE_NAMES: Final[frozenset[str]] = frozenset({"cto", "ceo"})
 
 
 def _role_class(writer_role: str) -> str:
@@ -25,11 +43,14 @@ def _role_class(writer_role: str) -> str:
             `core/schema.py` upstream of any ownership check).
 
     Returns:
-        str: `"ceo"` if the role is the CEO role, else `"superhuman"` — every
-        other role (Project Manager, Developer, Architect, QA, Tester, ...)
-        is on the superhuman side of the ownership split.
+        str: `CTO_OWNER_CLASS` if the role is the CTO role (or its legacy
+        "CEO" spelling), else `SUPERHUMAN_OWNER_CLASS` — every other role
+        (Project Manager, Developer, Architect, QA, Tester, ...) is on the
+        superhuman side of the ownership split.
     """
-    return "ceo" if writer_role.strip().lower() == _CEO_ROLE_NAME else "superhuman"
+    if writer_role.strip().lower() in _CTO_ROLE_NAMES:
+        return CTO_OWNER_CLASS
+    return SUPERHUMAN_OWNER_CLASS
 
 
 def assert_writer_may(field: str, writer_role: str) -> None:

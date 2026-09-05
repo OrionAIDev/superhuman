@@ -14,7 +14,7 @@ reconciliation false-merge risk").
 Every write goes through `core.events.append` (validation + ownership
 enforcement live there, per DESIGN's data flow) — nothing here writes the
 log or a fragment any other way. `lifecycle` is a superhuman-owned field
-(`core.schema.FIELD_OWNERS`), so a `writer_role` on the "ceo" side of
+(`core.schema.FIELD_OWNERS`), so a `writer_role` on the "cto" side of
 `core.ownership`'s split is rejected by `append` itself before anything is
 persisted; this module does not duplicate that check.
 
@@ -254,7 +254,7 @@ def emit(
             to run in — the fuzzy-match anchor (TC-19).
         writer_role: a role name, never a model/vendor string (NFR-6).
             `lifecycle` is superhuman-owned (`core.schema.FIELD_OWNERS`), so
-            a "ceo"-class role is rejected by `core.events.append` itself
+            a "cto"-class role is rejected by `core.events.append` itself
             (FR-8) — not re-checked here.
         log_path: path to the project's event log.
         sessions_dir: path to the project's fragment directory.
@@ -638,7 +638,7 @@ def self_register(
         log_path: path to the project's event log.
         sessions_dir: path to the project's fragment directory.
         writer_role: a role name, never a model/vendor string (NFR-6).
-            `lifecycle` is superhuman-owned, so a "ceo"-class role is
+            `lifecycle` is superhuman-owned, so a "cto"-class role is
             rejected by `core.events.append` itself (FR-8).
         handoff_id: the id recovered from the launched session's own prompt
             (Decision E's primary anchor). `None` selects the fuzzy path.
@@ -814,7 +814,7 @@ def cancel(
         node_id: the handoff intent row's node id.
         project_id: the owning project's stable id.
         writer_role: a role name, never a model/vendor string (NFR-6).
-            `lifecycle` is superhuman-owned, so a "ceo"-class role is
+            `lifecycle` is superhuman-owned, so a "cto"-class role is
             rejected by `core.events.append` itself (FR-8).
         log_path: path to the project's event log.
         sessions_dir: path to the project's fragment directory.

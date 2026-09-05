@@ -23,6 +23,7 @@ from scripts.fleet.cli import build_parser
 from scripts.fleet.core.errors import LockTimeoutError, OwnershipError, ValidationError
 from scripts.fleet.core.nodes import parse_node_id
 from scripts.fleet.core.store import read_fragment
+from scripts import regen_core_manifest as regen
 from scripts.fleet.handoff import extract_handoff_id
 
 
@@ -1428,48 +1429,56 @@ class TestObserveStatusSlugValidation:
         assert not (git_repo / "docs").exists()
 
 
-# The vendored-core baseline: PR #3's squash-merge as it exists on `main`.
-# Pinned as a full 40-char SHA on purpose — the original pin was an abbreviated
-# revision on a branch that a later history rewrite orphaned, which broke this
-# test permanently (roadmap #184). Bump this only when the vendored core is
-# deliberately re-synced, and only to a commit reachable from `main`.
-CORE_BASELINE = "ac9d1dd08ddbf4bd7d45ce81d4b8fa1db7a549d8"
-
-
 class TestCoreUntouched:
-    """TC-7: `scripts/fleet/core/*` is byte-unchanged and imports no harness module."""
+    """TC-7: `scripts/fleet/core/*` is byte-unchanged and imports no harness module.
 
-    def test_core_diff_against_merge_base_is_empty(self) -> None:
-        skill_root = Path(__file__).resolve().parents[2]
+    The baseline is a committed CONTENT MANIFEST of per-file SHA-256 digests
+    (`scripts/fleet/core-manifest.json`), not a git revision (roadmap #194).
+    A revision pin rotted the moment history was rewritten (#184) and needed
+    full history in CI; a content manifest is immune to rewrites, rebases,
+    squash-merges and repo re-homing, works in a shallow clone, and makes a
+    deliberate re-sync a readable diff instead of a one-character SHA bump.
 
-        # Resolve the baseline before diffing against it. Without this, a clone
-        # that lacks the commit fails as an opaque `assert 128 == 0` rather than
-        # saying which commit is missing.
-        resolved = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", CORE_BASELINE + "^{commit}"],
-            cwd=skill_root,
-            capture_output=True,
-            text=True,
-            check=False,
+    Regenerate with `python scripts/regen_core_manifest.py`, in the SAME commit
+    as the core change it describes.
+    """
+
+    def test_core_matches_the_content_manifest(self) -> None:
+        core_dir = regen.CORE_DIR
+        manifest_path = regen.MANIFEST_PATH
+
+        # Fail CLOSED on an absent or unreadable manifest. A guard whose
+        # baseline can go missing and take the check with it is the failure
+        # mode this replaces, not an improvement on it.
+        assert manifest_path.is_file(), (
+            f"vendored-core manifest missing at {manifest_path}. This is the "
+            "TC-7 baseline; regenerate it with "
+            "`python scripts/regen_core_manifest.py` only when the core is "
+            "deliberately re-synced."
         )
-        assert resolved.returncode == 0, (
-            f"baseline unresolvable: {CORE_BASELINE} is not present in this clone. "
-            "CI needs actions/checkout with fetch-depth: 0; a shallow local clone "
-            "needs `git fetch --unshallow`. This is a missing commit, not a "
-            "modification of scripts/fleet/core/."
+        recorded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert isinstance(recorded, dict) and recorded, (
+            f"vendored-core manifest at {manifest_path} is empty or not a "
+            "mapping; it cannot pin anything."
         )
 
-        result = subprocess.run(
-            ["git", "diff", CORE_BASELINE, "--", "scripts/fleet/core/"],
-            cwd=skill_root,
-            capture_output=True,
-            text=True,
-            check=False,
+        actual = regen.build_manifest(core_dir)
+
+        # Compared as WHOLE SETS first, so a file added to or deleted from the
+        # core is caught. Digest-only comparison over the intersection would
+        # let an added file pass unpinned -- the same scoped-predicate defect
+        # class Phase 1's preflight kept finding.
+        assert set(actual) == set(recorded), (
+            "vendored core file set differs from the manifest.\n"
+            f"  on disk, not in manifest: {sorted(set(actual) - set(recorded))}\n"
+            f"  in manifest, not on disk: {sorted(set(recorded) - set(actual))}"
         )
-        assert result.returncode == 0, f"git diff failed: {result.stderr.strip()}"
-        assert result.stdout.strip() == "", (
-            "scripts/fleet/core/ has been modified against the vendored "
-            f"baseline {CORE_BASELINE}:\n{result.stdout}"
+
+        changed = sorted(name for name in actual if actual[name] != recorded[name])
+        assert not changed, (
+            f"scripts/fleet/core/ has been modified against the manifest: {changed}. "
+            "If the change is deliberate, regenerate the manifest in the same "
+            "commit: `python scripts/regen_core_manifest.py`."
         )
 
     def test_no_harness_native_import_in_core(self) -> None:
