@@ -11,7 +11,12 @@ import pytest
 
 from scripts.fleet.core.errors import OwnershipError
 from scripts.fleet.core.events import append, read_all
-from scripts.fleet.core.ownership import assert_writer_may
+from scripts.fleet.core.ownership import (
+    CTO_OWNER_CLASS,
+    SUPERHUMAN_OWNER_CLASS,
+    _role_class,
+    assert_writer_may,
+)
 
 
 class TestSuperhumanOwnedField:
@@ -174,3 +179,38 @@ class TestEventTypeOwnershipIsEnforcedAtAppendCallSite:
         log_path = tmp_path / "events.jsonl"
         result = append(log_path, _typed_event("key-ordinary", "Developer", "session_registered"))
         assert result is not None
+
+
+class TestCtoRoleName:
+    """roadmap #207 — the role is named CTO; "CEO" survives as a legacy alias.
+
+    `writer_role` is persisted verbatim in manifest fragments, so rows written
+    during Phase 1/1.1 carry "CEO". Both spellings must resolve to the SAME
+    ownership class: a CTO-named writer that classified as `superhuman` would
+    be locked out of the fields the role exists to own, and a legacy "CEO" row
+    that stopped classifying as the CTO class would be silently reclassified.
+    """
+
+    @pytest.mark.parametrize("field", ["adoption_state", "observation", "recommendation"])
+    def test_cto_role_may_write_every_cto_owned_field(self, field: str) -> None:
+        assert_writer_may(field, "CTO")  # must not raise
+
+    @pytest.mark.parametrize("field", ["lifecycle", "block_state", "review_state"])
+    def test_cto_role_may_not_write_any_superhuman_owned_field(self, field: str) -> None:
+        with pytest.raises(OwnershipError):
+            assert_writer_may(field, "CTO")
+
+    @pytest.mark.parametrize("spelling", ["CTO", "cto", "  Cto  ", "CEO", "ceo"])
+    def test_both_spellings_resolve_to_one_class(self, spelling: str) -> None:
+        """Case- and whitespace-insensitive, and the two names are one class."""
+        assert _role_class(spelling) == CTO_OWNER_CLASS
+
+    def test_cto_is_matched_whole_not_as_a_substring(self) -> None:
+        """A role merely CONTAINING the token is not the CTO (loose-predicate
+        guard: the same species of defect as the truthiness/isinstance findings
+        in Phase 1's preflight rounds)."""
+        for role in ("CTO Assistant", "Deputy CTO", "octopus", "Director CEO-adjacent"):
+            assert _role_class(role) == SUPERHUMAN_OWNER_CLASS
+
+    def test_cto_may_write_the_shared_done_level_field(self) -> None:
+        assert_writer_may("done_level", "CTO")  # must not raise

@@ -15,7 +15,7 @@ the dispatch, exactly the way `handoff.emit` already mints a synthetic
 
 This adapter therefore registers the **dispatch unit itself**, keyed on a
 PM-minted `local_id` (the dispatch id), reporting `harness="subagent"` so
-`fleet status` and the Phase-2 CEO can tell a subagent dispatch apart from a
+`fleet status` and the Phase-2 CTO can tell a subagent dispatch apart from a
 `PortableAdapter`-registered OS process or a `ClaudeAdapter`-registered
 harness session — never `harness="portable"` (Decision C's rejected
 alternative: reusing `PortableAdapter` would mislabel a dispatch as "this OS

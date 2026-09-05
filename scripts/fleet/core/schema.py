@@ -103,16 +103,16 @@ _ALLOWED_FRAGMENT_FIELDS: Final[frozenset[str]] = _REQUIRED_FRAGMENT_FIELDS
 #: Per-field ownership (CC-6/FR-8). "shared" fields accept a write from either
 #: class. Fields absent from this table are unowned/free (no restriction).
 #: `observation`/`recommendation` are payload *kinds* (event types), not
-#: fragment fields, but they are ownership-checked the same way (ceo-owned),
+#: fragment fields, but they are ownership-checked the same way (cto-owned),
 #: per DESIGN "core/ownership.py" responsibility and ARCHITECTURE item 5.
 FIELD_OWNERS: Final[dict[str, str]] = {
     "lifecycle": "superhuman",
     "block_state": "superhuman",
     "review_state": "superhuman",
-    "adoption_state": "ceo",
+    "adoption_state": "cto",
     "done_level": "shared",
-    "observation": "ceo",
-    "recommendation": "ceo",
+    "observation": "cto",
+    "recommendation": "cto",
 }
 
 #: writer_role denylist (NFR-6) — model/vendor names, never a role. Substring
@@ -185,9 +185,9 @@ class Fragment:
         lifecycle: intra-project execution lifecycle (superhuman-owned).
         block_state: blocked/unblocked axis (superhuman-owned).
         review_state: review axis (superhuman-owned).
-        adoption_state: orphan/adoption axis (ceo-owned).
+        adoption_state: orphan/adoption axis (cto-owned).
         done_level: evidence-backed deployment rung; state machine in Chunk 5
-            (ceo/superhuman shared field — advancement rules live in
+            (cto/superhuman shared field — advancement rules live in
             `core/done.py`).
     """
 
