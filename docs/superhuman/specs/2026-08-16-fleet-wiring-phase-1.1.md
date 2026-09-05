@@ -78,6 +78,6 @@ proxy derivation; the `fleet:` profile-schema block never formally extended. Non
 
 ## Not in scope
 
-The Phase-2 CEO overseer (active loop, dashboard, stall detection, escalation) — that is a
+The Phase-2 CTO (active loop, dashboard, stall detection, escalation) — that is a
 separate project at its own G0. This project only makes superhuman *write* what it already
 promised to write.

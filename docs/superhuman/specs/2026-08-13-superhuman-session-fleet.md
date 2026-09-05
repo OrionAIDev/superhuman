@@ -1,4 +1,4 @@
-# Spec (design input): The CEO overseer & Superhuman Session Fleet
+# Spec (design input): The CTO & Superhuman Session Fleet
 
 **Created:** 2026-08-13
 **Last refined:** 2026-08-13 (requirements round 3 — HITL autonomy, levels of done, self-improvement)
@@ -18,18 +18,18 @@
 
 Refined into **two separate-but-related goals with a little overlap**:
 
-- **A. The CEO overseer** — *active, autonomous* entity that tracks/manages **everything**: every
+- **A. The CTO** — *active, autonomous* entity that tracks/manages **everything**: every
   session (whether or not asked), every roadmap issue, every superhuman project. It **delegates to but
   also supervises** superhuman. Its job is to keep work from **dying, being forgotten, or lost** —
   periodically prioritizing and checking what is stuck, what is next, what got dropped.
 - **B. Superhuman managing its own project** — superhuman never causes a session to exist (spawned,
   relayed, **or** a manual "next prompt" handoff) without tracking it and its dependencies.
 
-Overlap = the **shared manifest** (§13): superhuman is a durable *writer*; the CEO is the active *loop*.
+Overlap = the **shared manifest** (§13): superhuman is a durable *writer*; the CTO is the active *loop*.
 
 ## 2. Field research
 
-- **"CEO"/lead-agent pattern** — orchestrator decomposes, delegates to isolated-context sub-agents,
+- **"CTO"/lead-agent pattern** — orchestrator decomposes, delegates to isolated-context sub-agents,
   checks in, stays auditable. (Addy Osmani; Shipyard.)
 - **Native Agent Teams** (Anthropic 2026, experimental) — shared task list, real-time status/dependency
   tracking, **auto-unblocks dependents**. Claude-specific (§6). (Claude Code Docs; MindStudio.)
@@ -47,7 +47,7 @@ Overlap = the **shared manifest** (§13): superhuman is a durable *writer*; the 
 | **`superhuman`** | Vision→acceptance; roles; gates; drift watch; **HITL levels H/M/L**. Harness-portable | Loses the plot across sessions; can silently stall; **calls "done" before prod** |
 | **Governing disciplines skill** | 8 Rules; **Rule 8: promotion to UAT/Prod needs explicit approval, every time; nothing complete until promotion lands** | Governing peer (§7 levels of done) |
 | **Auto-memory + `docs/superhuman/`** | Durable per-project state | Not aggregated |
-| **`schedule`/scheduled-tasks MCP** | Cron | Not pointed at backlog / CEO loop / overnight self-review |
+| **`schedule`/scheduled-tasks MCP** | Cron | Not pointed at backlog / CTO loop / overnight self-review |
 | **Native Agent Teams** | Real-time shared task list + auto-unblock | Experimental, off, intra-project, **Claude-specific** |
 
 **Missing organs:** (a) a **portable persistent manifest** tying sessions ↔ issues ↔ phases, and
@@ -59,13 +59,13 @@ Overlap = the **shared manifest** (§13): superhuman is a durable *writer*; the 
 2. **Roadmap-issue ↔ issue** (declared in GitHub).
 3. **Phase ↔ gate within a superhuman project** (superhuman already models this).
 
-The CEO reconciles across all three.
+The CTO reconciles across all three.
 
 ## 5. Two entities — core architecture
 
 ```
         ┌──────────────────────────────────────────────────────┐
-        │  CEO OVERSEER  (active, autonomous, always-on)          │
+        │  CTO  (active, autonomous, always-on)                   │
         │  • surveys every session, issue, SH project             │
         │  • HUNTS sessions that escaped tracking (R12)           │
         │  • detects stuck / dropped / dying; prioritizes         │
@@ -87,7 +87,7 @@ The CEO reconciles across all three.
      └────────────────────────────────────────────────────────┘
 ```
 
-**CEO ⊃ superhuman.** Superhuman is reactive within a project (and can stall); the CEO notices and
+**CTO ⊃ superhuman.** Superhuman is reactive within a project (and can stall); the CTO notices and
 resurfaces. The **manifest is the contract**; session-relay/Agent Teams are Claude-side adapters.
 
 ## 6. Harness-agnostic constraint (hard)
@@ -119,28 +119,28 @@ Self-documenting labels (per the meaningful-shorthand habit — the token carrie
   DP#5 irreversible line.
 - **Reaching D2-test can be autonomous.** Where the resolved rung permits unattended work
   (`act_unattended: [self]` — laptop, lab, test) **and** the project is at HITL-L, superhuman
-  *or* the CEO may drive work all the way to **D2-test** (build → merge → deploy-to-test → run tests)
+  *or* the CTO may drive work all the way to **D2-test** (build → merge → deploy-to-test → run tests)
   without human intervention. The cap is entry to UAT, not entry to Test. *(This corrects the earlier
   draft, which wrongly gated D2.)*
 - **Nothing is terminal-`done` until D4-prod** (human-accepted in prod). The manifest carries a
   `done-level`; superhuman's internal "done" maps to **D0-code / D1-merged** only and must never
   masquerade as terminal.
 - **No production environment yet**: the project reaches its current ceiling and
-  parks at **`pending-prod`** — a status the CEO keeps **permanently visible**, never closed. (Cf. memory
+  parks at **`pending-prod`** — a status the CTO keeps **permanently visible**, never closed. (Cf. memory
   "superhuman never past Test": superhuman's *own* ceiling is Test — a project-specific D-ceiling,
   not a redefinition of D4-prod.)
 
-## 8. HITL-scaled CEO autonomy (new)
+## 8. HITL-scaled CTO autonomy (new)
 
-The CEO reads the project's **HITL level** and scales how far it may act on a stuck/stalled run:
+The CTO reads the project's **HITL level** and scales how far it may act on a stuck/stalled run:
 
-| HITL | CEO may… |
+| HITL | CTO may… |
 | --- | --- |
 | **High** | Only **surface/escalate** to the human. Never auto-act. |
 | **Medium** | **Nudge** within bounds (re-dispatch the next chunk, restart a dead session, re-ask a pending question), surface decisions. |
 | **Low** | Get a stuck run **back on track autonomously** — restart, re-spawn, unblock, advance to the next chunk — without waiting for the human. |
 
-**Hard cap regardless of HITL (dev-principle #5):** the CEO never autonomously crosses an irreversible /
+**Hard cap regardless of HITL (dev-principle #5):** the CTO never autonomously crosses an irreversible /
 safety-critical line — **promotion into UAT or Prod (D3-uat / D4-prod)**, money, credentials, deletions,
 external sends. Those stay human at every HITL level. Deploying up to **D2-test** is *within* the
 reversible autonomy band where the rung permits it (§7). HITL widens the reversible band; never the cap.
@@ -154,44 +154,44 @@ reversible autonomy band where the rung permits it (§7). HITL widens the revers
 - **R5** the roadmap tracker used more effectively — intentional issue dependencies.
 - **R6** Backlog resurfacing — nothing rots.
 - **R7** Adopt native Agent Teams (Claude adapter real-time layer).
-- **R8** The **active** CEO — proactively **surveys and prioritizes across all three surfaces** (open
+- **R8** The **active** CTO — proactively **surveys and prioritizes across all three surfaces** (open
   sessions, roadmap issues, superhuman projects), determines what's next, and keeps things from dying.
   **Phase 2** (session/project prioritization → P2.4; roadmap-issue prioritization → P2.6). *Not Phase 1.*
-- **R9** Proactive **trigger/hook** — CEO looks whether or not asked.
+- **R9** Proactive **trigger/hook** — CTO looks whether or not asked.
 - **R10** Track **manual handoffs** — `awaiting-launch` row at prompt-emission; stale row = dropped thread.
 - **R11** **Harness-agnostic** (§6).
-- **R12 [new]** CEO **actively hunts sessions that escaped tracking** — enumerate all live sessions,
+- **R12 [new]** CTO **actively hunts sessions that escaped tracking** — enumerate all live sessions,
   diff against the union of manifests, adopt/flag orphans.
-- **R13 [new]** CEO is **HITL-aware** — autonomy scaled by the project's HITL level (§8), DP#5-capped.
-- **R14 [new]** **Levels of done** (§7) — the manifest tracks `done-level`; the CEO surfaces the gap
+- **R13 [new]** CTO is **HITL-aware** — autonomy scaled by the project's HITL level (§8), DP#5-capped.
+- **R14 [new]** **Levels of done** (§7) — the manifest tracks `done-level`; the CTO surfaces the gap
   between superhuman-"done" and prod-accepted; `pending-prod` stays visible where no prod exists.
-- **R15 [new]** **Self-improvement log** — the CEO keeps a *separate, prioritized* log of self-
+- **R15 [new]** **Self-improvement log** — the CTO keeps a *separate, prioritized* log of self-
   improvements and does **not** implement meaningful ones absent HITL. An **overnight scheduled job**
   reviews problems, failures, inefficiencies, cost/task, and UX (reduced human involvement, clarity of
   responses/questions) and ranks proposals. → **Phase 3** (§16).
-- **R16 [new]** **Provider-plan / budget awareness.** The CEO is aware of LLM-provider plan usage (e.g.
+- **R16 [new]** **Provider-plan / budget awareness.** The CTO is aware of LLM-provider plan usage (e.g.
   Claude's rolling **5-hour** and **1-week** windows) and throttles so it never exhausts the window —
   always leaving headroom for the operator, maximizing value extracted from providers against the limits.
   → **Phase 3/4**; short-term stopgap if the limit bites sooner (§16).
-- **R17 [new]** **Superhuman self-un-stall (works without the CEO).** Others may install superhuman
-  *without* the CEO, so superhuman must not silently stall on its own: from the manifest it detects its
+- **R17 [new]** **Superhuman self-un-stall (works without the CTO).** Others may install superhuman
+  *without* the CTO, so superhuman must not silently stall on its own: from the manifest it detects its
   own dead/idle sessions and stale `awaiting-launch` handoffs and **re-surfaces or re-dispatches** them.
-  The CEO adds cross-project, HITL-scaled healing *on top*; it is not a prerequisite for baseline recovery.
+  The CTO adds cross-project, HITL-scaled healing *on top*; it is not a prerequisite for baseline recovery.
   **Scheduled: Phase 2** (deferred out of Phase 1 at G0, 2026-08-13) — but built **superhuman-side**, not
-  CEO-side, so it functions with no CEO installed. Phase 1 only makes stalls *visible* in the manifest.
+  CTO-side, so it functions with no CTO installed. Phase 1 only makes stalls *visible* in the manifest.
 - **R18 [new]** **Portability proof each phase.** At the end of every phase, ship to **hermeslab** (a
   Hermes harness) and exercise the deliverable there, proving the portable core actually runs off-Claude —
   portability is *demonstrated per phase*, not asserted and deferred. (Revises the VISION's NG-5.)
-- **R19 [new]** **CEO model-tier routing / cost-effectiveness.** The CEO runs its own judgment
+- **R19 [new]** **CTO model-tier routing / cost-effectiveness.** The CTO runs its own judgment
   (prioritization, stuck-diagnosis, next-action) on a **most-capable** model (Opus / GPT-class) but
   **delegates easier work to cheaper agents** (Sonnet/Haiku) — the same cheapest-capable-model discipline
   superhuman already applies (dev-principles; `adaptation/dispatch.md`). **Cost-effectiveness is an
-  explicit build goal**, decided early (the CEO's role→tier table) rather than retrofitted. Relates to
+  explicit build goal**, decided early (the CTO's role→tier table) rather than retrofitted. Relates to
   R16 (budget awareness). → **Phase 2** (early decision).
 
 ## 10. Vision
 
-**Two cooperating layers over one shared manifest, delivered in three phases.** The **CEO overseer**
+**Two cooperating layers over one shared manifest, delivered in three phases.** The **CTO**
 is a standing, autonomous, HITL-aware supervisor that keeps the enterprise alive — surveying sessions,
 issues, and superhuman projects; hunting escaped sessions; detecting stuck/dropped/aging work;
 self-healing what it safely may (scaled by HITL, capped by DP#5); and refusing to let anything read as
@@ -214,22 +214,22 @@ it tracks every session it causes to exist, portably, and reports honest done-le
 - **G10** **Harness portability** — manifest + tracking harness-neutral; Claude tools are one adapter.
 - **G11 [new]** **Honest done** — nothing terminal-`done` until human-accepted in prod (D4); the gap is
   always visible; `pending-prod` never closes silently.
-- **G12 [new]** **HITL-scaled self-healing** — the CEO recovers stuck work autonomously up to the
+- **G12 [new]** **HITL-scaled self-healing** — the CTO recovers stuck work autonomously up to the
   project's HITL band, never past the DP#5 irreversible cap.
 - **G13 [new]** **Disciplined self-improvement** — a prioritized improvement log + nightly review;
   meaningful changes proposed, never enacted without HITL.
 
 **GitHub in the goals:** not a goal-outcome — it is the **backbone + a watched surface** (G5; open
-issues are one of the three surfaces the CEO watches under G8). Kept as mechanism, surfaced here.
+issues are one of the three surfaces the CTO watches under G8). Kept as mechanism, surfaced here.
 
 ## 12. Non-goals
 
-- **NG-1** The CEO is not a subfeature of one superhuman project (though built *by* one — §16).
+- **NG-1** The CTO is not a subfeature of one superhuman project (though built *by* one — §16).
 - **NG-2** Not replacing session-relay (Claude executor/adapter) or superhuman (planner/tracker).
 - **NG-3** No new roadmap tracker — the existing one stays SoT.
 - **NG-4** No introspection of a session's internal reasoning — track *state and edges*, not thoughts.
 - **NG-5** Manifest core carries no harness-specific calls.
-- **NG-6 [new]** The CEO does **not** self-modify meaningfully, promote/deploy, or cross any DP#5 line
+- **NG-6 [new]** The CTO does **not** self-modify meaningfully, promote/deploy, or cross any DP#5 line
   autonomously — regardless of HITL. Self-improvement is *proposal*, not *enactment*.
 
 ## 13. The manifest — shared substrate
@@ -241,14 +241,14 @@ issues are one of the three surfaces the CEO watches under G8). Kept as mechanis
 - **Manual-handoff mechanism (R10):** superhuman writes the row **when it emits the prompt**
   (`awaiting-launch`); the launched session self-registers → `active` on first action; a stale
   `awaiting-launch` = a detectable **dropped handoff** (feeds G8).
-- **Escaped-session hunt (R12):** the CEO diffs live sessions (harness adapter) against the union of
+- **Escaped-session hunt (R12):** the CTO diffs live sessions (harness adapter) against the union of
   all manifests and adopts/flags anything untracked or stale.
 
 ## 14. Skills bundle vs. schema contract (R2)
 
 Interop point = the **manifest schema** (harness-neutral). **Now:** define a shared **manifest
 contract** (schema + location). **Later, if it earns it:** bundle the tightly-coupled trio
-(superhuman + CEO + Claude session adapter). **Independent:** disciplines (governing peer),
+(superhuman + CTO + Claude session adapter). **Independent:** disciplines (governing peer),
 skill-audit (conditional QA companion). Decision belongs to the projects, not pre-committed here.
 
 ## 15. Low-hanging-fruit menu (maps to phases in §16)
@@ -274,7 +274,7 @@ fields that Phase 2 acts on. Phase 1 makes stalls *visible* only — self-un-sta
 Phase 2 at G0. **Phase 1's G0 decides the exact "implement now" scope.** *Value: honest, durable
 visibility of everything superhuman spawns.*
 
-**Phase 2 — The CEO overseer.** Broken into value-delivering slices (Phase 2's G0 sequences them):
+**Phase 2 — The CTO.** Broken into value-delivering slices (Phase 2's G0 sequences them):
 
 | Slice | Deliverable | Standalone value |
 | --- | --- | --- |
@@ -287,10 +287,10 @@ visibility of everything superhuman spawns.*
 | **P2.7** | **Levels-of-done tracking** (§7) — surface the gap to prod-acceptance; keep `pending-prod` visible | No false "done" |
 
 Phase 2 also ships **P2.0 — superhuman-native self-un-stall (R17)**: a superhuman-side capability
-(re-surface stale `awaiting-launch`, re-dispatch a dead subagent) that works with **no CEO installed**,
-distinct from the CEO's cross-project HITL-scaled healing. Deferred here from Phase 1 at G0.
+(re-surface stale `awaiting-launch`, re-dispatch a dead subagent) that works with **no CTO installed**,
+distinct from the CTO's cross-project HITL-scaled healing. Deferred here from Phase 1 at G0.
 
-*Dependency: **Phase 1 blocks Phase 2** — the CEO cannot supervise a manifest superhuman is not yet
+*Dependency: **Phase 1 blocks Phase 2** — the CTO cannot supervise a manifest superhuman is not yet
 populating. Within Phase 2, P2.1 unblocks P2.2–P2.4; P2.5 depends on P2.4.*
 
 **Phase 3 — Disciplined self-improvement (R15/G13).** A **separate prioritized self-improvement log**
@@ -303,14 +303,14 @@ clearer, and less human-dependent over time, safely.*
 shipped to **hermeslab** (Hermes harness) and exercised there. A phase that only works under Claude is
 not done. This turns "harness-agnostic" from an assertion into a per-phase test.
 
-**Phase 4 (candidate) — provider-plan / budget awareness (R16).** The CEO learns the operator's LLM-plan
+**Phase 4 (candidate) — provider-plan / budget awareness (R16).** The CTO learns the operator's LLM-plan
 windows (Claude 5-hour / 1-week) and throttles to leave headroom, maximizing value against limits. Pulled
 forward as a stopgap if the limit bites during Phase 2/3.
 
 **Roadmap / research ideas (not yet phased — route to the roadmap tracker):**
 - **Agents-as-employees.** Refactor superhuman's agent use so a role agent (developer, architect) holds a
   *task list* and, on getting stuck, **escalates and switches to another task** instead of blocking — a
-  "mini-CEO" per agent type. Larger than this effort; a research/roadmap candidate, not a phase here.
+  "mini-CTO" per agent type. Larger than this effort; a research/roadmap candidate, not a phase here.
 
 ## 17. Working sequence
 
@@ -321,16 +321,16 @@ forward as a stopgap if the limit bites during Phase 2/3.
 ## 18. Open questions (for the phases' G0)
 
 1. **Manifest home** — `FLEET.md` per slug vs. section in `SUPERHUMAN.md`. *(P1)*
-2. **Cross-project roll-up** — single top-level CEO view vs. per-project + roll-up. *(P2)*
+2. **Cross-project roll-up** — single top-level CTO view vs. per-project + roll-up. *(P2)*
 3. **Dashboard surface** — markdown vs. HTML artifact vs. both. *(P2.1)*
 4. **Edge inheritance** — session edges auto-inherit from served issue/phase, or declared+reconciled? *(P1/P2)*
 5. **Agent Teams boundary** — Claude real-time vs. portable durable manifest. *(P1)*
-6. **CEO cadence & the autonomy line** — how often it runs; the exact HITL×action matrix and where the
+6. **CTO cadence & the autonomy line** — how often it runs; the exact HITL×action matrix and where the
    code/LLM line sits per DP#5. *(P2)*
 7. **Backlog cron scope** — the roadmap tracker only vs. every repo in the org. *(P2.6)*
 8. **Bundle vs. schema contract** — §14. *(P1)*
-9. **CEO portability** — harness-agnostic CEO vs. per-harness supervisor over a portable manifest. *(P2)*
-10. **Done-level detection** — how the CEO learns a project's current D-level (deploy registry? env
+9. **CTO portability** — harness-agnostic CTO vs. per-harness supervisor over a portable manifest. *(P2)*
+10. **Done-level detection** — how the CTO learns a project's current D-level (deploy registry? env
     probes? disciplines ledger?) and its D-ceiling where no prod exists. *(P2.7)*
 11. **Self-improvement job autonomy** — what (if anything) it may auto-apply (trivial/safe only) vs.
     always-propose; where it writes its log. *(P3)*
@@ -352,7 +352,7 @@ the roadmap scan. **All adopted.** Phase-1 items (CC-1…CC-8) are formalized in
 - **CC-4 Handoff durability** — durable `handoff_id` + expiry/cancel; a Phase-1 stale-handoff report.
 - **CC-5 Evidence-backed `done_level`** — commit/PR/CI/deploy-id/env/approver/timestamp + project
   D-ceiling; not self-assertable.
-- **CC-6 State-ownership** — superhuman owns intra-project execution state; the CEO observes/recommends
+- **CC-6 State-ownership** — superhuman owns intra-project execution state; the CTO observes/recommends
   or calls a recovery interface, never mutates owned lifecycle fields except scoped orphan flags.
 - **CC-7 Tiny throwaway `fleet status` viewer** in Phase 1 (validates schema + early win; superseded by
   P2.1). **LHF-8 (Agent Teams) cut** from the Phase-1 critical path.
@@ -365,19 +365,19 @@ the roadmap scan. **All adopted.** Phase-1 items (CC-1…CC-8) are formalized in
   shadow-mode probation + confidence thresholds.
 - **CC-10** Orphan-hunt is **flag-only + scoped** to allowlisted workspace roots; classify on
   cwd/title/branch, **never transcripts** (preserves NG-4).
-- **CC-11** CEO **budget hard-limits from day one of Phase 2** (max cycles/day, sessions/cycle, respawns,
+- **CC-11** CTO **budget hard-limits from day one of Phase 2** (max cycles/day, sessions/cycle, respawns,
   tokens/run, stop-when-uncertain) — do not wait for Phase 4.
 - **CC-12** Self-improvement **proposals-only first**; auto-apply later, reports/metadata only, after
   explicit policy approval.
 
 **Roadmap cross-refs** (registry: the roadmap tracker's research index):
-IDEA-034 (CEO / self-improvement prior art), IDEA-035 (rejected — the DP#5 guardrail boundary),
+IDEA-034 (CTO / self-improvement prior art), IDEA-035 (rejected — the DP#5 guardrail boundary),
 IDEA-036 & IDEA-030 (cost / model-tier backing for R16/R19 — secondary), IDEA-013 → roadmap #95 (Hermes
 multi-session — the hermeslab reference), IDEA-028 (role-based audit primitive). This effort was
 registered as a new IDEA in that file (2026-08-14).
 
 **Attribution rule (IDEA-028 tweak):** every signature/attribution this system writes — commit trailers,
-manifest entries, the CEO audit trail — names **roles** (CEO, Project Manager, Developer…),
+manifest entries, the CTO audit trail — names **roles** (CTO, Project Manager, Developer…),
 **never** an AI/model/provider.
 
 ## 19. Sources
