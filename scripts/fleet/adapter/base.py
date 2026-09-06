@@ -59,11 +59,22 @@ def format_handoff_line(handoff_id: str) -> str:
 #: `format_handoff_line`). Deliberately generic prose, not a fully-formed
 #: CLI invocation: `emit_prompt` has no `workspace`/`slug` to fill in, and
 #: this step is best-effort by construction — never worth blocking on.
+#: The invocation is spelled as a module (`python -m scripts.fleet.cli`) run
+#: from the superhuman skill root, because that is the only form that
+#: resolves: superhuman is a skill loaded by path, not an installed Python
+#: distribution, so no `fleet` executable is ever placed on `PATH`, and
+#: `cli.py` imports its siblings package-relatively so it cannot be run as a
+#: loose script either. The skill root is deliberately called out as distinct
+#: from `--workspace`: the launched session is normally working in some other
+#: repo entirely, and `-m` resolves against the current directory.
 _LAUNCH_INSTRUCTION = (
     "If this project uses fleet session observation, run "
-    "`fleet observe launch --workspace <this project's root> "
-    "--slug <this project's slug> --handoff-id <the id above>` as your first "
-    "action (see SKILL.md's first-action step). This is best-effort: if "
+    "`python -m scripts.fleet.cli observe launch "
+    "--workspace <this project's root> --slug <this project's slug> "
+    "--handoff-id <the id above>` as your first action (see SKILL.md's "
+    "first-action step). Run it from the superhuman skill root — the checkout "
+    "holding SKILL.md — which is usually NOT this project's root; this "
+    "project's root is what --workspace names. This is best-effort: if "
     "fleet observation is disabled, unavailable, or the command fails, skip "
     "it and proceed with the work above regardless — it never blocks."
 )

@@ -8,12 +8,14 @@
 #
 # Purpose: give the spawned-dispatch registration a DETERMINISTIC ceiling on
 # top of the portable prose floor in `roles/pm.md` / `phases/3-implementation.md`
-# ("after each role dispatch, call `fleet observe dispatch`"). Where
+# ("after each role dispatch, call `python -m scripts.fleet.cli observe
+# dispatch`"). Where
 # installed, this hook fires without depending on the PM thread remembering
 # the prose call-out.
 #
 # This hook calls the SAME entry point the prose floor calls —
-# `fleet observe dispatch` — never a parallel or divergent invocation. A
+# `python -m scripts.fleet.cli observe dispatch` — never a parallel or
+# divergent invocation. A
 # deterministic hook can never diverge from the portable prose floor because
 # both call the identical CLI verb.
 #
@@ -26,8 +28,9 @@
 # and, where available, its prompt payload before calling through.
 #
 # Best-effort by construction: this script's exit status is never allowed to
-# block the tool call it observes. `fleet observe dispatch` itself always
-# exits 0 (it is fail-soft — see `scripts/fleet/observe.py`'s module
+# block the tool call it observes. `python -m scripts.fleet.cli observe
+# dispatch` itself always exits 0 (it is fail-soft — see
+# `scripts/fleet/observe.py`'s module
 # docstring), and this wrapper additionally never propagates a non-zero exit
 # from anything else it runs.
 #
@@ -46,19 +49,35 @@ SLUG="REPLACE_WITH_YOUR_PROJECT_SLUG"
 # Replace with however your harness names/threads a subagent dispatch.
 DISPATCH_ID="REPLACE_WITH_A_DISPATCH_ID"
 
-# Locate the `fleet` CLI. Adjust if your install path differs.
-FLEET_CLI="$(command -v fleet || echo "${WORKSPACE}/scripts/fleet/cli.py")"
+# The superhuman skill root: the checkout holding `SKILL.md` and `scripts/`.
+# The CLI is invoked as a module from there (`python -m scripts.fleet.cli`),
+# which is the only form that resolves — superhuman is a skill loaded by
+# path, not an installed Python distribution, so no `fleet` executable is
+# ever placed on `PATH`, and `scripts/fleet/cli.py` imports its siblings
+# package-relatively so it cannot be run as a loose script either.
+#
+# This is NOT "$WORKSPACE". The project under observation is passed
+# separately, via --workspace, and is normally a different directory; `-m`
+# resolves `scripts.fleet` against the current directory, so the `cd` below
+# has to land on the skill root specifically.
+SUPERHUMAN_ROOT="${SUPERHUMAN_ROOT:-REPLACE_WITH_YOUR_SUPERHUMAN_SKILL_ROOT}"
+
+# The interpreter to run it with. Override if yours is not `python3`.
+PYTHON="${PYTHON:-python3}"
 
 # Best-effort: never let this block or fail the tool call it observes.
 # --harness subagent (with --local-id set to the dispatch id) is required here
 # — omitting it silently defaults to --harness portable (DESIGN's Decision C
 # names this exact semantic overloading as the reason a dispatch unit is never
 # represented by PortableAdapter).
-"$FLEET_CLI" observe dispatch \
-  --workspace "$WORKSPACE" \
-  --slug "$SLUG" \
-  --dispatch-id "$DISPATCH_ID" \
-  --harness subagent \
-  --local-id "$DISPATCH_ID" >/dev/null 2>&1 || true
+(
+  cd "$SUPERHUMAN_ROOT" \
+    && "$PYTHON" -m scripts.fleet.cli observe dispatch \
+      --workspace "$WORKSPACE" \
+      --slug "$SLUG" \
+      --dispatch-id "$DISPATCH_ID" \
+      --harness subagent \
+      --local-id "$DISPATCH_ID"
+) >/dev/null 2>&1 || true
 
 exit 0

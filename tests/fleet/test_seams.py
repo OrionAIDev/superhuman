@@ -39,8 +39,13 @@ from publication_patterns import TOKENS_FILE, find_tokens, load_tokens  # noqa: 
 _EDITED_FILES = ("roles/pm.md", "phases/3-implementation.md")
 
 #: The literal command shape the new subsection must name (TC-10, W-NFR-4).
+#: Spelled as the module invocation, which is the only form that resolves:
+#: superhuman ships no packaging, so no `fleet` executable exists on `PATH`,
+#: and `cli.py`'s package-relative imports rule out running it as a script.
+#: The `\s*` between tokens tolerates the line wrapping prose requires.
 _COMMAND_SHAPE_RE = re.compile(
-    r"fleet observe handoff-emit --prompt-file \.\.\. --output-file \.\.\."
+    r"python -m scripts\.fleet\.cli observe handoff-emit\s+"
+    r"--prompt-file \.\.\.\s+--output-file \.\.\."
 )
 
 #: Phrases proving the non-blocking / logged-failure-and-proceed language is
@@ -152,7 +157,8 @@ class TestHandoffEmissionSeamContent:
         subsection = _new_subsection_text(_REPO_ROOT / relative_path)
         assert _COMMAND_SHAPE_RE.search(subsection), (
             f"{relative_path}: subsection does not name the literal command shape "
-            "'fleet observe handoff-emit --prompt-file ... --output-file ...'"
+            "'python -m scripts.fleet.cli observe handoff-emit --prompt-file ... "
+            "--output-file ...'"
         )
 
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
@@ -177,8 +183,42 @@ class TestHandoffEmissionSeamContent:
         assert not hits, f"{relative_path}: operator token(s) found: {hits!r}"
 
 
+#: W-NFR-4 rule 1 forbids changing a line that already existed in these
+#: orchestration files, so that a resumed pre-existing project fires identical
+#: gates in identical order. One narrow class of change cannot satisfy that and
+#: still be correct: a line naming the fleet CLI as a bare `fleet <verb>`
+#: command. No such command has ever been installable — the repo ships no
+#: packaging, so nothing puts a `fleet` executable on `PATH`, and
+#: `scripts/fleet/cli.py`'s package-relative imports rule out running it as a
+#: loose script. Re-spelling those lines to the module form
+#: (`python -m scripts.fleet.cli <verb>`) necessarily removes them.
+#:
+#: The exemption is deliberately as small as the defect: it matches ONLY a
+#: line naming a bare-`fleet` subcommand, so any other removal in these files
+#: still fails. It also expires on its own — once no line spells a command
+#: that way, it matches nothing. The behavioural guarantee it protects is
+#: unaffected: these are non-gating observational call-outs, and the
+#: gate-sequence check (`TestGateFrontmatterUnchanged`) is independent.
+_LEGACY_BARE_FLEET_INVOCATION_RE = re.compile(
+    r"`fleet (?:observe|status|handoff|register|query|gen-view|done)\b"
+)
+
+
+def _disallowed_removed_lines(diff_stdout: str) -> list[str]:
+    """Return removed diff lines that W-NFR-4 rule 1 does not permit."""
+    return [
+        line
+        for line in diff_stdout.splitlines()
+        if line.startswith("-")
+        and not line.startswith("---")
+        and not _LEGACY_BARE_FLEET_INVOCATION_RE.search(line)
+    ]
+
+
 class TestAdditiveDiffInvariant:
-    """TC-10's application of TC-24: the edited files' diffs contain zero removed lines."""
+    """TC-10's application of TC-24: the edited files' diffs contain zero removed
+    lines, save the narrow bare-`fleet` re-spelling exemption above.
+    """
 
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
     def test_diff_against_merge_base_has_zero_removed_lines(self, relative_path: str) -> None:
@@ -197,11 +237,7 @@ class TestAdditiveDiffInvariant:
         if result.returncode != 0:
             pytest.skip(f"git diff against {merge_base} failed in this environment")
 
-        removed_lines = [
-            line
-            for line in result.stdout.splitlines()
-            if line.startswith("-") and not line.startswith("---")
-        ]
+        removed_lines = _disallowed_removed_lines(result.stdout)
         assert removed_lines == [], (
             f"{relative_path}: diff against merge-base {merge_base} removed lines:\n"
             + "\n".join(removed_lines)
@@ -212,11 +248,13 @@ class TestAdditiveDiffInvariant:
 # entry point (W-NFR-5, Chunk 3) --------------------------------------------
 
 #: The two operator-neutral hook templates Chunk 3 ships. Each must invoke
-#: the identical `fleet observe <event>` verb the prose floor uses — never a
-#: parallel/divergent invocation (DESIGN's hybrid boundary).
+#: the identical `observe <event>` verb the prose floor uses — never a
+#: parallel/divergent invocation (DESIGN's hybrid boundary). Matched on the
+#: real module invocation (`python -m scripts.fleet.cli observe <event>`),
+#: since no `fleet` executable is ever installed on `PATH`.
 _HOOK_TEMPLATES: dict[str, str] = {
-    "templates/hooks/SessionStart": "fleet observe launch",
-    "templates/hooks/PreToolUse": "fleet observe dispatch",
+    "templates/hooks/SessionStart": "-m scripts.fleet.cli observe launch",
+    "templates/hooks/PreToolUse": "-m scripts.fleet.cli observe dispatch",
 }
 
 
@@ -261,8 +299,11 @@ class TestHookTemplateSeamContent:
 # --- TC-20: spawned-dispatch seam content — granularity rule stated once,
 # role-prompt predicate checkable (W-FR-1, Q3 / Decision C, Chunk 5) --------
 
-#: The literal command shape the two new subsections must name.
-_DISPATCH_COMMAND_SHAPE_RE = re.compile(r"fleet observe dispatch --harness subagent")
+#: The literal command shape the two new subsections must name. `\s*`
+#: tolerates the line wrapping prose requires around the longer module form.
+_DISPATCH_COMMAND_SHAPE_RE = re.compile(
+    r"python -m scripts\.fleet\.cli observe dispatch\s+--harness subagent"
+)
 
 #: The canonical granularity-rule statement (Decision C). Matched loosely
 #: enough to survive minor rewording, tightly enough that a drifted second
@@ -313,7 +354,7 @@ class TestSpawnedDispatchSeamContent:
         subsection = _dispatch_subsection_text(_REPO_ROOT / relative_path)
         assert _DISPATCH_COMMAND_SHAPE_RE.search(subsection), (
             f"{relative_path}: dispatch-observation subsection does not name the literal "
-            "command shape 'fleet observe dispatch --harness subagent'"
+            "command shape 'python -m scripts.fleet.cli observe dispatch --harness subagent'"
         )
 
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
@@ -371,7 +412,9 @@ class TestSpawnedDispatchSeamContent:
 # `TestFuzzyLaunchFlip::test_launch_not_found_is_journaled` — this class adds
 # the missing content-level half: does SKILL.md's prose actually say so. ----
 
-_SKILL_MD_LAUNCH_COMMAND_RE = re.compile(r"fleet observe launch\b")
+_SKILL_MD_LAUNCH_COMMAND_RE = re.compile(
+    r"python -m scripts\.fleet\.cli observe launch\b"
+)
 _IDEMPOTENT_MARKERS = ("idempotent",)
 _INERT_WHEN_OFF_MARKERS = ("inert",)
 
@@ -399,7 +442,7 @@ class TestSkillMdLaunchStepSeamContent:
         subsection = _skill_md_launch_step_text()
         assert _SKILL_MD_LAUNCH_COMMAND_RE.search(subsection), (
             "SKILL.md launch-flip subsection does not name the literal "
-            "'fleet observe launch' command"
+            "'python -m scripts.fleet.cli observe launch' command"
         )
 
     def test_subsection_states_idempotent(self) -> None:
@@ -443,7 +486,7 @@ _REQUIRED_DOC_TOPICS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("fail-soft/fail-closed boundary", ("fail-soft", "fail-closed")),
     ("granularity rule", ("granularity rule",)),
     ("hook install", ("install", "session start", "pretooluse")),
-    ("observe status", ("observe status", "fleet observe status")),
+    ("observe status", ("observe status", "scripts.fleet.cli observe status")),
     (
         "stale-output-is-candidates-not-verdicts caveat",
         ("candidates to confirm, not a verdict", "candidates to confirm, not as a verdict"),

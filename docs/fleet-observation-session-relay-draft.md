@@ -24,18 +24,24 @@ two subsections for the house style this draft matches.
 > `session-relay` calls:
 >
 > ```
-> fleet observe relay --harness claude --session-id <session-id> --workspace <path> \
->     --slug <slug> --writer-role pm
+> python -m scripts.fleet.cli observe relay --harness claude --session-id <session-id> \
+>     --workspace <path> --slug <slug> --writer-role pm
 > ```
 >
 > to record the relay. `<session-id>` is the launched session's native id; `<path>` and `<slug>`
 > identify the target superhuman project the same way every other `fleet observe` call does.
 >
+> The command runs from the **superhuman skill root** — the checkout holding `SKILL.md`. There is
+> no bare `fleet` executable to find on `PATH` (superhuman is a skill loaded by path, not an
+> installed Python distribution), and `-m` resolves `scripts.fleet` against the current directory,
+> so the skill root is not interchangeable with `--workspace`: `--workspace` names the project
+> being observed, which is normally somewhere else entirely.
+>
 > This step is purely observational: it never blocks the handoff, it never delays prompt delivery,
 > and a failure (`fleet` unconfigured for the target project, an unavailable manifest write, or any
 > other fault) is logged and the handoff itself proceeds unaffected. `fleet observe relay` always
 > exits `0`; `session-relay` does not need to inspect its output or react to its exit code. If the
-> `fleet` CLI is not present at all (e.g. `superhuman` not installed in the target workspace), the
+> fleet CLI is not reachable at all (no superhuman checkout to run `-m scripts.fleet.cli` from), the
 > call is simply skipped — `session-relay`'s own handoff mechanics are entirely independent of
 > whether this observation succeeds, is attempted, or is even possible.
 

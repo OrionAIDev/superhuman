@@ -1,4 +1,9 @@
-"""``fleet`` CLI entry point (`argparse`, per `conventions/python.md`).
+"""Fleet CLI entry point (`argparse`, per `conventions/python.md`).
+
+Invoked as ``python -m scripts.fleet.cli <subcommand>`` from the superhuman
+skill root. There is deliberately no ``fleet`` executable: this repo ships no
+packaging, so nothing installs a console script, and the package-relative
+imports below mean this file cannot be run as a loose script either.
 
 This chunk wires only the `register` subcommand — the registrar for FR-1's
 spawned and relayed origination paths (Decision C: `session-relay`'s KICKOFF
@@ -1110,7 +1115,8 @@ def build_parser() -> argparse.ArgumentParser:
         here.
     """
     parser = argparse.ArgumentParser(
-        prog="fleet", description="Superhuman session-fleet manifest CLI."
+        prog="python -m scripts.fleet.cli",
+        description="Superhuman session-fleet manifest CLI.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {CLI_VERSION}")
 

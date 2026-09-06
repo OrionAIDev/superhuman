@@ -15,12 +15,14 @@
 # reading its own prompt or loading superhuman at all.
 #
 # This hook calls the SAME entry point the prose floor calls —
-# `fleet observe launch` — never a parallel or divergent invocation. A
+# `python -m scripts.fleet.cli observe launch` — never a parallel or
+# divergent invocation. A
 # deterministic hook can never diverge from the portable prose floor because
 # both call the identical CLI verb.
 #
 # Best-effort by construction: this script's exit status is never allowed to
-# block session start. `fleet observe launch` itself always exits 0 (it is
+# block session start. `python -m scripts.fleet.cli observe launch` itself
+# always exits 0 (it is
 # fail-soft — see `scripts/fleet/observe.py`'s module docstring), and this
 # wrapper additionally never propagates a non-zero exit from anything else
 # it runs.
@@ -36,10 +38,28 @@ WORKSPACE="$(pwd)"
 # auto-derived because more than one slug may exist under one workspace.
 SLUG="REPLACE_WITH_YOUR_PROJECT_SLUG"
 
-# Locate the `fleet` CLI. Adjust if your install path differs.
-FLEET_CLI="$(command -v fleet || echo "${WORKSPACE}/scripts/fleet/cli.py")"
+# The superhuman skill root: the checkout holding `SKILL.md` and `scripts/`.
+# The CLI is invoked as a module from there (`python -m scripts.fleet.cli`),
+# which is the only form that resolves — superhuman is a skill loaded by
+# path, not an installed Python distribution, so no `fleet` executable is
+# ever placed on `PATH`, and `scripts/fleet/cli.py` imports its siblings
+# package-relatively so it cannot be run as a loose script either.
+#
+# This is NOT "$WORKSPACE". The project under observation is passed
+# separately, via --workspace, and is normally a different directory; `-m`
+# resolves `scripts.fleet` against the current directory, so the `cd` below
+# has to land on the skill root specifically.
+SUPERHUMAN_ROOT="${SUPERHUMAN_ROOT:-REPLACE_WITH_YOUR_SUPERHUMAN_SKILL_ROOT}"
+
+# The interpreter to run it with. Override if yours is not `python3`.
+PYTHON="${PYTHON:-python3}"
 
 # Best-effort: never let this block or fail session start.
-"$FLEET_CLI" observe launch --workspace "$WORKSPACE" --slug "$SLUG" >/dev/null 2>&1 || true
+(
+  cd "$SUPERHUMAN_ROOT" \
+    && "$PYTHON" -m scripts.fleet.cli observe launch \
+      --workspace "$WORKSPACE" \
+      --slug "$SLUG"
+) >/dev/null 2>&1 || true
 
 exit 0

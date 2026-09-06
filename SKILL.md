@@ -50,7 +50,7 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
 
 If the invoking prompt carries a `FLEET-HANDOFF-ID:` line (fleet-wiring Chunk 3, Decision E — a
 prior session's `handoff-emit` embeds this line, along with its own self-register instruction,
-next to the id), attempt `fleet observe launch --workspace <project-root> --slug <slug>
+next to the id), attempt `python -m scripts.fleet.cli observe launch --workspace <project-root> --slug <slug>
 --handoff-id <the id from that line>` as your first action, before Phase 0's HARD-GATE step 1.
 This is purely observational, exactly like `## Handoff prompt emission` below: it never blocks or
 gates any phase, it is idempotent (a repeat call on an already-launched row is a no-op, not an
@@ -59,6 +59,12 @@ invocation with no pending handoff attempts nothing and produces no output. Any 
 disabled, an unavailable manifest write, a fuzzy match too ambiguous to guess, or any other fault)
 is logged and kickoff proceeds unaffected — this step never determines whether Phase 0 or a resume
 proceeds.
+
+Run it from the superhuman **skill root** — the checkout holding this `SKILL.md`. There is no bare
+`fleet` executable to find: superhuman is a skill loaded by path, not an installed Python
+distribution, and `-m` resolves `scripts.fleet` against the current directory. The skill root is
+therefore not interchangeable with `--workspace`, which names the project being observed and is
+normally a different directory.
 
 ## Anti-pattern: "This is too simple to need the framework"
 

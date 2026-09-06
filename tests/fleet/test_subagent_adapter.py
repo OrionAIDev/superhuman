@@ -212,7 +212,7 @@ class TestObserveDispatchViaSubagentAdapter:
     def test_cli_observe_dispatch_with_harness_subagent(
         self, enabled_project: tuple[Path, str]
     ) -> None:
-        """The actual `fleet observe dispatch --harness subagent ...` command shape."""
+        """The actual `observe dispatch --harness subagent ...` command shape."""
         workspace, slug = enabled_project
         parser = build_parser()
         args = parser.parse_args(
