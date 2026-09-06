@@ -476,3 +476,86 @@ def test_blank_lines_inside_a_section_are_skipped() -> None:
 def test_gate_entry_pattern_is_exposed_for_reuse() -> None:
     """`GATE_ENTRY` is the one public pattern for this line shape (DESIGN component table)."""
     assert isinstance(grp.GATE_ENTRY, re.Pattern)
+
+
+# ---------------------------------------------------------------------------
+# `malformed_at` -- line numbers for malformed lines, so a caller can report
+# "file:line: text" (DESIGN error table: "message names file, line number,
+# and the offending text"), without a second heading-scan implementation.
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_at_reports_one_based_document_line_numbers() -> None:
+    """`malformed_at` pairs 1:1 with `malformed`, giving each a document line number."""
+    text = (
+        "# Title\n"
+        "front matter\n"
+        "## Decisions locked\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[not-a-stamp] G1: this line is broken\n"
+        "\n"
+        "[also-not-a-stamp] G2: this one too\n"
+    )
+    reading = grp.parse_section(text, "## Decisions locked")
+    assert reading.malformed == (
+        "[not-a-stamp] G1: this line is broken",
+        "[also-not-a-stamp] G2: this one too",
+    )
+    # Line 5 is `[not-a-stamp] ...`; line 7 (after the blank line 6) is the second.
+    assert reading.malformed_at == (5, 7)
+
+
+def test_malformed_at_is_empty_when_nothing_is_malformed() -> None:
+    """A well-formed section reports an empty `malformed_at`, paired with `malformed`."""
+    reading = grp.parse_section(
+        "## Decisions locked\n[2026-08-01T00:00:00Z] G0: baseline\n",
+        "## Decisions locked",
+    )
+    assert reading.malformed == ()
+    assert reading.malformed_at == ()
+
+
+def test_section_not_found_has_empty_malformed_at() -> None:
+    """A missing heading reports `malformed_at=()`, matching every other empty field."""
+    reading = grp.parse_section("no heading here\n", "## Decisions locked")
+    assert reading.malformed_at == ()
+
+
+# ---------------------------------------------------------------------------
+# `MANDATORY_GATES` / `predecessor()` -- FR-13, the non-contiguous predecessor
+# rule. Pure functions, no I/O (PLAN chunk 2 step 1).
+# ---------------------------------------------------------------------------
+
+
+def test_mandatory_gates_is_the_documented_non_contiguous_tuple() -> None:
+    """G6, G9 and G10 are conditional gates and are absent from the mandatory set."""
+    assert grp.MANDATORY_GATES == (0, 1, 2, 3, 4, 5, 7, 8)
+
+
+# TC-21: the non-contiguous predecessor table, every mandatory gate
+@pytest.mark.parametrize(
+    "gate,expected",
+    [
+        (0, None),
+        (1, 0),
+        (2, 1),
+        (3, 2),
+        (4, 3),
+        (5, 4),
+        (6, None),
+        (7, 5),
+        (8, 7),
+        (9, None),
+        (10, None),
+    ],
+)
+def test_predecessor_table_g7_predecessor_is_g5_not_g6(gate: int, expected: int | None) -> None:
+    """FR-13's whole point in one row: G7's predecessor is G5, not G6 (naive n-1 fails here)."""
+    assert grp.predecessor(gate) == expected
+
+
+# TC-23 (pure-function half): predecessor() never raises on an out-of-range gate
+@pytest.mark.parametrize("gate", [-1, 11, 999])
+def test_predecessor_returns_none_for_out_of_range_gate_and_never_raises(gate: int) -> None:
+    """An out-of-range gate resolves to `None` deterministically -- it must never raise."""
+    assert grp.predecessor(gate) is None

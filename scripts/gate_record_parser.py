@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 #: The one regex for this line format in the estate (FR-1). Deliberately
 #: `\d+`, not `\d`: the retired pattern this replaces (`G(\d)\s*:`, which
@@ -196,6 +197,10 @@ class SectionReading:
             the section that failed to parse, in document order. Callers
             that must fail closed (NFR-2) refuse on a non-empty tuple here
             rather than passing vacuously.
+        malformed_at: the 1-based document line number of each entry in
+            `malformed`, in the same order -- so a caller can report
+            "file:line: text" (DESIGN error table) without a second
+            heading-scan implementation.
         gates: the set of gate ordinals contributed by `entries`.
         highest_gate: `max(gates)`, or None when no entry names a gate.
     """
@@ -203,6 +208,7 @@ class SectionReading:
     found: bool
     entries: tuple[Entry, ...]
     malformed: tuple[str, ...]
+    malformed_at: tuple[int, ...]
     gates: frozenset[int]
     highest_gate: int | None
 
@@ -213,7 +219,12 @@ class SectionReading:
 
 
 _NOT_FOUND = SectionReading(
-    found=False, entries=(), malformed=(), gates=frozenset(), highest_gate=None
+    found=False,
+    entries=(),
+    malformed=(),
+    malformed_at=(),
+    gates=frozenset(),
+    highest_gate=None,
 )
 
 
@@ -258,8 +269,9 @@ def parse_section(text: str, heading: str) -> SectionReading:
 
     entries: list[Entry] = []
     malformed: list[str] = []
+    malformed_at: list[int] = []
     in_comment = False
-    for line in lines[start:end]:
+    for line_no, line in enumerate(lines[start:end], start=start + 1):
         stripped = line.strip()
         if not stripped:
             continue
@@ -274,6 +286,7 @@ def parse_section(text: str, heading: str) -> SectionReading:
         entry = parse_entry(line)
         if entry is None:
             malformed.append(line)
+            malformed_at.append(line_no)
         else:
             entries.append(entry)
 
@@ -283,6 +296,186 @@ def parse_section(text: str, heading: str) -> SectionReading:
         found=True,
         entries=tuple(entries),
         malformed=tuple(malformed),
+        malformed_at=tuple(malformed_at),
         gates=gates,
         highest_gate=highest_gate,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The predecessor rule (FR-13) -- superhuman's mandatory gate sequence is not
+# contiguous: G6 (drift), G9 (parallelism) and G10 (BLOCKED) are conditional
+# and fire ad hoc, so a literal `n - 1` would demand a G6 that most projects
+# correctly never have (DESIGN "The predecessor rule").
+# ---------------------------------------------------------------------------
+
+#: The eight phase gates every project passes through, in order. G6, G9 and
+#: G10 are conditional and are deliberately absent from this tuple.
+MANDATORY_GATES: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 7, 8)
+
+
+def predecessor(gate: int) -> int | None:
+    """Return the highest mandatory gate strictly below `gate`.
+
+    A conditional gate (6, 9, 10) has no predecessor of its own -- it is
+    exempt from the predecessor test, though not (G10 aside) from the parse
+    test. Any `gate` outside `MANDATORY_GATES` -- including a conditional
+    gate or an out-of-range value such as -1 or 999 -- resolves to `None`
+    uniformly and this function never raises (R7): a bad `--gate` at the CLI
+    layer is a usage error there, not a crash here.
+
+    Args:
+        gate: the gate ordinal being requested.
+
+    Returns:
+        The nearest lower mandatory gate, or None when there isn't one (G0,
+        a conditional gate, or an out-of-range value).
+    """
+    if gate not in MANDATORY_GATES:
+        return None
+    lower = [g for g in MANDATORY_GATES if g < gate]
+    return max(lower) if lower else None
+
+
+# ---------------------------------------------------------------------------
+# Record reading (FR-2, FR-3 as amended at G6-001) -- combines both sections
+# of one `SUPERHUMAN.md` under the version gate. This is the only place the
+# `Superhuman-version` field is read; the caller (`gate_record_gap` in
+# `scripts/superhuman_profile.py`) decides what the reading means for one
+# requested gate.
+# ---------------------------------------------------------------------------
+
+#: The two section headings this module reads. Exported so a caller never
+#: needs to spell the heading string a second time.
+LOG_HEADING = "## Decisions log"
+LOCKED_HEADING = "## Decisions locked"
+
+#: The version at and above which the presence test reads `LOCKED_HEADING`
+#: instead of `LOG_HEADING` (FR-3, amended G6-001).
+_VERSION_GATE_FLOOR = (1, 1, 0)
+
+#: Matches the front-matter `Superhuman-version:` field, tolerating the
+#: markdown-bold wrapping every real record uses (`**Superhuman-version:**`)
+#: as well as a plain, unwrapped field.
+_VERSION_FIELD = re.compile(
+    r"^\*{0,2}Superhuman-version:\*{0,2}\s*(\S+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: A strictly well-formed `major.minor.patch` version. Anything else --
+#: `"1.1"`, `"v1.1.0"`, `"1.1.0-beta"`, `"latest"`, `""`, `"banana"` -- falls
+#: into the tolerant (< 1.1.0) bucket rather than raising (G4-R2).
+_STRICT_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def _extract_version(text: str) -> str | None:
+    """Read the declared `Superhuman-version:` field, verbatim.
+
+    Args:
+        text: the full record text.
+
+    Returns:
+        The field's value exactly as written, or None when the field is
+        absent.
+    """
+    match = _VERSION_FIELD.search(text)
+    return match.group(1) if match else None
+
+
+def _version_at_least(version: str | None, floor: tuple[int, int, int]) -> bool:
+    """Whether a declared version resolves to `>= floor`.
+
+    A missing or malformed version is deliberately never an error here (G4-R2):
+    it resolves False, placing the record in the tolerant, pre-1.1.0 bucket
+    rather than raising or defaulting to the stricter branch.
+
+    Args:
+        version: the raw field value, or None when undeclared.
+        floor: the `(major, minor, patch)` floor to compare against.
+
+    Returns:
+        True only when `version` is a strict `major.minor.patch` string at
+        or above `floor`.
+    """
+    if version is None:
+        return False
+    match = _STRICT_VERSION.match(version)
+    if match is None:
+        return False
+    return tuple(int(part) for part in match.groups()) >= floor
+
+
+@dataclass(frozen=True, slots=True)
+class RecordReading:
+    """Everything FR-2/FR-3 need to know about one project's gate record.
+
+    Attributes:
+        path: the `SUPERHUMAN.md` path that was read.
+        exists: whether the file could be found and read as text. False
+            covers both "no such file" and an unreadable file (e.g. a
+            permissions error); `error` distinguishes them for the message.
+        error: a human-readable reason `exists` is False, or None when the
+            read succeeded.
+        version: the declared `Superhuman-version` field, verbatim, or None
+            when front matter has no such field.
+        version_gate: whether `version` resolves to `>= 1.1.0` (FR-3,
+            amended G6-001). A missing or malformed version resolves False
+            -- the tolerant bucket (G4-R2) -- and this never raises.
+        log: reading of `## Decisions log` -- present in every real record
+            and, per FR-3, always the presence source below the version
+            gate.
+        locked: reading of `## Decisions locked` -- present only in some
+            records; the presence source at or above the version gate.
+    """
+
+    path: Path
+    exists: bool
+    error: str | None
+    version: str | None
+    version_gate: bool
+    log: SectionReading
+    locked: SectionReading
+
+
+def read_record(path: Path) -> RecordReading:
+    """Read one project's gate record.
+
+    Reuses `parse_section` for both sections -- this function never
+    re-derives the entry grammar (FR-1 is the single owner of that shape).
+    An absent or unreadable file is not a parse failure: it is reported via
+    `exists`/`error` so the caller can fail closed (NFR-2) with an
+    actionable message, rather than raising out of a read-and-report
+    contract.
+
+    Args:
+        path: path to a `SUPERHUMAN.md` file.
+
+    Returns:
+        A `RecordReading`. When the file cannot be read, `log` and `locked`
+        are both the empty "not found" reading -- there is no text to
+        search.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        empty = parse_section("", LOG_HEADING)
+        return RecordReading(
+            path=path,
+            exists=False,
+            error=str(exc),
+            version=None,
+            version_gate=False,
+            log=empty,
+            locked=parse_section("", LOCKED_HEADING),
+        )
+
+    version = _extract_version(text)
+    return RecordReading(
+        path=path,
+        exists=True,
+        error=None,
+        version=version,
+        version_gate=_version_at_least(version, _VERSION_GATE_FLOOR),
+        log=parse_section(text, LOG_HEADING),
+        locked=parse_section(text, LOCKED_HEADING),
     )

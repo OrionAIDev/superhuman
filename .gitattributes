@@ -12,3 +12,9 @@ scripts/autonomous-precondition.sh text eol=lf
 scripts/autonomous-rollback.sh text eol=lf
 scripts/autonomous-summary.sh text eol=lf
 scripts/autonomous-iter.sh text eol=lf
+
+# NFR-3 fixtures whose entire point is a specific, non-native line-ending
+# byte sequence (CRLF / lone CR). `-text` disables autocrlf conversion so
+# the exact bytes survive commit/checkout on any platform.
+tests/fixtures/gate_records/crlf_variant.md -text
+tests/fixtures/gate_records/cr_variant.md -text

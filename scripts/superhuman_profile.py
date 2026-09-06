@@ -40,6 +40,16 @@ except ImportError:  # pragma: no cover - environment problem, not logic
     )
     raise SystemExit(2)
 
+try:
+    # Package context: imported as `scripts.superhuman_profile` (e.g. by
+    # `scripts/fleet/cli.py`'s `from .. import superhuman_profile`, where
+    # `scripts/` itself is a namespace package, not a directory on `sys.path`).
+    from . import gate_record_parser
+except ImportError:
+    # Flat-script context: `scripts/` is added directly to `sys.path` (every
+    # test module's own convention, and how this file runs standalone).
+    import gate_record_parser
+
 SCHEMA_VERSION = 1
 
 #: Exit codes. 0/2/3 preserve the pre-0.7.0 ``autonomous-precondition.sh``
@@ -48,6 +58,10 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_DENIED = 3
 EXIT_UNRESOLVED = 4
+#: A project's own gate record fails to parse or is missing its predecessor
+#: gate (D-5). New, and additive for the same reason 4 was: every existing
+#: caller already aborts on any non-zero exit.
+EXIT_RECORD = 5
 
 #: Detector families in precedence order (spec §3.4). Lower tier == higher
 #: authority; explicit declarations outrank inferred ones.
@@ -1120,6 +1134,81 @@ def rollback_plan_gap(root: Path, slug: str | None) -> Gap | None:
     return None
 
 
+def gate_record_gap(reading: gate_record_parser.RecordReading, gate: int) -> Gap | None:
+    """Check the FR-3 gate-record precondition: may `gate` pass for this record?
+
+    G10 is checked first and unconditionally (FR-14): it is the BLOCKED
+    escalation channel, and gating "I am stuck" behind a well-formedness
+    check would deadlock exactly the broken record that most needs to say
+    so. Every other gate requires, in order: the record exists and is
+    readable; ``## Decisions log`` is present and every line in it parses;
+    ``## Decisions locked``, wherever present, also parses (FR-3: "well-
+    formedness is checked over both blocks"); at ``Superhuman-version >=
+    1.1.0`` the locked block is present and non-empty (R6/G4-R1 — absence
+    is treated exactly like emptiness); and finally the immediately
+    preceding mandatory gate (FR-13's `predecessor`) is present in whichever
+    section governs presence at this record's version (FR-3, amended
+    G6-001).
+
+    Args:
+        reading: the record reading from `gate_record_parser.read_record`.
+        gate: the gate ordinal being requested.
+
+    Returns:
+        A :class:`Gap` with :data:`EXIT_RECORD`, or ``None`` when the gate
+        may pass.
+    """
+    if gate == 10:
+        return None
+
+    path = reading.path.as_posix()
+
+    if not reading.exists:
+        detail = f" ({reading.error})" if reading.error else ""
+        return Gap(EXIT_RECORD, f"gate-record unreadable: {path}{detail}")
+
+    if not reading.log.found:
+        return Gap(EXIT_RECORD, f"{path}: no `## Decisions log` section found")
+
+    if reading.log.malformed:
+        line_no = reading.log.malformed_at[0]
+        text = reading.log.malformed[0]
+        return Gap(
+            EXIT_RECORD,
+            f"{path}:{line_no}: unparseable gate-record line in "
+            f"`## Decisions log`: {text!r}",
+        )
+
+    if reading.locked.found and reading.locked.malformed:
+        line_no = reading.locked.malformed_at[0]
+        text = reading.locked.malformed[0]
+        return Gap(
+            EXIT_RECORD,
+            f"{path}:{line_no}: unparseable gate-record line in "
+            f"`## Decisions locked`: {text!r}",
+        )
+
+    if reading.version_gate:
+        if not reading.locked.found or not reading.locked.entries:
+            return Gap(
+                EXIT_RECORD,
+                f"{path}: Superhuman-version >= 1.1.0 requires a non-empty "
+                "`## Decisions locked` section; none found — absence is not "
+                "treated as empty (R6)",
+            )
+        presence = reading.locked
+    else:
+        presence = reading.log
+
+    pred = gate_record_parser.predecessor(gate)
+    if pred is not None and pred not in presence.gates:
+        return Gap(
+            EXIT_RECORD,
+            f"{path}: gate {gate} requires gate {pred} on record; not found",
+        )
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -1348,6 +1437,70 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"superhuman-profile: OK (rung {res.stage.name}, HITL-{level}, "
         f"{args.action}={policy.describe()}{scope}) — "
         f"{res.context.root.as_posix()}{deferred}"
+    )
+    return EXIT_OK
+
+
+#: The documented gate range a `--gate` value may name (TEST.md TC-21's
+#: table domain). Anything else is a usage error at the CLI layer, never a
+#: record failure (R7) — `gate_record_parser.predecessor` itself never
+#: raises on an out-of-range value, but a caller's typo says nothing about
+#: whether the record is broken.
+_DOCUMENTED_GATES = frozenset(range(0, 11))
+
+
+def cmd_check_gate_record(args: argparse.Namespace) -> int:
+    """Evaluate the FR-3 gate-record precondition for one project.
+
+    Resolution never searches (D-4): the record is always
+    ``project_dir(root, slug)/SUPERHUMAN.md``, exactly as
+    :func:`rollback_plan_gap` already resolves ``ROLLBACK.md``.
+
+    Args:
+        args: parsed CLI arguments (``root``, ``--slug``, ``--gate``,
+            ``--kickoff``).
+
+    Returns:
+        :data:`EXIT_OK`, :data:`EXIT_USAGE` (bad ``--gate``),
+        :data:`EXIT_UNRESOLVED` (no ``--slug``), or :data:`EXIT_RECORD`.
+    """
+    if args.kickoff:
+        print(
+            "superhuman-profile: OK (kickoff: gate-record check deferred — "
+            "the record is still being written)"
+        )
+        return EXIT_OK
+
+    if args.slug is None:
+        root = Path(args.root)
+        print(
+            "superhuman-profile: UNRESOLVED — check-gate-record requires "
+            "--slug; refusing to guess across sibling projects under "
+            f"{root.as_posix()}/docs/superhuman/ (pass --slug <project>)",
+            file=sys.stderr,
+        )
+        return EXIT_UNRESOLVED
+
+    if args.gate not in _DOCUMENTED_GATES:
+        print(
+            f"superhuman-profile: usage error — --gate {args.gate} is not "
+            f"a documented gate ({min(_DOCUMENTED_GATES)}-"
+            f"{max(_DOCUMENTED_GATES)})",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    root = Path(args.root)
+    manifest = project_dir(root, args.slug) / "SUPERHUMAN.md"
+    reading = gate_record_parser.read_record(manifest)
+    gap = gate_record_gap(reading, args.gate)
+    if gap is not None:
+        print(f"superhuman-profile: BLOCKED — {gap.message}", file=sys.stderr)
+        return gap.code
+
+    print(
+        f"superhuman-profile: OK (gate {args.gate}, project {args.slug}) — "
+        f"{manifest.as_posix()}"
     )
     return EXIT_OK
 
@@ -2412,6 +2565,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     check.set_defaults(func=cmd_check)
+
+    check_record = add(
+        "check-gate-record",
+        "evaluate the FR-3 gate-record precondition for one project (not yet wired into any gate)",
+    )
+    check_record.add_argument(
+        "--slug",
+        "--project",
+        dest="slug",
+        default=None,
+        metavar="SLUG",
+        help=(
+            "project slug under docs/superhuman/ whose record to check. "
+            "Without it the check cannot be scoped and exits 4 rather than "
+            "guessing across sibling projects."
+        ),
+    )
+    check_record.add_argument(
+        "--gate",
+        type=int,
+        required=True,
+        metavar="N",
+        help="the gate ordinal about to pass (0-10)",
+    )
+    check_record.add_argument(
+        "--kickoff",
+        action="store_true",
+        help=(
+            "the project's own record is still being written: defer the "
+            "check entirely. Never pass this to authorize a loop."
+        ),
+    )
+    check_record.set_defaults(func=cmd_check_gate_record)
 
     models = subs.add_parser("models", help="manage the models: block of a profile")
     models_subs = models.add_subparsers(dest="models_cmd", required=True)
