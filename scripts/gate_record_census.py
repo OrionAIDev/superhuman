@@ -1,8 +1,20 @@
 """FR-6 canonical-record enumerator.
 
-Walks a set of scan roots, applies the exclusion rule (never a path
-containing ``/.claude/worktrees/`` or ``/tests/``), and yields one
-``RecordRef`` per canonical ``docs/superhuman/<slug>/SUPERHUMAN.md``.
+Walks a set of scan roots, applies the exclusion rule -- never a path
+containing ``/tests/``, and never a record whose repository is a linked git
+worktree -- and yields one ``RecordRef`` per canonical
+``docs/superhuman/<slug>/SUPERHUMAN.md``.
+
+A worktree is detected by asking the filesystem, never by matching a path
+(G6-003): a git worktree can be created anywhere, so a path-convention rule
+(e.g. ``/.claude/worktrees/``) misses worktrees created elsewhere -- a
+sibling of the repo they belong to, for instance -- and the same project
+record gets enumerated twice under two different ``repo_root``s. The fix
+relies on a documented git invariant instead: a linked worktree's ``.git``
+is a *file* containing ``gitdir: <path>``, while a main checkout's ``.git``
+is a directory. A ``tests/`` directory holds fixtures, not real projects --
+this is what keeps this project's own `tests/fixtures/gate_records/` from
+inflating the count it measures (TC-31).
 
 Identity is always ``(repo_root, slug)``, never ``slug`` alone (NFR-7):
 `memory-sync-evaluation` exists as two byte-identical files in two different
@@ -18,12 +30,9 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 #: Path substrings (checked against the POSIX form) that exclude a matched
-#: ``SUPERHUMAN.md`` from the canonical record set (FR-6). A worktree is a
-#: working copy of a project already counted at its home location; a
-#: ``tests/`` directory holds fixtures, not real projects -- this is what
-#: keeps this project's own `tests/fixtures/gate_records/` from inflating
-#: the count it measures (TC-31).
-_EXCLUDED_SUBSTRINGS = ("/.claude/worktrees/", "/tests/")
+#: ``SUPERHUMAN.md`` from the canonical record set (FR-6), independent of
+#: the git-worktree check below.
+_EXCLUDED_SUBSTRINGS = ("/tests/",)
 
 #: The glob that locates every canonical record under a scan root.
 _RECORD_GLOB = "**/docs/superhuman/*/SUPERHUMAN.md"
@@ -58,6 +67,51 @@ def _is_excluded(path: Path) -> bool:
     return any(substring in posix for substring in _EXCLUDED_SUBSTRINGS)
 
 
+def _enclosing_git_entry(start: Path) -> Path | None:
+    """Find the nearest ``.git`` entry (file or directory) walking up from `start`.
+
+    Args:
+        start: an absolute directory to begin the upward walk from.
+
+    Returns:
+        The path to the nearest ancestor's ``.git`` entry, or `None` when no
+        ancestor -- up to and including the filesystem root -- has one.
+    """
+    current = start
+    while True:
+        candidate = current / ".git"
+        if candidate.exists():
+            return candidate
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _is_linked_worktree(repo_root: Path) -> bool:
+    """Whether `repo_root`'s enclosing git checkout is a linked worktree.
+
+    A linked worktree's ``.git`` is a *file* containing ``gitdir: <path>``;
+    a main checkout's ``.git`` is a directory (G6-003). The walk starts at
+    `repo_root` rather than checking it in isolation, since the nearest
+    ``.git`` is the authority on what kind of checkout this is.
+
+    A `repo_root` with no enclosing ``.git`` at all -- not inside any git
+    checkout -- is treated as NOT a worktree: the exclusion rule targets a
+    specific, provable condition (a ``.git`` file), and the absence of
+    ``.git`` entirely is not evidence of that condition. Guessing otherwise
+    is exactly the path-convention brittleness G6-003 rejected.
+
+    Args:
+        repo_root: the candidate record's computed repository root.
+
+    Returns:
+        True only when an enclosing ``.git`` entry exists and is a file.
+    """
+    git_entry = _enclosing_git_entry(repo_root)
+    return git_entry is not None and git_entry.is_file()
+
+
 def iter_canonical_records(roots: Iterable[Path]) -> Iterator[RecordRef]:
     """Yield one `RecordRef` per canonical gate record under `roots`.
 
@@ -71,9 +125,9 @@ def iter_canonical_records(roots: Iterable[Path]) -> Iterator[RecordRef]:
 
     Yields:
         A `RecordRef` for every ``docs/superhuman/<slug>/SUPERHUMAN.md``
-        found, excluding worktrees and ``tests/`` trees. Never
-        de-duplicates across `roots` beyond exact path identity, and never
-        collapses two repos sharing a slug (NFR-7).
+        found, excluding ``tests/`` trees and linked git worktrees (G6-003).
+        Never de-duplicates across `roots` beyond exact path identity, and
+        never collapses two repos sharing a slug (NFR-7).
     """
     seen: set[Path] = set()
     for root in roots:
@@ -83,9 +137,11 @@ def iter_canonical_records(roots: Iterable[Path]) -> Iterator[RecordRef]:
         for path in sorted(root_path.glob(_RECORD_GLOB)):
             if path in seen or _is_excluded(path):
                 continue
-            seen.add(path)
             slug = path.parent.name
             repo_root = path.parent.parent.parent.parent
+            if _is_linked_worktree(repo_root):
+                continue
+            seen.add(path)
             yield RecordRef(repo_root=repo_root, slug=slug, path=path)
 
 

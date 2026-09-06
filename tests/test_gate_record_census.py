@@ -76,15 +76,88 @@ def test_census_over_nonexistent_root_yields_nothing_for_that_root(tmp_path: Pat
 # ---------------------------------------------------------------------------
 
 
+def _make_main_checkout(repo: Path) -> None:
+    """Give `repo` a directory `.git` -- the invariant of a main checkout."""
+    (repo / ".git").mkdir(parents=True, exist_ok=True)
+
+
+def _make_linked_worktree(worktree_dir: Path, gitdir_target: str = "/elsewhere/.git/worktrees/wt") -> None:
+    """Give `worktree_dir` a FILE `.git` -- the invariant of a linked worktree."""
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    (worktree_dir / ".git").write_text(f"gitdir: {gitdir_target}\n", encoding="utf-8")
+
+
 def test_worktree_records_are_excluded(tmp_path: Path) -> None:
-    """A `SUPERHUMAN.md` under `.claude/worktrees/` is never enumerated."""
+    """A `SUPERHUMAN.md` under a linked worktree (`.git` is a file) is never enumerated, even nested under a conventional `.claude/worktrees/` path."""
     repo = tmp_path / "repo-a"
+    _make_main_checkout(repo)
     _make_record(repo, "real-project")
-    _make_record(repo / ".claude" / "worktrees" / "some-branch", "real-project")
+
+    worktree = repo / ".claude" / "worktrees" / "some-branch"
+    _make_linked_worktree(worktree)
+    _make_record(worktree, "real-project")
 
     refs = list(census_mod.iter_canonical_records([tmp_path]))
     assert len(refs) == 1
-    assert ".claude" not in refs[0].path.parts or "worktrees" not in refs[0].path.parts
+    assert refs[0].repo_root == repo
+
+
+def test_linked_worktree_excluded_by_git_file_not_path_convention(tmp_path: Path) -> None:
+    """A checkout is excluded because its `.git` is a FILE, not because of any path shape (G6-003).
+
+    The main checkout and the linked worktree hold an identically named
+    record; the census must return exactly one entry, from the main
+    checkout.
+    """
+    main_repo = tmp_path / "repo-a"
+    _make_main_checkout(main_repo)
+    _make_record(main_repo, "shared-project")
+
+    worktree = tmp_path / "repo-a-linked-worktree"
+    _make_linked_worktree(worktree)
+    _make_record(worktree, "shared-project")
+
+    refs = list(census_mod.iter_canonical_records([tmp_path]))
+    assert len(refs) == 1
+    assert refs[0].repo_root == main_repo
+    assert refs[0].slug == "shared-project"
+
+
+def test_sibling_directory_worktree_is_excluded_not_only_nested_ones(tmp_path: Path) -> None:
+    """A linked worktree living as a sibling directory -- not nested under `.claude/worktrees/` -- is still excluded.
+
+    This is the real-world shape that defeated the old path-substring rule:
+    a git worktree can be created anywhere, including alongside the repo it
+    belongs to, and the census must not enumerate it as a second, distinct
+    project just because its path does not match a conventional worktree
+    location.
+    """
+    main_repo = tmp_path / "project"
+    _make_main_checkout(main_repo)
+    _make_record(main_repo, "alpha")
+
+    sibling_worktree = tmp_path / "project-wt-reconcile"
+    _make_linked_worktree(sibling_worktree)
+    _make_record(sibling_worktree, "alpha")
+
+    refs = list(census_mod.iter_canonical_records([tmp_path]))
+    assert len(refs) == 1
+    assert refs[0].repo_root == main_repo
+
+
+def test_record_with_no_enclosing_git_at_all_is_not_treated_as_a_worktree(tmp_path: Path) -> None:
+    """A record outside any git checkout has no `.git` to inspect and is included.
+
+    The exclusion rule targets a specific, provable condition -- an
+    enclosing `.git` that is a file. The absence of `.git` entirely is not
+    evidence of that condition, so it must not be guessed into an exclusion.
+    """
+    repo = tmp_path / "no-git-here"
+    _make_record(repo, "ungoverned-project")
+
+    refs = list(census_mod.iter_canonical_records([tmp_path]))
+    assert len(refs) == 1
+    assert refs[0].repo_root == repo
 
 
 def test_tests_directory_records_are_excluded(tmp_path: Path) -> None:
