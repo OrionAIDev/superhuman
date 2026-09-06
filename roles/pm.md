@@ -445,11 +445,16 @@ Append-only section in SUPERHUMAN.md. Never edited; only grown. Cache-stable for
 
 When PM produces a next-session handoff or kickoff prompt — the session-restart checkpoint
 evaluated at a gate or chunk boundary — PM produces that
-prompt through `fleet observe handoff-emit --prompt-file ... --output-file ...` rather than
+prompt through `python -m scripts.fleet.cli observe handoff-emit --prompt-file ... --output-file ...` rather than
 hand-writing or hand-copying it into the reply. This is purely observational: it never blocks the
 surrounding gate, a failure (fleet disabled, an unavailable manifest write, or any other fault) is
 logged and PM's own progression continues unaffected, and the prompt PM actually hands to the next
 session is produced whether or not the observation succeeds.
+
+Run it from the superhuman **skill root** — the checkout holding `SKILL.md`, which is where `-m`
+resolves `scripts.fleet`. That is not interchangeable with `--workspace`: there is no bare `fleet`
+executable on `PATH` (superhuman is a skill loaded by path, not an installed Python distribution),
+and the project being observed is normally a different directory from the skill root.
 
 ---
 
@@ -457,7 +462,7 @@ session is produced whether or not the observation succeeds.
 
 After PM issues a subagent dispatch — any `<dispatch:agent>` call whose prompt leads with a
 `roles/*.md` block (PM, Architect, Developer, QA, Tester, Business Expert, surrogate-user, or a
-reviewer role) — PM calls `fleet observe dispatch --harness subagent --dispatch-id <role>-<chunk>-<n>
+reviewer role) — PM calls `python -m scripts.fleet.cli observe dispatch --harness subagent --dispatch-id <role>-<chunk>-<n>
 --local-id <role>-<chunk>-<n> ...` to record the dispatch.
 
 **Granularity rule:** a dispatch registers iff the dispatched prompt leads with a `roles/*.md`
@@ -468,6 +473,8 @@ This step is purely observational: it never blocks the dispatch or any surroundi
 (fleet disabled, an unavailable manifest write, or any other fault) is logged and PM's own
 progression continues unaffected, and the dispatch itself proceeds whether or not the observation
 succeeds.
+
+As with handoff emission, run it from the superhuman skill root, not from `--workspace`.
 
 ---
 

@@ -2,12 +2,38 @@
 
 Superhuman can write to its own session-fleet manifest as a side effect of normal operation — a
 handoff prompt, a role dispatch, a relayed session, a launched checkpoint — without anyone running
-`fleet` by hand. This doc is the operator-facing guide to turning that on, understanding what it
+the fleet CLI by hand. This doc is the operator-facing guide to turning that on, understanding what it
 guarantees (and does not), and reading its output correctly.
 
 It covers: enablement, the fail-soft/fail-closed boundary, the granularity rule for spawned
 dispatches, installing the optional hook templates, `fleet observe status`, and the caveat every
 operator needs before acting on a stale report.
+
+## Invoking the CLI
+
+Everything below is a subcommand of one CLI, invoked as a Python module **from the superhuman skill
+root** — the checkout holding `SKILL.md` and `scripts/`:
+
+```bash
+python -m scripts.fleet.cli observe status --workspace <project-root> --slug <slug>
+```
+
+Two things about that form are load-bearing:
+
+- **The module form, not a bare `fleet`.** Superhuman is a skill loaded by path, not an installed
+  Python distribution — there is no `pyproject.toml` and no `console_scripts` entry point, so
+  nothing ever puts a `fleet` executable on `PATH`. Running the file directly
+  (`python scripts/fleet/cli.py`) does not work either: `cli.py` imports its siblings
+  package-relatively and must be run as a module.
+- **The working directory is the *skill* root, not the project being observed.** `-m` resolves
+  `scripts.fleet` against the current directory, so the command must run from wherever superhuman
+  itself is checked out. The project under observation is named separately, by `--workspace`, and
+  is normally a different directory. Getting these two confused is the single most likely reason a
+  call that looks right silently does nothing.
+
+For readability the rest of this doc names subcommands in short form — `fleet observe status`,
+`fleet handoff stale` — as shorthand for `python -m scripts.fleet.cli observe status` and so on.
+Each one needs the full form above to actually run.
 
 ## Enablement
 
@@ -129,10 +155,13 @@ To install:
 
 1. Copy the template for your harness's session-start / pre-tool-use hook mechanism (for Claude
    Code, `.claude/settings.json`'s `SessionStart` / `PreToolUse` hooks).
-2. Fill in the placeholders each template marks with `REPLACE_WITH_...` — the project slug
-   (`SessionStart`, `PreToolUse`) and, for `PreToolUse`, a dispatch id your harness can supply per
-   call. Neither is auto-derived, because more than one project slug can exist under one workspace.
-3. Point `FLEET_CLI` at your `fleet` install if it is not on `PATH`.
+2. Fill in the placeholders each template marks with `REPLACE_WITH_...` — the superhuman skill
+   root (both templates), the project slug (both templates), and, for `PreToolUse`, a dispatch id
+   your harness can supply per call. None is auto-derived: more than one project slug can exist
+   under one workspace, and the skill root is generally not the workspace.
+3. Set `SUPERHUMAN_ROOT` to the checkout holding `SKILL.md` — the templates `cd` there and run
+   `python -m scripts.fleet.cli`, since there is no `fleet` executable to find on `PATH`. Override
+   `PYTHON` if your interpreter is not `python3`.
 4. Leave the best-effort guarding (`|| true`, unconditional `exit 0`) as shipped — the hook must
    never block session start or the tool call it observes, matching `observe.py`'s own contract.
 
@@ -141,7 +170,8 @@ above are exactly what you fill in for your own environment.
 
 ## `fleet observe status`
 
-`fleet observe status --workspace <path> --slug <slug>` is the one `observe` subcommand whose
+`python -m scripts.fleet.cli observe status --workspace <path> --slug <slug>` is the one
+`observe` subcommand whose
 entire purpose is its printed report. It answers "is fleet observation active for this project,
 and why (not)?" in one of four shapes:
 

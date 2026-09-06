@@ -112,6 +112,7 @@ class TestChunk2SeamsStillGreen:
         pm_md = _REPO_ROOT / "roles" / "pm.md"
         text = pm_md.read_text(encoding="utf-8")
         pattern = re.compile(
-            r"fleet observe handoff-emit --prompt-file \.\.\. --output-file \.\.\."
+            r"python -m scripts\.fleet\.cli observe handoff-emit\s+"
+            r"--prompt-file \.\.\.\s+--output-file \.\.\."
         )
         assert pattern.search(text), "roles/pm.md no longer names the handoff-emit command shape"

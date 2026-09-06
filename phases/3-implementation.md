@@ -37,22 +37,28 @@ Per DESIGN.md §11.6. Triggers from §7. PM classifies severity; trivial → log
 
 When a chunk boundary produces a next-session handoff/kickoff prompt — e.g. PM pauses here to
 reassess restart-vs-continue and hands the next chunk to a fresh session — PM emits that prompt
-through `fleet observe handoff-emit --prompt-file ... --output-file ...` rather than handing it
+through `python -m scripts.fleet.cli observe handoff-emit --prompt-file ... --output-file ...` rather than handing it
 off by hand. This step never blocks the surrounding gate: it is purely observational, any failure
 (fleet disabled, a manifest write that cannot complete, or any other fault) is logged and
 execution proceeds exactly as if the step had not run, and the deliverable prompt handed to the
 next session is produced regardless of whether the observation itself succeeds.
 
+Run it from the superhuman **skill root** — the checkout holding `SKILL.md`, which is where `-m`
+resolves `scripts.fleet`. There is no bare `fleet` executable on `PATH`, and the skill root is not
+interchangeable with `--workspace`, which names the project being observed.
+
 ## Per-chunk dispatch observation (non-gating)
 
 After PM dispatches Developer for a chunk (Step 2 above), PM calls
-`fleet observe dispatch --harness subagent --dispatch-id <role>-<chunk>-<n> --local-id
+`python -m scripts.fleet.cli observe dispatch --harness subagent --dispatch-id <role>-<chunk>-<n> --local-id
 <role>-<chunk>-<n> ...` to record the dispatch — per the granularity rule stated once in
 `roles/pm.md`'s "Fleet dispatch observation (spawned path)" subsection, not restated here. This
 step never blocks the surrounding gate: it is purely observational, any failure (fleet disabled, a
 manifest write that cannot complete, or any other fault) is logged and execution proceeds exactly
 as if the step had not run, and the chunk dispatch itself proceeds regardless of whether the
 observation succeeds.
+
+As with handoff emission, run it from the superhuman skill root, not from `--workspace`.
 
 ## Outputs
 

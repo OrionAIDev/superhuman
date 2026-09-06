@@ -38,18 +38,22 @@ W-FR-1's acceptance criterion is only partly automatable):**
    `.superhuman/profile.yaml`, have PM dispatch one role subagent whose
    prompt leads with a `roles/*.md` block (per the granularity rule in
    `roles/pm.md`'s "Fleet dispatch observation (spawned path)" subsection).
-2. Immediately after the dispatch call returns, run (from the dispatching
-   workspace):
-   ``fleet observe dispatch --harness subagent --workspace <ws> --slug <slug>
-   --dispatch-id <role>-<chunk>-<n> --local-id <role>-<chunk>-<n>
-   --writer-role pm``
-3. Run ``fleet observe status --workspace <ws> --slug <slug>`` and confirm it
-   reports "last write for this project succeeded" (not "zero writes").
-4. Run ``fleet status --workspace <ws> --slug <slug>`` and confirm the new
-   row appears with ``harness=subagent`` and ``origination=spawned``.
+2. Immediately after the dispatch call returns, run (from the superhuman
+   skill root — the checkout holding ``SKILL.md``, which is where ``-m``
+   resolves ``scripts.fleet``; ``<ws>`` is the dispatching workspace, and is
+   normally a different directory):
+   ``python -m scripts.fleet.cli observe dispatch --harness subagent
+   --workspace <ws> --slug <slug> --dispatch-id <role>-<chunk>-<n>
+   --local-id <role>-<chunk>-<n> --writer-role pm``
+3. Run ``python -m scripts.fleet.cli observe status --workspace <ws> --slug
+   <slug>`` and confirm it reports "last write for this project succeeded"
+   (not "zero writes").
+4. Run ``python -m scripts.fleet.cli status --workspace <ws> --slug <slug>``
+   and confirm the new row appears with ``harness=subagent`` and
+   ``origination=spawned``.
 5. Repeat once for a PM research/read-only fan-out (a prompt that does NOT
    lead with a `roles/*.md` block, e.g. an `Explore` dispatch) and confirm
-   PM does *not* call `fleet observe dispatch` for it — the granularity rule
+   PM does *not* call `observe dispatch` for it — the granularity rule
    holds. This half (a live orchestrating model actually following the
    prose instruction) is exactly what TC-21 records as manual-only; no
    automated test can prove a model's own compliance.
