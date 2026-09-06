@@ -22,3 +22,11 @@ scripts/autonomous-iter.sh text eol=lf
 # continue the line.
 templates/hooks/SessionStart text eol=lf
 templates/hooks/PreToolUse text eol=lf
+
+# Reference scripts the docs invoke directly (`./find-polluter.sh`,
+# `./render-graphs.js`, `scripts/start-server.sh`). Same reasoning as above:
+# LF today by contributor convention rather than by declaration.
+references/brainstorming/scripts/start-server.sh text eol=lf
+references/brainstorming/scripts/stop-server.sh text eol=lf
+references/systematic-debugging/find-polluter.sh text eol=lf
+references/writing-skills/render-graphs.js text eol=lf
