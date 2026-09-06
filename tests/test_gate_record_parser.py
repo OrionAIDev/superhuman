@@ -248,6 +248,179 @@ def test_single_line_html_comment_is_stripped() -> None:
 
 
 # ---------------------------------------------------------------------------
+# G6-002 (1): a fourth recognised stamp precision -- `YYYY-MM-DD HH:MM UTC`
+# ---------------------------------------------------------------------------
+
+
+def test_space_separated_utc_minute_stamp_parses() -> None:
+    """`[2026-06-23 22:09 UTC]` is a legitimately authored stamp, not corruption.
+
+    Real corpus shape (genericized): `hello-cli`'s entire `## Decisions log`
+    uses this space-separated, `UTC`-suffixed form instead of ISO `T...Z`.
+    Rejecting it silently dropped all seven of that project's recorded gates
+    (G6-002).
+    """
+    entry = grp.parse_entry("[2026-06-23 22:09 UTC] G7: docs sync approved")
+    assert entry is not None
+    assert entry.gate == 7
+    assert entry.precision == "minute"
+    assert entry.timestamp is not None
+    assert entry.timestamp.year == 2026
+    assert entry.timestamp.month == 6
+    assert entry.timestamp.day == 23
+    assert entry.timestamp.hour == 22
+    assert entry.timestamp.minute == 9
+    assert entry.timestamp.tzinfo is not None
+
+
+def test_space_separated_utc_minute_stamp_on_non_gate_label_parses() -> None:
+    """The fourth precision is recognised on non-gate labels too, not just `G<n>:`."""
+    entry = grp.parse_entry(
+        "[2026-06-23 22:16 UTC] Foundation decision: single chunk, no preceding foundation chunk"
+    )
+    assert entry is not None
+    assert entry.gate is None
+    assert entry.precision == "minute"
+    assert entry.timestamp is not None
+
+
+def test_space_separated_utc_calendar_invalid_stamp_does_not_parse() -> None:
+    """A calendar-invalid value in the fourth precision's shape still fails closed."""
+    assert grp.parse_entry("[2026-13-40 99:99 UTC] G1: bad calendar values") is None
+
+
+# ---------------------------------------------------------------------------
+# G6-002 (2): continuation lines -- a hard-wrapped paragraph is not malformed
+# ---------------------------------------------------------------------------
+
+
+def test_wrapped_continuation_line_folds_into_preceding_entrys_text() -> None:
+    """A non-blank line with no `[stamp]` opening folds into the prior entry's text.
+
+    Real corpus shape (genericized): a long decision line hard-wrapped across
+    physical lines with no bracket on the continuation lines. No gate is lost
+    -- the entry's own opening line already parsed -- so refusing the record
+    over how its prose wraps would be measuring formatting, not content
+    (G6-002, continuous with G4-R3).
+    """
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G3: DESIGN approved with a long rationale that\n"
+        "wraps onto a second physical line with no bracket at all\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is True
+    assert reading.malformed == ()
+    assert len(reading.entries) == 1
+    assert reading.entries[0].gate == 3
+    assert reading.entries[0].text == (
+        "DESIGN approved with a long rationale that "
+        "wraps onto a second physical line with no bracket at all"
+    )
+
+
+def test_multiple_consecutive_continuation_lines_all_fold_in_document_order() -> None:
+    """Several wrapped lines in a row all fold into the same preceding entry, in order."""
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G4: TEST plan approved with rationale that\n"
+        "spans three physical lines total, each one wrapped by hand\n"
+        "with no bracket prefix anywhere in the continuation.\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is True
+    assert len(reading.entries) == 1
+    assert reading.entries[0].text == (
+        "TEST plan approved with rationale that "
+        "spans three physical lines total, each one wrapped by hand "
+        "with no bracket prefix anywhere in the continuation."
+    )
+
+
+def test_continuation_line_does_not_register_a_gate_of_its_own() -> None:
+    """A `G<n>:` token inside folded continuation prose must NOT register as that gate.
+
+    This is the direct regression test for reintroducing G4-R4's whole-file-
+    scan defect at paragraph scale: a wrapped sentence that happens to
+    mention `G7:` mid-paragraph is prose, not a second entry, and must not
+    contribute to the gate set.
+    """
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G3: DESIGN approved, superseding the earlier\n"
+        "G7: reference in the retired draft, which was never itself a gate line\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is True
+    assert reading.gates == frozenset({3})
+    assert 7 not in reading.gates
+    assert reading.highest_gate == 3
+
+
+def test_orphan_continuation_line_before_any_entry_is_still_malformed() -> None:
+    """A non-blank, bracket-less line before any entry has opened is malformed, not swallowed.
+
+    Leading orphan prose (e.g. a heading immediately followed by free text
+    with no `[stamp] label:` line at all) must not be silently accepted --
+    there is no preceding entry for it to fold into (G6-002).
+    """
+    text = (
+        "## Decisions log\n"
+        "stray prose with no stamp at all, appearing before any entry opens\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is False
+    assert len(reading.malformed) == 1
+    assert "stray prose" in reading.malformed[0]
+    assert reading.gates == frozenset({0})
+
+
+def test_bracketed_but_unrecognized_stamp_line_stays_malformed_not_continuation() -> None:
+    """A line that structurally attempts a new entry (bracket + label + colon) stays malformed.
+
+    This is the regression anchor distinguishing an attempted-but-broken gate
+    line (visible, reported) from ordinary wrapped prose (folded silently):
+    a bad stamp on what is otherwise a `label: text` shape must never
+    disappear into the preceding entry's text, or a real gate label could be
+    silently lost -- the exact failure mode G6-002 exists to eliminate.
+    """
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[not-a-stamp] G1: this line is broken\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is False
+    assert len(reading.malformed) == 1
+    assert "this line is broken" in reading.malformed[0]
+    assert reading.gates == frozenset({0})
+    assert 1 not in reading.gates
+
+
+def test_bracketed_prose_with_no_colon_folds_as_continuation() -> None:
+    """A bracketed, validly-stamped line with no `Label:` delimiter at all is a continuation.
+
+    Real corpus shape (genericized): `[2026-07-01] PLAN.md extended with...` --
+    a validly-stamped freeform note with no colon anywhere. It never matches
+    the entry grammar (no `label:` to find), so -- like unbracketed prose --
+    it folds into the preceding entry rather than blocking well-formedness.
+    """
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] Note: baseline note\n"
+        "[2026-07-01] a freeform dated note with no colon delimiter at all\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is True
+    assert reading.malformed == ()
+    assert len(reading.entries) == 1
+    assert reading.entries[0].text == (
+        "baseline note [2026-07-01] a freeform dated note with no colon delimiter at all"
+    )
+
+
+# ---------------------------------------------------------------------------
 # TC-A: markdown-emphasis-wrapped gate label
 # ---------------------------------------------------------------------------
 

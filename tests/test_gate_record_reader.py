@@ -403,6 +403,54 @@ def test_swept_record_with_unknown_gates_passes_its_own_gate_check(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
+# G6-002: the space-separated UTC stamp and continuation lines, end to end
+# through `read_record` / `gate_record_gap` -- not just `parse_section`.
+# ---------------------------------------------------------------------------
+
+
+def test_space_separated_utc_stamp_record_passes_its_own_gates(tmp_path: Path) -> None:
+    """A record entirely stamped `YYYY-MM-DD HH:MM UTC` (the `hello-cli` shape) reads correctly.
+
+    This is the direct regression test for G6-002's motivating finding: a
+    parser that fails to recognise this stamp shape reports a completed
+    project's gate set as empty. Genericized shape of the real corpus record.
+    """
+    path = _write(
+        tmp_path,
+        "## Decisions log\n"
+        "[2026-06-23 22:09 UTC] G0: VISION approved; user decision: approve\n"
+        "[2026-06-23 22:09 UTC] G1: workflow prefs set; user decision: approve\n"
+        "[2026-06-23 22:13 UTC] G2: REQUIREMENTS approved; user decision: approve\n"
+        "[2026-06-23 22:16 UTC] G3: DESIGN approved; user decision: approve\n"
+        "[2026-06-23 22:19 UTC] G4: TEST plan approved; user decision: approve\n",
+    )
+    reading = grp.read_record(path)
+    assert reading.log.well_formed is True
+    assert reading.log.gates == frozenset({0, 1, 2, 3, 4})
+    assert sp.gate_record_gap(reading, gate=5) is None
+
+
+def test_hard_wrapped_continuation_record_passes_its_own_gates(tmp_path: Path) -> None:
+    """A record whose long decisions hard-wrap across physical lines still passes cleanly.
+
+    No gate is lost by a wrapped paragraph (G6-002); refusing the record over
+    how its prose wraps would measure formatting, not well-formedness.
+    """
+    path = _write(
+        tmp_path,
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-08-02T00:00:00Z] G1: kickoff approved after a long discussion that\n"
+        "wraps across a second physical line with no bracket prefix at all\n"
+        "[2026-08-03T00:00:00Z] G2: requirements approved\n",
+    )
+    reading = grp.read_record(path)
+    assert reading.log.well_formed is True
+    assert reading.log.gates == frozenset({0, 1, 2})
+    assert sp.gate_record_gap(reading, gate=3) is None
+
+
+# ---------------------------------------------------------------------------
 # TC-B: a gate mentioned only in prose, outside any target section
 # ---------------------------------------------------------------------------
 

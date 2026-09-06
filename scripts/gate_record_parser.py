@@ -17,12 +17,28 @@ a whole record file, resolving which section governs presence under the
 `Superhuman-version` gate (FR-2/FR-3), enumerating the canonical record set
 (FR-6), and the predecessor-gate rule (FR-13) are later chunks' concerns and
 are not implemented here.
+
+G6-002 correction: the live 35-record corpus surfaced two authored shapes
+the original grammar rejected -- rejecting either one is a formatting
+complaint dressed up as a well-formedness failure, which is exactly the
+distinction this module exists to get right. Both are handled here, not by
+the sweeper: (1) a fourth stamp precision, `YYYY-MM-DD HH:MM UTC`
+(space-separated, `UTC`-suffixed, minute-precision); and (2) continuation
+lines -- inside `parse_section`, a non-blank, non-comment line that does not
+itself structurally attempt a `[stamp] label: text` shape folds into the
+*preceding* entry's `text` rather than counting as malformed, as long as an
+entry has already opened in that section. A line that DOES structurally
+attempt the shape (an opening bracket followed eventually by a colon) but
+carries an unrecognised stamp is deliberately NOT folded -- it stays
+malformed and visible, because it is very likely a real, mistyped gate line,
+and folding it away would silently drop the gate the way this project's own
+motivating defect did.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,6 +78,10 @@ _NEXT_HEADING = re.compile(r"^##\s")
 _ISO_FULL = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _ISO_MINUTE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z$")
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+#: Fourth precision, added at G6-002: space-separated, `UTC`-suffixed,
+#: minute precision (e.g. `2026-06-23 22:09 UTC`) -- a legitimately authored
+#: stamp shape, not corruption (see module docstring).
+_SPACE_UTC_MINUTE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC$")
 
 #: How much of an entry's timestamp is known. Recorded, never enforced
 #: (DESIGN "The grammar, concretely") -- the gate check ignores precision
@@ -111,8 +131,9 @@ def _parse_stamp(raw: str) -> tuple[datetime | None, str | None]:
 
     Returns:
         A `(timestamp, precision)` pair. `precision` is `None` when `raw`
-        matches none of the sanctioned forms (`UNKNOWN`, or an ISO
-        timestamp at full/minute/date precision), signalling the caller to
+        matches none of the sanctioned forms (`UNKNOWN`; an ISO timestamp at
+        full/minute/date precision; or the space-separated, `UTC`-suffixed
+        minute-precision form added at G6-002), signalling the caller to
         reject the whole entry.
     """
     if raw == "UNKNOWN":
@@ -132,6 +153,17 @@ def _parse_stamp(raw: str) -> tuple[datetime | None, str | None]:
             return (
                 datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc),
                 _PRECISION_DATE,
+            )
+        if _SPACE_UTC_MINUTE.match(raw):
+            # Minute precision (G6-002): this shape carries exactly the same
+            # information as `_ISO_MINUTE`, just spelled with a space and a
+            # `UTC` suffix instead of `T...Z`. Reusing `_PRECISION_MINUTE`
+            # rather than minting a fifth vocabulary value keeps "precision"
+            # meaning what it says -- how much of the timestamp is known --
+            # rather than which of two equivalent notations authored it.
+            return (
+                datetime.strptime(raw, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc),
+                _PRECISION_MINUTE,
             )
     except ValueError:
         # Syntactically ISO-shaped but a calendar-invalid value (e.g. month
@@ -192,11 +224,27 @@ class SectionReading:
             located at all.
         entries: every line inside the section that parsed as an `Entry`,
             in document order. Blank lines and HTML comments are skipped
-            silently -- neither counts as an entry nor as a failure.
+            silently -- neither counts as an entry nor as a failure. A
+            continuation line (see below) is folded into the `text` of the
+            entry it extends rather than appearing here as its own `Entry`.
         malformed: the raw text of every non-blank, non-comment line inside
-            the section that failed to parse, in document order. Callers
-            that must fail closed (NFR-2) refuse on a non-empty tuple here
-            rather than passing vacuously.
+            the section that failed to parse AND that could not be folded
+            as a continuation, in document order. Callers that must fail
+            closed (NFR-2) refuse on a non-empty tuple here rather than
+            passing vacuously.
+
+            G6-002: a line that does not itself structurally attempt the
+            `[stamp] label: text` shape (no colon-delimited label at all --
+            e.g. a hard-wrapped continuation of a long decision, or a
+            bracketed freeform note with no `Label:`) is a **continuation
+            line**. It folds into the *preceding* entry's `text` instead of
+            landing here, as long as an entry has already opened in this
+            section -- a continuation line before any entry has opened is
+            still malformed (there is nothing for it to fold into). A line
+            that DOES structurally attempt the shape but carries an
+            unrecognised stamp is never folded: it stays here, visible,
+            because it is very likely a real gate line with a typo'd
+            timestamp, and folding it away would silently drop the gate.
         malformed_at: the 1-based document line number of each entry in
             `malformed`, in the same order -- so a caller can report
             "file:line: text" (DESIGN error table) without a second
@@ -218,6 +266,32 @@ class SectionReading:
         return self.found and not self.malformed
 
 
+def _fold_continuation(previous: Entry, continuation_text: str) -> Entry:
+    """Fold one continuation line into the entry it extends (G6-002).
+
+    Joins with a single space, not a newline: the corpus shape this exists
+    for is a long decision hard-wrapped across physical lines purely for
+    readability, so re-flowing it back into one prose line (rather than
+    preserving the arbitrary wrap points as embedded newlines) is the
+    faithful reconstruction of the author's intent. `raw` is deliberately
+    left untouched -- it keeps its existing documented meaning (the
+    entry's own opening line, for diagnostics) rather than growing to span
+    every physical line folded into it.
+
+    Args:
+        previous: the most recently parsed `Entry` in the current section.
+        continuation_text: the continuation line's text, already stripped
+            of surrounding whitespace.
+
+    Returns:
+        A new `Entry`, identical to `previous` except `text`, which gains
+        `continuation_text` appended after a single joining space (or is
+        replaced outright if `previous.text` was empty).
+    """
+    joined = f"{previous.text} {continuation_text}" if previous.text else continuation_text
+    return replace(previous, text=joined)
+
+
 _NOT_FOUND = SectionReading(
     found=False,
     entries=(),
@@ -236,6 +310,12 @@ def parse_section(text: str, heading: str) -> SectionReading:
     else in the document -- front matter, prose, a different section --
     never registers. This is the property that a whole-file scan (the
     defect this module replaces) violates.
+
+    A line inside the section that does not itself open a new entry folds
+    into the *preceding* entry's text as a continuation line rather than
+    counting as malformed, provided an entry has already opened (G6-002).
+    See `SectionReading.malformed` for the exact rule and why a
+    structurally-attempted-but-broken entry is never folded this way.
 
     Args:
         text: the full document text, or any substring containing the
@@ -284,11 +364,23 @@ def parse_section(text: str, heading: str) -> SectionReading:
                 in_comment = True
             continue
         entry = parse_entry(line)
-        if entry is None:
-            malformed.append(line)
-            malformed_at.append(line_no)
-        else:
+        if entry is not None:
             entries.append(entry)
+            continue
+        if entries and GATE_ENTRY.match(line.rstrip("\r\n")) is None:
+            # G6-002: this line does not even structurally attempt a
+            # `[stamp] label: text` shape (no colon-delimited label at all),
+            # so it is a continuation of the entry most recently opened in
+            # this section, not a new entry and not a malformed one. A line
+            # that DOES match `GATE_ENTRY` but failed only because its stamp
+            # is unrecognised falls through to `malformed` below -- it looks
+            # enough like a real (if broken) gate line that swallowing it
+            # silently would risk dropping a real gate (the module docstring
+            # explains why).
+            entries[-1] = _fold_continuation(entries[-1], stripped)
+            continue
+        malformed.append(line)
+        malformed_at.append(line_no)
 
     gates = frozenset(entry.gate for entry in entries if entry.gate is not None)
     highest_gate = max(gates) if gates else None
