@@ -12,3 +12,13 @@ scripts/autonomous-precondition.sh text eol=lf
 scripts/autonomous-rollback.sh text eol=lf
 scripts/autonomous-summary.sh text eol=lf
 scripts/autonomous-iter.sh text eol=lf
+
+# Hook TEMPLATES are copied by operators and run by POSIX shells. They are
+# LF today only because every committer so far had core.autocrlf set; the
+# declaration makes that independent of contributor config, as it already
+# is for every other POSIX script above. CRLF would break these twice: a
+# shebang ending in a carriage return names no valid interpreter, and a
+# trailing backslash would escape that carriage return rather than
+# continue the line.
+templates/hooks/SessionStart text eol=lf
+templates/hooks/PreToolUse text eol=lf
