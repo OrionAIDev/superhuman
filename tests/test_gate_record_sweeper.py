@@ -25,10 +25,41 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import gate_record_census as census_mod  # noqa: E402
 import gate_record_parser as grp  # noqa: E402
 import gate_record_sweeper as sweeper  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "gate_records"
+
+#: Precision rank for `Entry.precision` values, lowest to highest -- mirrors
+#: the vocabulary `gate_record_parser.Entry` documents (`"unknown"` <
+#: `"date"` < `"minute"` < `"full"`). A line with no recognisable
+#: `[stamp] label: text` shape at all (e.g. the pre-repair `LD-n` shape,
+#: which carries no bracket whatsoever) ranks the same as `"unknown"`:
+#: neither carries any usable timestamp information.
+_PRECISION_RANK = {None: 0, "unknown": 0, "date": 1, "minute": 2, "full": 3}
+
+
+def _stamp_precision_rank(line: str | None) -> int:
+    """Precision rank (0..3) of a rendered/original gate-record line's stamp.
+
+    Reuses `gate_record_parser.parse_entry` -- never re-derives stamp
+    classification (FR-1's single owner).
+
+    Args:
+        line: a full physical line (original or rendered), or `None` when
+            there is no original line to compare against (an "added" line).
+
+    Returns:
+        0 for `None`, an unparseable line, or an `UNKNOWN` stamp; otherwise
+        the rank of `Entry.precision`.
+    """
+    if line is None:
+        return 0
+    entry = grp.parse_entry(line)
+    if entry is None:
+        return 0
+    return _PRECISION_RANK[entry.precision]
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +497,245 @@ def test_a_gate_dropped_from_the_current_block_but_evidenced_by_history_is_propo
     assert added[0].gate == 1
     assert added[0].original is None
     assert "kickoff decided" in added[0].rendered
+
+
+# ---------------------------------------------------------------------------
+# G6-004: stamp precision may only increase -- the sweep is monotone
+# ---------------------------------------------------------------------------
+
+
+def test_date_precision_stamp_upgrades_when_history_differentiates(tmp_path: Path) -> None:
+    """A date-precision stamp is upgraded to full precision when git evidence differentiates.
+
+    This is FR-7's real value, preserved by G6-004: reconstruction still
+    happens, exactly when it is a genuine improvement.
+    """
+    repo = _init_repo(tmp_path)
+    slug = "date-to-full"
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T21:08:00+00:00",
+    )
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [2026-08-16] G0: baseline decided\n"
+        "- [2026-08-17] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-17T09:30:00+00:00",
+    )
+
+    proposal = sweeper.propose(manifest)
+
+    gate_lines = {line.gate: line.rendered for line in proposal.lines if line.gate is not None}
+    assert gate_lines[0] == "[2026-08-16T21:08:00Z] G0: baseline decided\n"
+    assert gate_lines[1] == "[2026-08-17T09:30:00Z] G1: kickoff decided\n"
+    assert proposal.unknown_count == 0
+
+
+def test_date_precision_stamp_is_kept_byte_unchanged_when_history_does_not_differentiate(
+    tmp_path: Path,
+) -> None:
+    """The G6-004 defect: a real, human-recorded date stamp must never become `[UNKNOWN]`.
+
+    A single-commit history gives no differentiating evidence (the same
+    squashed-history trap TC-39 exercises for the `UNKNOWN` case) -- the
+    written date stamp is the only evidence this gate will ever have and
+    must survive the sweep exactly as written, per `DECISIONS.md` G6-004.
+    """
+    repo = _init_repo(tmp_path)
+    manifest = _commit_manifest(
+        repo,
+        "date-stays-put",
+        "## Decisions locked\n- [2026-08-16] G1: base branch decided\n## Decisions log\n",
+        "2026-09-01T00:00:00+00:00",
+    )
+
+    proposal = sweeper.propose(manifest)
+
+    gate_lines = {line.gate: line.rendered for line in proposal.lines if line.gate is not None}
+    assert gate_lines[1] == "[2026-08-16] G1: base branch decided\n"
+    assert proposal.unknown_count == 0
+    assert "UNKNOWN" not in proposal.proposed_text
+
+
+def test_full_precision_stamp_stays_put_even_when_evidence_is_found(tmp_path: Path) -> None:
+    """A stamp already at full precision is never rewritten -- evidence can never be "more precise".
+
+    The commit's own committer date (`2026-08-20T00:00:00Z`) deliberately
+    differs from the stamp already written (`2026-08-16T21:08:00Z`) -- if
+    the sweep incorrectly treated "evidence found" as license to overwrite,
+    this test would see the commit date leak into the proposal. G6-004
+    requires the byte-original, already-full-precision stamp to survive
+    untouched: evidence is only ever a strict *upgrade*, never a
+    replacement of equal-or-lesser precision.
+    """
+    repo = _init_repo(tmp_path)
+    slug = "full-stays-put"
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [2026-08-16T21:08:00Z] G0: baseline decided\n"
+        "## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [2026-08-16T21:08:00Z] G0: baseline decided\n"
+        "- [2026-08-17T09:30:00Z] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-20T00:00:00+00:00",
+    )
+
+    proposal = sweeper.propose(manifest)
+
+    gate_lines = {line.gate: line.rendered for line in proposal.lines if line.gate is not None}
+    # The bullet is still stripped (chunk 3's mandate), but the full-precision
+    # stamp itself is byte-identical to what was written -- neither gate's
+    # commit date (2026-08-01 / 2026-08-20) leaks into the rendered stamp.
+    assert gate_lines[0] == "[2026-08-16T21:08:00Z] G0: baseline decided\n"
+    assert gate_lines[1] == "[2026-08-17T09:30:00Z] G1: kickoff decided\n"
+
+
+def test_minute_precision_stamp_upgrades_when_history_differentiates(tmp_path: Path) -> None:
+    """A minute-precision stamp is upgraded to full precision, symmetrically with the date case."""
+    repo = _init_repo(tmp_path)
+    slug = "minute-to-full"
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16T21:08Z] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T21:08:37+00:00",
+    )
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [2026-08-16T21:08Z] G0: baseline decided\n"
+        "- [2026-08-17T09:30Z] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-17T09:30:55+00:00",
+    )
+
+    proposal = sweeper.propose(manifest)
+
+    gate_lines = {line.gate: line.rendered for line in proposal.lines if line.gate is not None}
+    assert gate_lines[0] == "[2026-08-16T21:08:37Z] G0: baseline decided\n"
+    assert gate_lines[1] == "[2026-08-17T09:30:55Z] G1: kickoff decided\n"
+
+
+def test_genuinely_absent_stamp_still_becomes_unknown_with_no_evidence(tmp_path: Path) -> None:
+    """A stamp already `UNKNOWN`, with no differentiating evidence, stays `UNKNOWN` -- not a downgrade.
+
+    D-1's sentinel is the correct output exactly when no parseable stamp
+    exists at all and no evidence can fill it in; G6-004 narrows *when*
+    `UNKNOWN` is written, it does not remove it for this genuine case.
+    """
+    repo = _init_repo(tmp_path)
+    manifest = _commit_manifest(
+        repo,
+        "still-unknown",
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+
+    proposal = sweeper.propose(manifest)
+
+    gate_lines = {line.gate: line.rendered for line in proposal.lines if line.gate is not None}
+    assert gate_lines[0] == "[UNKNOWN] G0: baseline decided\n"
+    assert proposal.unknown_count == 1
+
+
+def test_reproduces_the_delta_report_example_verbatim(tmp_path: Path) -> None:
+    """Regression anchor for the exact example quoted in `delta-report-G6-004.md`.
+
+    Before the fix, this proposed replacing `[2026-08-16]` with `[UNKNOWN]`
+    for a squashed-history record -- the defect that triggered G6-004.
+    """
+    repo = _init_repo(tmp_path)
+    manifest = _commit_manifest(
+        repo,
+        "gate-record-integrity",
+        "## Decisions locked\n"
+        "- [2026-08-16] G1: base branch -- Phase 1 merged to `main` first "
+        "(squash-only repo)\n"
+        "## Decisions log\n",
+        "2026-09-05T00:00:00+00:00",
+    )
+
+    proposal = sweeper.propose(manifest)
+
+    assert "[UNKNOWN]" not in proposal.proposed_text
+    assert (
+        "[2026-08-16] G1: base branch -- Phase 1 merged to `main` first (squash-only repo)"
+        in proposal.proposed_text
+    )
+
+
+def _all_proposed_lines_for_property_check(path: Path) -> list[sweeper.ProposedLine]:
+    """Return the proposal's lines for `path`, or `[]` when not applicable/aborted."""
+    proposal = sweeper.propose(path)
+    if not proposal.applicable or proposal.aborted:
+        return []
+    return list(proposal.lines)
+
+
+def test_sweep_never_downgrades_a_stamp() -> None:
+    """No line the sweep proposes ever carries less timestamp information than the line it replaces.
+
+    This is the named monotonicity property G6-004 requires (`DECISIONS.md`
+    G6-004: "the sweep is monotone -- it can only ever add information").
+    Run over 100% of `tests/fixtures/gate_records/` (never a sampled
+    subset, matching TC-42's own standard) and over the live corpus -- the
+    same population whose 32/32, 6/6, and 5/5 downgrades triggered this
+    corrective chunk in the first place.
+
+    A line with `original is None` (the "added" source: a gate history
+    evidences but the current block omits entirely) has nothing to compare
+    against and is skipped -- there is no existing stamp for it to
+    downgrade.
+    """
+    checked = 0
+    for fixture_path in _all_fixture_paths():
+        for line in _all_proposed_lines_for_property_check(fixture_path):
+            if line.original is None:
+                continue
+            before = _stamp_precision_rank(line.original)
+            after = _stamp_precision_rank(line.rendered)
+            checked += 1
+            assert after >= before, (
+                f"{fixture_path.name}: stamp downgraded from rank {before} to {after}\n"
+                f"  original: {line.original!r}\n  rendered: {line.rendered!r}"
+            )
+    assert checked > 0, "no fixture exercised the property -- test would pass vacuously"
+
+    live_roots = [root for root in (Path.home() / ".claude" / "skills", Path.home() / "dev") if root.is_dir()]
+    if not live_roots:
+        pytest.skip("live corpus roots not present on this machine")
+    try:
+        records = census_mod.census(live_roots)
+    except RuntimeError:
+        pytest.skip("live census is empty on this machine")
+
+    live_checked = 0
+    for record in records:
+        for line in _all_proposed_lines_for_property_check(record.path):
+            if line.original is None:
+                continue
+            before = _stamp_precision_rank(line.original)
+            after = _stamp_precision_rank(line.rendered)
+            live_checked += 1
+            assert after >= before, (
+                f"{record.repo_root}/{record.slug}: stamp downgraded from rank {before} to {after}\n"
+                f"  original: {line.original!r}\n  rendered: {line.rendered!r}"
+            )
+    assert live_checked > 0, "live corpus present but no record exercised the property"
 
 
 # ---------------------------------------------------------------------------

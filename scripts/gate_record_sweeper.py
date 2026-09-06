@@ -1,12 +1,33 @@
 """FR-7/FR-8/FR-9 gate-record sweeper: propose repairs, never apply them (chunk 3).
 
 This module reconstructs each gate line's real time from the record's own
-`git log -p` history -- never from the timestamp typed into the file
-(FR-7) -- and proposes a normalised `## Decisions locked` block: the
-leading bullet is stripped and the stamp is upgraded to a reconstructed
-value or the `[UNKNOWN]` sentinel (D-1) when no git evidence exists. It
-never rewrites a decision's wording, because wording is not something git
-evidence can adjudicate (DESIGN's Sweep data flow).
+`git log -p` history (FR-7) and proposes a normalised `## Decisions
+locked` block: the leading bullet is always stripped, but the stamp is
+rewritten only when doing so is a strict improvement (G6-004). **Stamp
+precision may only increase:**
+
+- Git evidence strictly more precise than what is written -- upgrade
+  (e.g. `2026-08-16` -> `2026-08-16T21:08:00Z`). This is FR-7's real value.
+- No git evidence, or evidence no more precise than what is written --
+  keep the existing stamp byte-unchanged.
+- `[UNKNOWN]` is written only where no parseable stamp exists at all: the
+  stamp slot already read `UNKNOWN` and no evidence was found to fill it
+  in (D-1). It is never written in place of a real, human-recorded
+  timestamp merely because *git* has no evidence for it -- a chunk-3
+  defect that conflated "no git evidence" with "no evidence at all" and
+  proposed downgrading every real, already-stamped gate line in this
+  repo's own records to `[UNKNOWN]` (`DECISIONS.md` G6-004;
+  `delta-report-G6-004.md`). A record whose locked block never carried a
+  stamp at all (the OI-3 `LD-n` shape, G6-003-b) still reports `[UNKNOWN]`
+  when it has no git evidence either -- that is not a downgrade, because
+  there was never a written timestamp to protect.
+
+The resulting property is named and tested (`test_sweep_never_downgrades_a_stamp`):
+the sweep is monotone -- it can only ever add information, never remove
+it -- which is what makes it safe to run repeatedly and safe to run
+against a population nobody has audited line by line. It never rewrites a
+decision's wording, because wording is not something git evidence can
+adjudicate (DESIGN's Sweep data flow).
 
 Chunk 3 is dry-run only: :func:`propose` never writes to disk, and the CLI
 below wires `--dry-run` as the only working mode. `--apply` is defined so
@@ -385,8 +406,28 @@ def _collect_evidence(path: Path) -> _Evidence:
 # ---------------------------------------------------------------------------
 
 
+#: `Entry.precision` value denoting the maximum precision `gate_record_parser`
+#: recognises. Reconstructed git evidence (`_to_canonical_stamp`'s output) is
+#: always this precision, so it can never be "strictly more precise" than an
+#: already-full-precision written stamp (G6-004) -- comparing against this
+#: constant, rather than re-deriving a precision ordering, is what keeps this
+#: module from re-implementing `gate_record_parser`'s stamp grammar.
+_MAX_PRECISION = "full"
+
+
 def _normalise_entry_line(content: str, entry: gate_record_parser.Entry, evidence: _Evidence) -> tuple[str, bool]:
-    """Render one already-well-formed entry with its bullet stripped and stamp normalised.
+    """Render one already-well-formed entry with its bullet stripped and its stamp normalised.
+
+    Stamp precision may only increase (G6-004). The reconstructed value,
+    when git evidence exists, is always full precision -- so it upgrades
+    the stamp only when the written stamp is not already at full
+    precision. Every other case -- no evidence at all, or a written stamp
+    already at full precision -- keeps the existing stamp byte-unchanged:
+    overwriting it for lack of *git* evidence would delete a timestamp a
+    human actually recorded, which is itself the only evidence that gate
+    will ever have (`DECISIONS.md` G6-004). `[UNKNOWN]` is rendered here
+    only when the stamp as written was already `UNKNOWN` and no evidence
+    was found to fill it in -- never as a downgrade of a real timestamp.
 
     Only the bullet and the stamp change. The label is rendered exactly as
     written -- including any leading markdown emphasis -- because chunk 3's
@@ -403,18 +444,24 @@ def _normalise_entry_line(content: str, entry: gate_record_parser.Entry, evidenc
 
     Returns:
         `(rendered_line, is_unknown)` where `rendered_line` carries no
-        trailing newline and `is_unknown` reports whether the stamp is the
-        `[UNKNOWN]` sentinel.
+        trailing newline and `is_unknown` reports whether the rendered
+        stamp is the `[UNKNOWN]` sentinel.
     """
     match = gate_record_parser.GATE_ENTRY.match(content)
     raw_label = match.group("rawlabel").strip() if match else entry.label
+    written_stamp = match.group("stamp") if match else UNKNOWN_STAMP
 
-    stamp = None
+    reconstructed = None
     if evidence.has_differentiation:
         key = (entry.gate, entry.sub, entry.label, entry.text)
-        stamp = evidence.by_content.get(key)
-    is_unknown = stamp is None
-    rendered_stamp = stamp if stamp is not None else UNKNOWN_STAMP
+        reconstructed = evidence.by_content.get(key)
+
+    if reconstructed is not None and entry.precision != _MAX_PRECISION:
+        rendered_stamp = reconstructed
+    else:
+        rendered_stamp = written_stamp
+
+    is_unknown = rendered_stamp == UNKNOWN_STAMP
     rendered = f"[{rendered_stamp}] {raw_label}: {entry.text}" if entry.text else f"[{rendered_stamp}] {raw_label}:"
     return rendered, is_unknown
 
@@ -432,6 +479,12 @@ def _try_ld_repair(content: str, evidence: _Evidence) -> tuple[str, int | None, 
     Args:
         content: the original line, trailing newline already removed.
         evidence: this record's git evidence.
+
+    G6-004 note: an `LD-n` line carries no `[stamp]` slot at all -- there is
+    no existing timestamp for this repair to protect, so writing `UNKNOWN`
+    here when no evidence exists is not a downgrade (there was nothing to
+    downgrade from); the monotonicity property holds trivially for this
+    shape, unlike an already-stamped `GATE_ENTRY` line.
 
     Returns:
         `(rendered_line, gate, is_unknown)`, or `None` when `content` does
@@ -706,12 +759,16 @@ def propose(path: Path) -> Proposal:
     """Propose a repair for one record's `## Decisions locked` block.
 
     Reconstructs each gate line's real time from `git log -p --follow`
-    over `path`'s own history (FR-7), independent of whatever timestamp is
-    currently typed into the file. A line with no differentiating git
-    evidence -- including every line in a record whose entire history is
-    one commit, the squashed/rewritten-history trap (TEST.md TC-39) --
-    becomes the `[UNKNOWN]` sentinel; nothing is ever guessed, interpolated,
-    or inferred from a neighbouring line (FR-8).
+    over `path`'s own history (FR-7), and upgrades the written stamp only
+    when that reconstruction is strictly more precise (G6-004). A line with
+    no differentiating git evidence -- including every line in a record
+    whose entire history is one commit, the squashed/rewritten-history trap
+    (TEST.md TC-39) -- keeps whatever stamp is already written, byte-
+    unchanged; only a stamp that was already `UNKNOWN`, with no evidence to
+    fill it in, is rendered `UNKNOWN`. Nothing is ever guessed, interpolated,
+    or inferred from a neighbouring line (FR-8), and a real, human-recorded
+    timestamp is never downgraded merely because git itself has no evidence
+    for it.
 
     Only the bullet and the stamp are normalised. Blank lines, HTML
     comments, and continuation lines (G6-002) pass through byte-identical.
