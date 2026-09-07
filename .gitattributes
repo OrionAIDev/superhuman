@@ -30,3 +30,13 @@ references/brainstorming/scripts/start-server.sh text eol=lf
 references/brainstorming/scripts/stop-server.sh text eol=lf
 references/systematic-debugging/find-polluter.sh text eol=lf
 references/writing-skills/render-graphs.js text eol=lf
+
+# The last two shebang-bearing files. Materially weaker case than everything
+# above, and deliberately deferred in #15 for that reason: CRLF does not break
+# the Python interpreter, which reads source under universal newlines, so a
+# carriage return survives `python scripts/<name>.py` harmlessly. Only the
+# `scripts/superhuman_profile.py <cmd>` form README documents would break, and
+# only on its shebang. Declared anyway so that every shebang in the repo is
+# covered by rule rather than by contributor `core.autocrlf` config.
+scripts/regen_core_manifest.py text eol=lf
+scripts/superhuman_profile.py text eol=lf
