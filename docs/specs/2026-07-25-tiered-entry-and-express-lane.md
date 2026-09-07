@@ -5,7 +5,7 @@
 **Applies to:** superhuman v1.0.3 → v1.1.0
 **Author:** design session, 2026-07-25
 **Supersedes:** nothing. Extends the `<HARD-GATE>` in `SKILL.md` and adds one phase recipe.
-**Related:** `docs/superhuman/specs/2026-07-24-portable-profile-and-ladder.md` (same "extract the
+**Related:** `docs/specs/2026-07-24-portable-profile-and-ladder.md` (same "extract the
 decision into data, leave the orchestrator alone" strategy)
 
 ---

@@ -4,7 +4,7 @@
 # The deployment-ladder decision moved out of this script and into the
 # deterministic resolver `scripts/superhuman_profile.py`, driven by a
 # declarative profile (design spec
-# docs/superhuman/specs/2026-07-24-portable-profile-and-ladder.md).
+# docs/specs/2026-07-24-portable-profile-and-ladder.md).
 #
 # This shim exists so that existing callers — phases/3-autonomous-loop.md
 # Step 0, phases/0-kickoff.md Step 3, and the SKILL.md HARD-GATE — keep working

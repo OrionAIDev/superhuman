@@ -2,7 +2,7 @@
 
 **Created:** 2026-08-16
 **Status:** scoping brief, feeds a new superhuman project's G0 (VISION). Not a spec, not a plan.
-**Parent program:** `docs/superhuman/specs/2026-08-13-superhuman-session-fleet.md` §16 (phased delivery).
+**Parent program:** `docs/specs/2026-08-13-superhuman-session-fleet.md` §16 (phased delivery).
 **Predecessor:** Phase 1 `session-tracking` — COMPLETE, G8 accepted 2026-08-16.
 
 ---
