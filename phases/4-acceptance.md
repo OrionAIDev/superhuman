@@ -44,6 +44,22 @@ consulted: []
 
 3. **Worktree cleanup.** Run `git worktree prune` to clean any remaining stale worktree refs before closing out the project.
 
+   **Prune alone is not cleanup — reap first.** `git worktree prune` only drops registrations
+   whose folders are *already gone*, so it silently no-ops on every worktree still present on
+   disk, which is nearly all of them. It is the tidy-up *after* removal, never the removal
+   itself. Superhuman is the estate's biggest producer of worktrees — every parallel chunk in
+   Phase 3 is one — so this is the gate that closes them. Ask what is actually there:
+
+   ```bash
+   python ~/.claude/skills/session-relay/scripts/worktree_scan.py
+   ```
+
+   Reap the worktrees this project created and no longer needs, then prune. Two rules carry over
+   from session-relay, which owns this logic: **`SAFE` is a proposal, not a licence** — each
+   removal needs an explicit yes; and anything classified `REVIEW` holds uncommitted or unmerged
+   work and is never batch-removed. Worktrees this project did not create stay put. If any
+   survive, name them and why in the acceptance summary rather than reporting cleanup done.
+
 4. **G8: Acceptance sign-off.**
    - Type A gate.
    - Present: the acceptance summary.
