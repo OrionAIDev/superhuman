@@ -732,3 +732,258 @@ def test_predecessor_table_g7_predecessor_is_g5_not_g6(gate: int, expected: int 
 def test_predecessor_returns_none_for_out_of_range_gate_and_never_raises(gate: int) -> None:
     """An out-of-range gate resolves to `None` deterministically -- it must never raise."""
     assert grp.predecessor(gate) is None
+
+
+# ---------------------------------------------------------------------------
+# G6-007a: the label grammar matches a gate token at the HEAD of the label,
+# not whole-label equality, and strips trailing emphasis as well as leading.
+# Real corpus shapes (genericized per NFR-4) that the original grammar
+# silently failed to register -- measured on the live corpus at 8 of 34
+# records under-reporting their true highest gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line,expected_gate,expected_label",
+    [
+        (
+            "[2026-07-02] **G8 ACCEPTANCE**: user accepts the delivered project",
+            8,
+            "G8 ACCEPTANCE",
+        ),
+        (
+            "[2026-08-16T14:00:00Z] **G8 - ACCEPTANCE. Project accepted; "
+            "user decision: accept.**",
+            8,
+            "G8 - ACCEPTANCE. Project accepted; user decision",
+        ),
+        ("[2026-09-01] G5 (chunk 8, FINAL chunk): shipped", 5, "G5 (chunk 8, FINAL chunk)"),
+        ("[2026-09-01] G6 (moderate - drift): raised", 6, "G6 (moderate - drift)"),
+    ],
+)
+def test_gate_token_at_head_of_label_resolves_despite_trailing_qualifier_text(
+    line: str, expected_gate: int, expected_label: str
+) -> None:
+    """A gate token at the head of a richly worded label registers (G6-007a).
+
+    Only a clean `**G3:**`-shaped label resolved under the original,
+    whole-label-equality grammar; trailing qualifier text -- a word, a
+    parenthetical, an entire sentence -- silently defeated it. This is the
+    direct regression test for the defect measured at 8 of 34 live records.
+    """
+    entry = grp.parse_entry(line)
+    assert entry is not None
+    assert entry.gate == expected_gate
+    assert entry.label == expected_label
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[2026-09-01] Pre-G5 discussion: the token is not at the head",
+        "[2026-09-01] Chunk 8 G5 review: the token is not at the head",
+        "[2026-09-01] BRIEF: no gate token at all",
+        "[2026-09-01] Constraint: no gate token at all",
+        "[2026-09-01] Step 0.5: no gate token at all",
+        "[2026-09-01] CLOSED: must remain a non-gate entry (FR-16)",
+        "[UNKNOWN] LD-2 (G0): the locked block contributes no gates (G6-006)",
+    ],
+)
+def test_head_match_does_not_over_match_a_label_naming_a_gate_off_head(line: str) -> None:
+    """A gate token NOT at the head of the label must still yield `gate=None` (G6-007a).
+
+    Widening the grammar to a head match must not become "any gate token
+    anywhere": `Pre-G5`/`Chunk 8 G5` name a gate mid-label, and `LD-2 (G0)`
+    is the real `fidelity-provider-setup` locked-block shape whose gate
+    contribution G6-006 already ruled is none -- a head match must not
+    accidentally start resolving it to gate 0.
+    """
+    entry = grp.parse_entry(line)
+    assert entry is not None
+    assert entry.gate is None
+
+
+def test_trailing_emphasis_is_stripped_alongside_leading() -> None:
+    """Trailing `**`/`_` after a label is stripped, not just leading (G6-007a, G4-R3's other half)."""
+    entry = grp.parse_entry("[2026-08-01T00:00:00Z] **G4**: test plan approved")
+    assert entry is not None
+    assert entry.gate == 4
+    assert entry.label == "G4"
+
+
+# ---------------------------------------------------------------------------
+# G6-007b: the permissive disagreement detector -- a standing safety net for
+# the next authored spelling the grammar does not anticipate, independent of
+# and in addition to the G6-007a widening.
+# ---------------------------------------------------------------------------
+
+
+def test_disagreement_fires_when_a_label_names_a_higher_gate_than_the_grammar_resolved() -> None:
+    """A label the strict grammar cannot resolve, but which names a higher gate, forces disagreement.
+
+    Constructed case, not a live corpus shape: this is the standing safety
+    net for a spelling neither the original grammar nor the G6-007a
+    widening anticipated. `well_formed` and `gates` are unaffected --
+    disagreement is reported alongside them, not in place of them.
+    """
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G3: baseline reached\n"
+        "[2026-08-02T00:00:00Z] Escalation to G8 noted: for quick reference only\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.well_formed is True
+    assert reading.gates == frozenset({3})
+    assert reading.highest_gate == 3
+    assert reading.disagreement is True
+    assert reading.reported_highest_gate == grp.GATE_UNKNOWN
+
+
+def test_disagreement_never_fires_when_the_strict_grammar_already_covers_every_label() -> None:
+    """No disagreement when every entry's label names no gate higher than what strict parsing found."""
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-08-02T00:00:00Z] G1: kickoff\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.disagreement is False
+    assert reading.reported_highest_gate == 1
+
+
+def test_disagreement_scans_only_the_label_never_the_free_text() -> None:
+    """A gate number cited in free-text `text` must never trigger disagreement (G6-007b).
+
+    Decision rationale routinely cites other gates by number -- this
+    project's own decisions log does it constantly. Scanning `text` would
+    make disagreement fire on nearly every entry, defeating the point of a
+    *safety net* by turning it into permanent noise.
+    """
+    text = (
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G3: DESIGN approved, superseding the earlier "
+        "reference to G9 in the retired draft\n"
+    )
+    reading = grp.parse_section(text, "## Decisions log")
+    assert reading.disagreement is False
+    assert reading.reported_highest_gate == 3
+
+
+def test_reported_highest_gate_is_none_when_no_gate_and_no_disagreement() -> None:
+    """`reported_highest_gate` stays `None` (not `GATE_UNKNOWN`) for a genuinely gateless section.
+
+    `None` ("no gate reached") and `GATE_UNKNOWN` ("could not confidently
+    read this") are different claims and must never collapse into each
+    other.
+    """
+    reading = grp.parse_section(
+        "## Decisions log\n[2026-08-01T00:00:00Z] Constraint: no gate lines at all\n",
+        "## Decisions log",
+    )
+    assert reading.disagreement is False
+    assert reading.highest_gate is None
+    assert reading.reported_highest_gate is None
+
+
+# ---------------------------------------------------------------------------
+# FR-16 / G6-005: terminal state is a non-gate ledger entry, surfaced as a
+# reader field on `RecordReading`. No grammar change -- both spellings below
+# already parse under the existing entry grammar; this only reads that
+# parse. Kept in this file (vendorable, G6-005-b): stdlib + pytest only, no
+# other superhuman module imported.
+# ---------------------------------------------------------------------------
+
+
+def test_read_record_reports_none_terminal_state_for_an_ordinary_record(tmp_path: Path) -> None:
+    """A record with no CLOSED/ABORT marker reports `terminal_state=None`."""
+    path = tmp_path / "SUPERHUMAN.md"
+    path.write_text(
+        "## Decisions log\n[2026-08-01T00:00:00Z] G0: baseline\n",
+        encoding="utf-8",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state is None
+
+
+def test_read_record_recognises_bare_closed_entry(tmp_path: Path) -> None:
+    """`[<stamp>] CLOSED: <reason>` -- the canonical form -- reports `terminal_state == 'closed'`."""
+    path = tmp_path / "SUPERHUMAN.md"
+    path.write_text(
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-09-06] CLOSED: requirement kept, tracked elsewhere\n",
+        encoding="utf-8",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state == "closed"
+
+
+def test_read_record_recognises_closed_with_a_parenthetical_qualifier(tmp_path: Path) -> None:
+    """`CLOSED (not completed): ...` -- the real corpus shape -- also reports `'closed'`.
+
+    Genericized shape of `superhuman-init` and `export-markdown-render-deps`
+    (G6-005): both were closed short of G8 and both use this spelling.
+    """
+    path = tmp_path / "SUPERHUMAN.md"
+    path.write_text(
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-08-02T00:00:00Z] G1: kickoff\n"
+        "[2026-09-06] CLOSED (not completed): the project record was closed early\n",
+        encoding="utf-8",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state == "closed"
+
+
+def test_read_record_recognises_bare_abort_label(tmp_path: Path) -> None:
+    """A bare, non-gate `ABORT: <reason>` label reports `terminal_state == 'abort'`."""
+    path = tmp_path / "SUPERHUMAN.md"
+    path.write_text(
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-08-02T00:00:00Z] ABORT: project canceled by user decision\n",
+        encoding="utf-8",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state == "abort"
+
+
+def test_read_record_recognises_the_gate_line_abort_spelling(tmp_path: Path) -> None:
+    """`G3: ABORT -- PROJECT CLOSED` -- the real `memory-sync-evaluation` shape -- reports `'abort'`.
+
+    G4-R5 already ruled this line's project finished, not stalled; this
+    pins that `read_record` understands it structurally, with no rewrite
+    needed. The gate itself (3) still registers independently -- a gate
+    firing and the project being terminal are separate, simultaneous facts.
+    """
+    path = tmp_path / "SUPERHUMAN.md"
+    path.write_text(
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "- [2026-07-27T22:50:39Z] **G3: ABORT -- PROJECT CLOSED.** "
+        "PM presented the assessment; user decision: close the project.\n",
+        encoding="utf-8",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state == "abort"
+    assert reading.log.gates == frozenset({0, 3})
+
+
+def test_malformed_closed_line_does_not_register_as_terminal_state(tmp_path: Path) -> None:
+    """A `CLOSED`-labeled line that fails the entry grammar never becomes a terminal marker.
+
+    It never became a parsed `Entry` in the first place, so there is
+    nothing for `_terminal_state` to read; the record is reported as
+    malformed, not as silently terminal.
+    """
+    path = tmp_path / "SUPERHUMAN.md"
+    path.write_text(
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[not-a-stamp] CLOSED: this line fails the entry grammar\n",
+        encoding="utf-8",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state is None
+    assert reading.log.well_formed is False

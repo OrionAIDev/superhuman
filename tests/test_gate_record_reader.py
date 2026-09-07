@@ -478,3 +478,66 @@ def test_gate_mentioned_in_front_matter_prose_does_not_count_as_reached(tmp_path
     gap = sp.gate_record_gap(reading, gate=3)
     assert gap is not None
     assert gap.code == sp.EXIT_RECORD
+
+
+# ---------------------------------------------------------------------------
+# FR-16 / G6-005: terminal state does not touch the predecessor test or the
+# enforcement path. A closed project never reaches another gate, so an
+# exemption there would have no caller -- the reader field alone closes the
+# gap (per DECISIONS.md's correction to the peer: highest_gate, not the
+# predecessor test, is what makes a closed project read as stalled).
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_record_still_fails_the_predecessor_test_for_an_unreached_gate(
+    tmp_path: Path,
+) -> None:
+    """A `CLOSED` record with a low highest gate is NOT exempted from `gate_record_gap`.
+
+    `terminal_state` is a reporting field only. Nothing about the
+    enforcement path changes: a record closed at G2 (with no G3 on record)
+    still fails at gate=4 exactly as an ordinary, non-terminal G2 record
+    would -- predecessor(4) is 3, which this record never reached.
+    """
+    path = _write(
+        tmp_path,
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-08-02T00:00:00Z] G1: kickoff\n"
+        "[2026-08-03T00:00:00Z] G2: requirements\n"
+        "[2026-09-06] CLOSED (not completed): closed early, requirement tracked elsewhere\n",
+    )
+    reading = grp.read_record(path)
+    assert reading.terminal_state == "closed"
+    gap = sp.gate_record_gap(reading, gate=4)
+    assert gap is not None
+    assert gap.code == sp.EXIT_RECORD
+
+
+def test_gate_disagreement_does_not_change_which_gates_the_enforcement_path_sees(
+    tmp_path: Path,
+) -> None:
+    """`gate_record_gap` reads `presence.gates`, never `highest_gate`/`disagreement` (G6-007b).
+
+    A section in disagreement still enforces on exactly the strictly-parsed
+    gate set -- the permissive detector is a reporting signal, not a second
+    enforcement path.
+    """
+    path = _write(
+        tmp_path,
+        "## Decisions log\n"
+        "[2026-08-01T00:00:00Z] G0: baseline\n"
+        "[2026-08-02T00:00:00Z] G1: kickoff\n"
+        "[2026-08-03T00:00:00Z] Escalation to G8 noted: for quick reference only\n",
+    )
+    reading = grp.read_record(path)
+    assert reading.log.disagreement is True
+    assert reading.gate_disagreement is True
+    # Gate 2's predecessor (1) is present, so gate 2 still passes -- the
+    # disagreement on a LATER, unrelated entry does not block it.
+    assert sp.gate_record_gap(reading, gate=2) is None
+    # Gate 8 was never actually asserted (only mentioned in prose), so it
+    # still correctly fails -- disagreement does not manufacture presence.
+    gap_at_8 = sp.gate_record_gap(reading, gate=8)
+    assert gap_at_8 is not None
+    assert gap_at_8.code == sp.EXIT_RECORD

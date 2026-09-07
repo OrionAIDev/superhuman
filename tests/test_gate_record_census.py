@@ -220,3 +220,83 @@ def test_duplicate_slug_across_repos_is_never_collapsed(tmp_path: Path) -> None:
     # never a slug-keyed mapping that would silently collapse this pair.
     assert isinstance(records, list)
     assert not isinstance(records, dict)
+
+
+# ---------------------------------------------------------------------------
+# G6-005-c: the inverted-path guard -- a real MAIN checkout at a path shaped
+# like a worktree location MUST be enumerated. Every test above exercises a
+# genuine worktree; none of them would fail if repository identity were ever
+# inferred from a path string again. This is the only one that would.
+# ---------------------------------------------------------------------------
+
+
+def test_main_checkout_at_a_worktree_shaped_path_is_still_enumerated(tmp_path: Path) -> None:
+    """A real main checkout (`.git` a directory) at a `.claude/worktrees/`-shaped path IS enumerated.
+
+    The exclusion rule is entirely git-based (`.git` file vs. directory,
+    G6-003) -- it does not inspect the path string at all. This is the
+    negative-space complement TEST.md's G6-005-e amendment calls for:
+    every existing worktree test in this module would still pass if
+    path-matching were reintroduced; only this inverted case would fail.
+    """
+    repo = tmp_path / "some-project" / ".claude" / "worktrees" / "feature-branch"
+    _make_main_checkout(repo)
+    _make_record(repo, "shape-mimics-a-worktree")
+
+    refs = list(census_mod.iter_canonical_records([tmp_path]))
+    assert len(refs) == 1
+    assert refs[0].repo_root == repo
+    assert refs[0].slug == "shape-mimics-a-worktree"
+
+
+# ---------------------------------------------------------------------------
+# G6-005-d: `repo_root` is resolved from the enclosing `.git`, never a fixed
+# parent count. A no-op on today's corpus (0 of 34 differ) but wrong inside
+# a monorepo, where it would break FR-10's one-commit-per-repo in chunks 5/6.
+# ---------------------------------------------------------------------------
+
+
+def test_repo_root_resolves_from_git_not_a_fixed_parent_count(tmp_path: Path) -> None:
+    """A record nested inside a monorepo package resolves `repo_root` to the real git root.
+
+    `iter_canonical_records` used to derive `repo_root` as
+    `path.parent.parent.parent.parent`, which is the record's containing
+    directory, not the repository root, the moment a record sits somewhere
+    other than exactly `<repo>/docs/superhuman/<slug>/SUPERHUMAN.md`. A
+    fixed-parent-count implementation would report `mono/packages/svc` here;
+    the true git root is `mono`.
+    """
+    mono = tmp_path / "mono"
+    _make_main_checkout(mono)
+    _make_record(mono / "packages" / "svc", "inner-project")
+
+    refs = list(census_mod.iter_canonical_records([tmp_path]))
+    assert len(refs) == 1
+    assert refs[0].repo_root == mono
+    assert refs[0].slug == "inner-project"
+
+
+# ---------------------------------------------------------------------------
+# G6-005-e: a corpus that matches your assumption cannot falsify it --
+# alongside the live-corpus run (never instead of it), a record several
+# levels below a scan root, one the shallow live estate does not exercise.
+# ---------------------------------------------------------------------------
+
+
+def test_record_nested_several_levels_below_scan_root_is_found(tmp_path: Path) -> None:
+    """A record several directories below the scan root is still enumerated (G6-005-e).
+
+    The census's glob is recursive (`**/docs/superhuman/*/SUPERHUMAN.md`),
+    never depth-limited, but nothing in this suite previously exercised a
+    record several levels down -- the shape a depth-limited glob
+    (`*/docs/superhuman/*/SUPERHUMAN.md`) would silently miss without ever
+    failing against today's uniformly shallow corpus.
+    """
+    deep_repo = tmp_path / "a" / "b" / "c" / "d" / "repo"
+    _make_main_checkout(deep_repo)
+    _make_record(deep_repo, "deeply-nested-project")
+
+    refs = list(census_mod.iter_canonical_records([tmp_path]))
+    assert len(refs) == 1
+    assert refs[0].slug == "deeply-nested-project"
+    assert refs[0].repo_root == deep_repo

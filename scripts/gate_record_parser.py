@@ -33,6 +33,32 @@ carries an unrecognised stamp is deliberately NOT folded -- it stays
 malformed and visible, because it is very likely a real, mistyped gate line,
 and folding it away would silently drop the gate the way this project's own
 motivating defect did.
+
+G6-007 correction: the label grammar required the *whole* label to equal
+`G<n>` and only *leading* emphasis was stripped (G4-R3), so a real, richly
+worded label -- `**G8 ACCEPTANCE**`, `G5 (chunk 8, FINAL chunk)`, `G6
+(moderate -- drift)` -- silently failed to register its gate. Measured on the
+live corpus: 8 of 34 records under-reported their true highest gate this
+way, three of them by four gates or more. This is worse than an empty gate
+set: it looks like a real, in-range finding rather than a parse failure. Two
+changes land together, because either alone leaves a hole:
+
+1. `_GATE_LABEL` now matches a gate token at the *head* of the label rather
+   than requiring whole-label equality, and trailing emphasis is stripped
+   alongside leading emphasis. Qualifier text after the token no longer
+   defeats the match.
+2. A permissive disagreement detector runs alongside the grammar,
+   permanently (it is not superseded by widening -- it is the standing
+   safety net for the *next* spelling nobody has anticipated yet). It scans
+   each entry's label -- never its free-text `text`, which routinely cites
+   other gates in prose and would make this fire on nearly every entry --
+   for any `G<n>` token, independent of where the strict grammar requires it
+   to sit. Where that permissive scan finds a higher gate than the grammar
+   resolved for the section, `SectionReading.disagreement` is set and
+   `reported_highest_gate` reports `GATE_UNKNOWN` rather than the lower,
+   confidently-parsed value. An unreadable record is not evidence of a lower
+   state, and a parser that falls back to the best value it managed to read
+   is asserting something it did not observe.
 """
 
 from __future__ import annotations
@@ -65,12 +91,42 @@ GATE_ENTRY = re.compile(
     re.VERBOSE,
 )
 
-#: Matches a gate label after any leading markdown emphasis has been
-#: stripped: `G0`, `G10`, `G6-001`, `G0-pre`.
-_GATE_LABEL = re.compile(r"^G(?P<gate>\d+)(?:-(?P<sub>\d+|pre))?$")
+#: Matches a gate token at the HEAD of a label, after leading/trailing
+#: markdown emphasis has been stripped -- not whole-label equality (G6-007a).
+#: `G0`, `G10`, `G6-001`, `G0-pre` still match in full, but so do
+#: `G8 ACCEPTANCE`, `G5 (chunk 8, FINAL chunk)` and `G6 (moderate -- drift)`:
+#: only the token at the head is captured, and trailing qualifier text plays
+#: no role in whether -- or which -- gate registers. The original
+#: `$`-anchored version silently dropped every one of these (module
+#: docstring, G6-007).
+_GATE_LABEL = re.compile(r"^G(?P<gate>\d+)(?:-(?P<sub>\d+|pre))?\b")
 
 #: Leading bullet/emphasis markers tolerated ahead of a label (G4-R3).
 _LEADING_EMPHASIS = re.compile(r"^[*_]+")
+
+#: Trailing markdown emphasis tolerated after a label (G6-007a) -- the other
+#: half of G4-R3's leading strip. `**G8 ACCEPTANCE**` and `**G3` are both
+#: real corpus shapes; only the leading run was stripped before this change.
+_TRAILING_EMPHASIS = re.compile(r"[*_]+$")
+
+#: Permissive scan for a gate token anywhere in a label, independent of
+#: where `_GATE_LABEL` requires it to sit (G6-007b). This is the standing
+#: safety net for an authored spelling neither the original grammar nor its
+#: G6-007a widening anticipated -- deliberately scoped to `label` alone,
+#: never `text`: free-text rationale routinely cites other gates by number
+#: (this project's own decisions log does it constantly), and scanning it
+#: would make disagreement fire on nearly every entry, defeating the point.
+_PERMISSIVE_GATE_TOKEN = re.compile(r"\bG(\d+)\b")
+
+#: Sentinel `SectionReading.reported_highest_gate` returns when the
+#: permissive detector out-ranks the strict parse (G6-007b): the record
+#: carries textual evidence of a gate the grammar could not confidently
+#: resolve, and reporting the lower, confidently-parsed value would repeat
+#: the exact failure this project exists to eliminate -- asserting a state
+#: that was never actually observed. Distinct from `None` (genuinely no
+#: gate reached): "I could not read this" and "this stopped here" are
+#: different claims.
+GATE_UNKNOWN = "UNKNOWN"
 
 #: A line that opens the next markdown section, terminating the current one.
 _NEXT_HEADING = re.compile(r"^##\s")
@@ -108,10 +164,16 @@ class Entry:
         precision: one of `"full"`, `"minute"`, `"date"`, `"unknown"` --
             how much of the timestamp is known.
         label: the label token as written, with any leading bullet marker
-            and leading markdown emphasis (`*`/`_`) stripped (G4-R3).
+            and leading/trailing markdown emphasis (`*`/`_`) stripped
+            (G4-R3, and trailing as of G6-007a).
         text: the free-text portion following `label: `, verbatim -- an
             `UNKNOWN -- <note>` value is not parsed further.
         raw: the original line, unmodified, kept for diagnostics.
+        permissive_gate: the highest gate token found anywhere in `label`
+            by the permissive scan (G6-007b), independent of `gate`. `None`
+            when the label carries no `G<n>` token at all. Used only to
+            compute `SectionReading.disagreement`; never a substitute for
+            `gate` in gate-presence logic.
     """
 
     gate: int | None
@@ -121,6 +183,7 @@ class Entry:
     label: str
     text: str
     raw: str
+    permissive_gate: int | None
 
 
 def _parse_stamp(raw: str) -> tuple[datetime | None, str | None]:
@@ -196,6 +259,7 @@ def parse_entry(line: str) -> Entry | None:
 
     raw_label = match.group("rawlabel").strip()
     label = _LEADING_EMPHASIS.sub("", raw_label).strip()
+    label = _TRAILING_EMPHASIS.sub("", label).strip()
     gate_match = _GATE_LABEL.match(label)
     if gate_match is not None:
         gate: int | None = int(gate_match.group("gate"))
@@ -203,6 +267,9 @@ def parse_entry(line: str) -> Entry | None:
     else:
         gate = None
         sub = None
+
+    permissive_tokens = [int(token) for token in _PERMISSIVE_GATE_TOKEN.findall(label)]
+    permissive_gate = max(permissive_tokens) if permissive_tokens else None
 
     return Entry(
         gate=gate,
@@ -212,6 +279,7 @@ def parse_entry(line: str) -> Entry | None:
         label=label,
         text=match.group("text"),
         raw=line,
+        permissive_gate=permissive_gate,
     )
 
 
@@ -250,7 +318,16 @@ class SectionReading:
             "file:line: text" (DESIGN error table) without a second
             heading-scan implementation.
         gates: the set of gate ordinals contributed by `entries`.
-        highest_gate: `max(gates)`, or None when no entry names a gate.
+        highest_gate: `max(gates)`, or None when no entry names a gate. This
+            is always the *strict* value -- never downgraded to
+            `GATE_UNKNOWN` even when `disagreement` is True. Use
+            `reported_highest_gate` for the value that respects disagreement.
+        disagreement: whether the permissive scan (G6-007b) found a gate
+            token, in some entry's label, strictly higher than
+            `highest_gate`. True means the section contains textual evidence
+            of a gate the strict grammar did not confidently resolve to that
+            value -- the standing safety net for a spelling neither the
+            original grammar nor its G6-007a widening anticipated.
     """
 
     found: bool
@@ -259,11 +336,23 @@ class SectionReading:
     malformed_at: tuple[int, ...]
     gates: frozenset[int]
     highest_gate: int | None
+    disagreement: bool
 
     @property
     def well_formed(self) -> bool:
         """Whether the section was found and every non-blank line parsed."""
         return self.found and not self.malformed
+
+    @property
+    def reported_highest_gate(self) -> int | str | None:
+        """`highest_gate`, downgraded to `GATE_UNKNOWN` on disagreement (G6-007b).
+
+        Returns:
+            `GATE_UNKNOWN` when `disagreement` is True; otherwise
+            `highest_gate` unchanged (an `int`, or `None` when no gate was
+            named at all).
+        """
+        return GATE_UNKNOWN if self.disagreement else self.highest_gate
 
 
 def _fold_continuation(previous: Entry, continuation_text: str) -> Entry:
@@ -299,6 +388,7 @@ _NOT_FOUND = SectionReading(
     malformed_at=(),
     gates=frozenset(),
     highest_gate=None,
+    disagreement=False,
 )
 
 
@@ -384,6 +474,11 @@ def parse_section(text: str, heading: str) -> SectionReading:
 
     gates = frozenset(entry.gate for entry in entries if entry.gate is not None)
     highest_gate = max(gates) if gates else None
+    permissive_values = [entry.permissive_gate for entry in entries if entry.permissive_gate is not None]
+    permissive_highest = max(permissive_values) if permissive_values else None
+    disagreement = permissive_highest is not None and (
+        highest_gate is None or permissive_highest > highest_gate
+    )
     return SectionReading(
         found=True,
         entries=tuple(entries),
@@ -391,6 +486,7 @@ def parse_section(text: str, heading: str) -> SectionReading:
         malformed_at=tuple(malformed_at),
         gates=gates,
         highest_gate=highest_gate,
+        disagreement=disagreement,
     )
 
 
@@ -497,6 +593,61 @@ def _version_at_least(version: str | None, floor: tuple[int, int, int]) -> bool:
     return tuple(int(part) for part in match.groups()) >= floor
 
 
+# ---------------------------------------------------------------------------
+# Terminal state (FR-16, G6-005) -- "closed, but not completed" is a
+# non-gate ledger entry, not a gate line, and not a front-matter field
+# (G4-R4 keeps the parser scoped to the sections it already reads). No
+# grammar change is required: both spellings below already parse under the
+# existing entry grammar as legal entries; this only reads that parse.
+# ---------------------------------------------------------------------------
+
+_TERMINAL_CLOSED = "closed"
+_TERMINAL_ABORT = "abort"
+
+
+def _entry_terminal_marker(entry: Entry) -> str | None:
+    """Whether one parsed entry is a terminal-state ledger marker (FR-16).
+
+    `ABORT` is recognised both as a bare non-gate label (`ABORT: ...`) and
+    in its existing gate-line spelling -- `G3: ABORT -- PROJECT CLOSED`, the
+    real `memory-sync-evaluation` shape locked at G4-R5 -- so that record
+    needs no rewrite to be understood. A gate-line `ABORT` entry still
+    registers its own gate normally; the two facts (a gate fired, and the
+    project is terminal) are independent and both true at once.
+
+    Args:
+        entry: a successfully parsed `Entry` from either target section.
+
+    Returns:
+        `"abort"`, `"closed"`, or `None` when the entry is neither.
+    """
+    if entry.label == "ABORT" or entry.text.startswith("ABORT"):
+        return _TERMINAL_ABORT
+    if entry.label.startswith("CLOSED"):
+        return _TERMINAL_CLOSED
+    return None
+
+
+def _terminal_state(sections: tuple[SectionReading, ...]) -> str | None:
+    """Scan a record's sections, in order, for the first terminal-state marker.
+
+    Args:
+        sections: the sections to scan, e.g. `(log, locked)`. Both are
+            scanned regardless of the version gate -- terminal state is a
+            project-level ledger event, not a presence-governed one (FR-3
+            governs which section counts *gates*, not this).
+
+    Returns:
+        `"abort"`, `"closed"`, or `None` when no section carries a marker.
+    """
+    for section in sections:
+        for entry in section.entries:
+            marker = _entry_terminal_marker(entry)
+            if marker is not None:
+                return marker
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class RecordReading:
     """Everything FR-2/FR-3 need to know about one project's gate record.
@@ -518,6 +669,13 @@ class RecordReading:
             gate.
         locked: reading of `## Decisions locked` -- present only in some
             records; the presence source at or above the version gate.
+        terminal_state: `"closed"`, `"abort"`, or `None` for an ordinary,
+            non-terminal record (FR-16, G6-005). A closed project never
+            reaches another gate, so a low `highest_gate` on a terminal
+            record means finished, not stalled -- distinguishing the two
+            without string-matching is this field's entire purpose. Neither
+            the predecessor test nor the enforcement path reads this: a
+            closed project has no caller left to exempt.
     """
 
     path: Path
@@ -527,6 +685,18 @@ class RecordReading:
     version_gate: bool
     log: SectionReading
     locked: SectionReading
+    terminal_state: str | None
+
+    @property
+    def gate_disagreement(self) -> bool:
+        """Whether either section's permissive scan out-ranked its strict parse (G6-007b).
+
+        A convenience OR over `log.disagreement` / `locked.disagreement` --
+        the authoritative, per-section computation lives on
+        `SectionReading`. True here means at least one section carries
+        textual evidence of a gate higher than what it confidently parsed.
+        """
+        return self.log.disagreement or self.locked.disagreement
 
 
 def read_record(path: Path) -> RecordReading:
@@ -559,15 +729,19 @@ def read_record(path: Path) -> RecordReading:
             version_gate=False,
             log=empty,
             locked=parse_section("", LOCKED_HEADING),
+            terminal_state=None,
         )
 
     version = _extract_version(text)
+    log_reading = parse_section(text, LOG_HEADING)
+    locked_reading = parse_section(text, LOCKED_HEADING)
     return RecordReading(
         path=path,
         exists=True,
         error=None,
         version=version,
         version_gate=_version_at_least(version, _VERSION_GATE_FLOOR),
-        log=parse_section(text, LOG_HEADING),
-        locked=parse_section(text, LOCKED_HEADING),
+        log=log_reading,
+        locked=locked_reading,
+        terminal_state=_terminal_state((log_reading, locked_reading)),
     )
