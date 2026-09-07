@@ -346,7 +346,8 @@ def _dispatch_subsection_text(file_path: Path) -> str:
 
 class TestSpawnedDispatchSeamContent:
     """TC-20: the granularity rule is stated exactly once, and each new dispatch
-    call-out names the literal `fleet observe dispatch --harness subagent` shape.
+    call-out names the literal
+    `python -m scripts.fleet.cli observe dispatch --harness subagent` shape.
     """
 
     @pytest.mark.parametrize("relative_path", _EDITED_FILES)
