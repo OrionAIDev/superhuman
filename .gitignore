@@ -12,21 +12,32 @@ Thumbs.db
 .worktrees/
 .publication-tokens
 
+# `docs/superhuman/` is a MOUNT POINT, not a directory this repo owns.
+#
 # Per-project superhuman working docs (VISION / REQUIREMENTS / DESIGN / PLAN /
-# TEST / SUPERHUMAN / DECISIONS, and any other per-project notes) stay LOCAL.
-# They record a specific operator's environments, hosts, and internal
-# vocabulary as a matter of course, and this repo is published, so they must
-# never become tracked files. The publication guard in tests/test_content.py
-# scans `git ls-files`, which means an untracked doc is invisible to it by
-# construction — this rule is what keeps it that way, and
+# TEST / SUPERHUMAN / DECISIONS, and any other per-project notes) record a
+# specific operator's environments, hosts, and internal vocabulary as a matter
+# of course. This repo is published, so they must never become tracked files
+# here. They are versioned — just by a different owner: the private repo
+# OrionAIDev/superhuman-project-docs is cloned into this path, and nothing
+# about that clone is visible to this repo. Deliberately a plain nested clone
+# and not a submodule: a submodule would write the private URL into a tracked
+# .gitmodules and hand every public cloner a fetch that 403s. See
+# OrionAIDev/trapezia-roadmap#225.
+#
+# The publication guard in tests/test_content.py scans `git ls-files`, which
+# means untracked content is invisible to it by construction — this rule is
+# what keeps it that way, and
 # tests/test_content.py::test_no_per_project_docs_are_tracked fails the build
-# if one ever slips back in.
+# if anything under here ever becomes tracked (including a gitlink, if someone
+# force-adds the nested clone).
+#
+# The whole directory, not `*/`: the previous rule matched subdirectories only,
+# so a file dropped directly at docs/superhuman/FOO.md was never ignored.
 #
 # Anchored with a leading slash so the synthetic-bug fixture under
 # tests/smoke/.../docs/superhuman/ is unaffected.
-/docs/superhuman/*/
-# Deliberately published, and scrubbed of operator specifics before they were:
-!/docs/superhuman/specs/
+/docs/superhuman/
 
 # Golden POLICY fixtures pin one operator's real environment names and their
 # expected verdicts. ladder-generic.yaml pins mechanism and IS published; these

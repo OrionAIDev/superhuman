@@ -3,7 +3,7 @@
 
 This module is the single decision point for the three questions superhuman asks
 about a developer's deployment topology (design spec
-``docs/superhuman/specs/2026-07-24-portable-profile-and-ladder.md`` §1.2):
+``docs/specs/2026-07-24-portable-profile-and-ladder.md`` §1.2):
 
 1. May an unattended (HITL-M / HITL-L) loop run at this location?
 2. May work land here, and who must approve it?

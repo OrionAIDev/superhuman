@@ -999,15 +999,25 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
 
 
 def test_no_per_project_docs_are_tracked(skill_root: Path) -> None:
-    """Only ``docs/superhuman/specs/`` may be tracked under ``docs/superhuman/``.
+    """Nothing under ``docs/superhuman/`` may be tracked. It is a mount point.
 
     This pins the exact failure that put operator vocabulary into the published
     tree: a project's working docs (VISION / REQUIREMENTS / DESIGN / PLAN /
     TEST / SUPERHUMAN / DECISIONS) were committed under
     ``docs/superhuman/<project>/`` and carried the operator's environment names
-    with them. Those docs are meant to stay local — enforced by the
-    ``/docs/superhuman/*/`` rule in ``.gitignore`` — and ``specs/`` is the one
-    subtree published on purpose (scrubbed first).
+    with them.
+
+    Those docs are versioned, just not here — the private repo
+    ``OrionAIDev/superhuman-project-docs`` is cloned into this path, and the
+    ``/docs/superhuman/`` rule in ``.gitignore`` keeps that clone invisible to
+    this repo. There is no published exception to carve out: specs live at
+    ``docs/specs/`` (see ``test_published_specs_are_tracked``), so the
+    invariant here is simply *empty*.
+
+    A deliberate ``git add -f`` of the nested clone does not slip past this.
+    Git records it as a gitlink — a single index entry ``docs/superhuman`` —
+    and ``git ls-files docs/superhuman/`` returns that entry despite the
+    trailing slash, so it lands in ``offenders`` like any other path.
 
     Unlike ``test_operator_tokens_are_absent``, this needs no token list, so it
     runs in CI on every pull request. It catches the leak by its shape rather
@@ -1016,7 +1026,10 @@ def test_no_per_project_docs_are_tracked(skill_root: Path) -> None:
     Args:
         skill_root: Repository root.
     """
-    tracked = subprocess.run(
+    # ``git ls-files docs/superhuman/`` returns only the repo-root subtree, so
+    # the intentionally-tracked fixture under tests/smoke/.../docs/superhuman/
+    # is out of scope by construction.
+    offenders = subprocess.run(
         ["git", "ls-files", "docs/superhuman/"],
         cwd=skill_root,
         capture_output=True,
@@ -1024,19 +1037,41 @@ def test_no_per_project_docs_are_tracked(skill_root: Path) -> None:
         check=True,
     ).stdout.split()
 
-    # ``git ls-files docs/superhuman/`` returns only the repo-root subtree, so
-    # the intentionally-tracked fixture under tests/smoke/.../docs/superhuman/
-    # is out of scope by construction.
-    offenders = [rel for rel in tracked if not rel.startswith("docs/superhuman/specs/")]
     assert not offenders, (
-        "per-project superhuman docs are tracked in a published repo — untrack "
-        "them (`git rm --cached`); they stay local per the .gitignore rule:\n"
+        "docs/superhuman/ is a mount point for the private "
+        "OrionAIDev/superhuman-project-docs clone — nothing there may be "
+        "tracked in this published repo. Untrack it (`git rm --cached`); if "
+        "this is a gitlink, the nested clone was force-added:\n"
         + "\n".join(f"  {rel}" for rel in offenders)
     )
-    # Guard against a future glob/path change silently matching nothing: the
-    # specs that are supposed to be published must actually be here.
-    assert any(rel.startswith("docs/superhuman/specs/") for rel in tracked), (
-        "expected docs/superhuman/specs/ to be tracked — either the specs were "
+
+
+def test_published_specs_are_tracked(skill_root: Path) -> None:
+    """``docs/specs/`` must be tracked and non-empty.
+
+    The counterpart to ``test_no_per_project_docs_are_tracked``: that one
+    asserts an emptiness, and an emptiness assertion passes just as happily
+    when the paths have silently moved out from under it. This pins the
+    positive half — the specs that are published on purpose (scrubbed of
+    operator specifics first) are actually here.
+
+    They moved from ``docs/superhuman/specs/`` when ``docs/superhuman/`` became
+    a mount point; a published subtree could not stay inside a directory owned
+    by a private repo.
+
+    Args:
+        skill_root: Repository root.
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files", "docs/specs/"],
+        cwd=skill_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+
+    assert tracked, (
+        "expected docs/specs/ to be tracked — either the published specs were "
         "removed or this check is no longer looking where it thinks it is"
     )
 
