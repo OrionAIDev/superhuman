@@ -420,8 +420,16 @@ def test_swept_locked_block_parses_cleanly(fixture_path: Path, tmp_path: Path) -
 # ---------------------------------------------------------------------------
 
 
-def test_ld_style_block_is_repaired_into_canonical_gate_lines() -> None:
-    """`LD-n (G<m>):` becomes a canonical `G<m>:` line; a non-gate `LD-n` keeps its label."""
+def test_ld_style_block_is_repaired_purely_additively() -> None:
+    """Every `LD-n` line gains a `[stamp]` slot and nothing else (G6-006).
+
+    The repair is purely additive: no gate is ever extracted from the
+    parenthetical, every `LD-n` identifier survives, and no sibling line is
+    treated differently from another. `LD-2 (G0)` stays `LD-2 (G0)` -- it
+    does not become a bare `G0:` line -- so the locked block contributes no
+    gates at all, which is the accepted, honest consequence recorded in
+    `DECISIONS.md` G6-006.
+    """
     fixture = FIXTURES_DIR / "ld_style_locked_block.md"
     assert fixture.is_file()
 
@@ -429,14 +437,23 @@ def test_ld_style_block_is_repaired_into_canonical_gate_lines() -> None:
 
     assert proposal.applicable is True
     assert proposal.aborted is False
-    by_gate = {line.gate: line for line in proposal.lines}
-    assert 0 in by_gate and by_gate[0].source == "repaired"
-    assert 1 in by_gate and by_gate[1].source == "repaired"
-    non_gate = [line for line in proposal.lines if line.gate is None]
-    assert any("LD-1" in line.rendered for line in non_gate)
+    repaired = [line for line in proposal.lines if line.source == "repaired"]
+    assert len(repaired) == 3  # LD-1, LD-2, LD-3 in the fixture
+    # Purely additive: no repaired line ever contributes a gate.
+    assert all(line.gate is None for line in repaired)
+    # Every identifier is preserved, including the ones that name a gate.
+    assert any("LD-1" in line.rendered for line in repaired)
+    assert any("LD-2 (G0)" in line.rendered for line in repaired)
+    assert any("LD-3 (G1)" in line.rendered for line in repaired)
     # Wording is preserved verbatim -- only the bullet/bold/stamp scaffolding changes.
-    assert "Elicitation depth = primary + fallback per tier." in by_gate[0].rendered
-    assert "HITL-H, on-divergence cadence, foundation-first" in by_gate[1].rendered
+    by_label = {}
+    for line in repaired:
+        if "LD-2" in line.rendered:
+            by_label["LD-2"] = line.rendered
+        elif "LD-3" in line.rendered:
+            by_label["LD-3"] = line.rendered
+    assert "Elicitation depth = primary + fallback per tier." in by_label["LD-2"]
+    assert "HITL-H, on-divergence cadence, foundation-first" in by_label["LD-3"]
 
 
 def test_a_line_with_no_known_repair_is_left_completely_untouched(tmp_path: Path) -> None:
@@ -1087,7 +1104,12 @@ def test_continuation_line_inside_the_locked_block_is_preserved_verbatim(tmp_pat
 
 
 def test_ld_repair_uses_real_evidence_when_history_differentiates(tmp_path: Path) -> None:
-    """An `LD-n` line's reconstructed stamp is a real commit date when history allows it."""
+    """An `LD-n` line's reconstructed stamp is a real commit date when history allows it.
+
+    The repair stays purely additive (G6-006): the rendered line keeps its
+    `LD-n (G<m>)` identifier verbatim and contributes no gate, even though
+    real git evidence exists for the stamp slot.
+    """
     repo = _init_repo(tmp_path)
     slug = "ld-with-evidence"
     _commit_manifest(
@@ -1110,9 +1132,15 @@ def test_ld_repair_uses_real_evidence_when_history_differentiates(tmp_path: Path
 
     proposal = sweeper.propose(manifest)
 
-    by_gate = {line.gate: line for line in proposal.lines}
-    assert by_gate[0].rendered == "[2026-08-01T00:00:00Z] G0: first locked decision\n"
-    assert by_gate[1].rendered == "[2026-08-02T00:00:00Z] G1: second locked decision\n"
+    repaired = [line for line in proposal.lines if line.source == "repaired"]
+    assert len(repaired) == 2
+    assert all(line.gate is None for line in repaired)
+    rendered_by_id = {}
+    for line in repaired:
+        key = "LD-1" if "LD-1" in line.rendered else "LD-2"
+        rendered_by_id[key] = line.rendered
+    assert rendered_by_id["LD-1"] == "[2026-08-01T00:00:00Z] LD-1 (G0): first locked decision\n"
+    assert rendered_by_id["LD-2"] == "[2026-08-02T00:00:00Z] LD-2 (G1): second locked decision\n"
     assert proposal.unknown_count == 0
 
 

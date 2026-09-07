@@ -54,12 +54,15 @@ what was actually read from disk.
 
 Two shape classes the tolerant grammar deliberately leaves malformed are
 repaired here instead, per `DECISIONS.md` G6-003-b: an OI-3 `LD-n (...):`
-block (`fidelity-provider-setup`'s style) is rewritten into canonical gate
-lines when it names a gate in parentheses, and left as a canonical
-non-gate entry otherwise. A line this module cannot recognise under any
-known repair heuristic is left completely untouched, byte-for-byte --
-FR-8 forbids guessing at a repair as much as it forbids guessing at a
-timestamp.
+block (`fidelity-provider-setup`'s style) has its missing `[stamp]` slot
+added and its bullet/bold-wrap scaffolding normalised away. Per the G6-006
+correction, this repair is purely additive -- every `LD-n` identifier is
+preserved and no gate is ever extracted from the parenthetical, even when
+it names one (`"(G0)"`), because doing so would delete information the
+monotone rule (G6-004) forbids deleting. A line this module cannot
+recognise under any known repair heuristic is left completely untouched,
+byte-for-byte -- FR-8 forbids guessing at a repair as much as it forbids
+guessing at a timestamp.
 
 This module owns no new entry-line grammar (FR-1's single owner is
 `gate_record_parser.py`): every gate-shaped line here is still parsed with
@@ -131,10 +134,6 @@ _LD_LINE = re.compile(
     """,
     re.VERBOSE,
 )
-
-#: Matches a parenthetical that names exactly one gate, e.g. `"G0"`.
-_PAREN_GATE = re.compile(r"^G(\d+)$")
-
 
 # ---------------------------------------------------------------------------
 # Fence-aware section-boundary detection (see module docstring)
@@ -475,14 +474,22 @@ def _normalise_entry_line(content: str, entry: gate_record_parser.Entry, evidenc
 
 
 def _try_ld_repair(content: str, evidence: _Evidence) -> tuple[str, int | None, bool] | None:
-    """Best-effort repair for the OI-3 `LD-n (...):` shape (G6-003-b).
+    """Purely additive repair for the OI-3 `LD-n (...):` shape (G6-003-b, ruled G6-006).
 
-    A parenthetical naming exactly one gate (`"(G0)"`) becomes that gate's
-    canonical label; anything else (`"(immutable, from invocation)"`, or no
-    parenthetical at all) is preserved verbatim as part of a non-gate
-    label, so no wording is invented or dropped -- only the missing
-    `[stamp]` slot is added and the `LD-n` bullet/bold-wrap scaffolding is
-    normalised away.
+    Adds the missing `[stamp]` slot and normalises away the `LD-n`
+    bullet/bold-wrap scaffolding -- nothing else. The parenthetical (e.g.
+    `"(G0)"`, `"(immutable, from invocation)"`, or none at all) is always
+    preserved verbatim as part of the `LD-n` label; it is never parsed out
+    to surface a bare `G<n>:` line. Every sibling `LD-n` line is treated
+    identically regardless of what its parenthetical happens to say, and
+    every `LD-n` identifier survives the sweep -- the monotone rule (G6-004)
+    forbids removing information, and dropping the identifier to promote a
+    line to a gate line is a removal, not an addition.
+
+    The accepted consequence: a repaired line never contributes a gate
+    (`gate` is always `None`), even when its parenthetical names one. That
+    is honest, not lossy -- see `DECISIONS.md` G6-006 for why this record's
+    gate history was never going to be read from this block regardless.
 
     Args:
         content: the original line, trailing newline already removed.
@@ -495,10 +502,11 @@ def _try_ld_repair(content: str, evidence: _Evidence) -> tuple[str, int | None, 
     shape, unlike an already-stamped `GATE_ENTRY` line.
 
     Returns:
-        `(rendered_line, gate, is_unknown)`, or `None` when `content` does
-        not match the known `LD-n` shape at all -- callers must then leave
-        the line completely untouched rather than guess at a repair
-        (FR-8 forbids guessing at a repair as much as at a timestamp).
+        `(rendered_line, gate, is_unknown)` with `gate` always `None`, or
+        `None` when `content` does not match the known `LD-n` shape at all
+        -- callers must then leave the line completely untouched rather
+        than guess at a repair (FR-8 forbids guessing at a repair as much
+        as at a timestamp).
     """
     match = _LD_LINE.match(content)
     if match is None:
@@ -506,19 +514,13 @@ def _try_ld_repair(content: str, evidence: _Evidence) -> tuple[str, int | None, 
 
     paren = (match.group("paren") or "").strip()
     text = match.group("text").strip()
-    gate_match = _PAREN_GATE.match(paren)
-    if gate_match is not None:
-        gate: int | None = int(gate_match.group(1))
-        label = f"G{gate}"
-    else:
-        gate = None
-        label = f"LD-{match.group('num')}" + (f" ({paren})" if paren else "")
+    label = f"LD-{match.group('num')}" + (f" ({paren})" if paren else "")
 
     stamp = evidence.by_raw_text.get(content.strip()) if evidence.has_differentiation else None
     is_unknown = stamp is None
     rendered_stamp = stamp if stamp is not None else UNKNOWN_STAMP
     rendered = f"[{rendered_stamp}] {label}: {text}" if text else f"[{rendered_stamp}] {label}:"
-    return rendered, gate, is_unknown
+    return rendered, None, is_unknown
 
 
 @dataclass(frozen=True, slots=True)
