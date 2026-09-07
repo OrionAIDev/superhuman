@@ -16,6 +16,7 @@ directs.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -783,24 +784,28 @@ def test_default_invocation_without_dry_run_flag_still_writes_nothing(tmp_path: 
     assert manifest.read_bytes() == before_bytes
 
 
-def test_apply_flag_refuses_and_writes_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """`--apply` is inert in this chunk: it refuses and never touches the file."""
+def test_apply_flag_writes_the_record_via_the_backup_then_write_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--apply` is live from chunk 4: it backs up, then writes, and reports success (D-4/G6-004-d)."""
     repo = _init_repo(tmp_path)
-    slug = "apply-refused-project"
+    slug = "apply-writes-project"
     manifest = _commit_manifest(
         repo,
         slug,
-        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
-        "2026-08-01T00:00:00+00:00",
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
     )
     before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+    monkeypatch.setattr(sweeper, "_default_backup_root", lambda: backup_root)
 
     exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--apply"])
 
-    assert exit_code != 0
-    assert manifest.read_bytes() == before_bytes
+    assert exit_code == 0
+    assert manifest.read_bytes() != before_bytes
     captured = capsys.readouterr()
-    assert "not available" in captured.err or "refus" in captured.err.lower()
+    assert "applied" in captured.out.lower()
 
 
 def test_dry_run_and_apply_are_mutually_exclusive() -> None:
@@ -1181,3 +1186,418 @@ def test_cli_reports_no_changes_when_the_block_is_already_normalised(
     assert exit_code == 0
     assert manifest.read_bytes() == before_bytes
     assert "no changes proposed" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Chunk 4: the write path (`apply()` / `--apply`) -- backup, verify, overwrite.
+#
+# DECISIONS.md G6-004-d: for records with no git history to revert to (this
+# repo's own, `.gitignore`d), the backup directory is the ONLY recovery
+# mechanism that exists -- so it must fail closed on any backup failure,
+# never overwrite the real file before the backup is written AND verified
+# byte-identical, and never write anything at all for a proposal with
+# nothing to change.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_backs_up_before_overwriting(tmp_path: Path) -> None:
+    """`apply()` writes a full-file, byte-identical backup, then overwrites the record."""
+    repo = _init_repo(tmp_path)
+    slug = "apply-writes"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
+    )
+    original_bytes = manifest.read_bytes()
+    expected_proposed_text = sweeper.propose(manifest).proposed_text
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, slug, run_id="run-1", backup_root=backup_root)
+
+    assert result.outcome == "applied"
+    assert result.wrote is True
+    assert result.backup_path is not None
+    assert result.backup_path.is_file()
+    assert result.backup_path.read_bytes() == original_bytes
+    assert manifest.read_text(encoding="utf-8") == expected_proposed_text
+    assert manifest.read_bytes() != original_bytes
+
+
+def test_apply_on_unchanged_record_is_a_noop(tmp_path: Path) -> None:
+    """An already-normalised record is a no-op: nothing written, nothing backed up."""
+    repo = _init_repo(tmp_path)
+    slug = "already-normalised"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n[2026-08-16T21:08:00Z] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T21:08:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    before_mtime = manifest.stat().st_mtime_ns
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, slug, run_id="run-noop", backup_root=backup_root)
+
+    assert result.outcome == "unchanged"
+    assert result.wrote is False
+    assert result.backup_path is None
+    assert manifest.read_bytes() == before_bytes
+    assert manifest.stat().st_mtime_ns == before_mtime
+    assert not backup_root.exists()
+
+
+def test_apply_on_record_with_no_locked_block_is_a_noop(tmp_path: Path) -> None:
+    """A record with only `## Decisions log` is not applicable -- no write, no backup."""
+    repo = _init_repo(tmp_path)
+    slug = "no-locked-block-apply"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions log\n[2026-08-01T00:00:00Z] G0: baseline\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, slug, run_id="run-na", backup_root=backup_root)
+
+    assert result.outcome == "not_applicable"
+    assert result.wrote is False
+    assert result.backup_path is None
+    assert manifest.read_bytes() == before_bytes
+    assert not backup_root.exists()
+
+
+def test_apply_never_writes_a_proposal_that_would_touch_bytes_outside_the_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A proposal FR-9 would abort (bytes outside the block would change) is never written.
+
+    `_propose_from_text` is monkeypatched to simulate the FR-9-violation
+    outcome directly -- `propose()` itself cannot produce it through the
+    public API (the boundary it guards against is structurally unreachable
+    given how the block is sliced), exactly as the existing dry-run
+    equivalent (`test_cli_surfaces_an_aborted_proposal_and_writes_nothing`)
+    already does for the read-only path.
+    """
+    repo = _init_repo(tmp_path)
+    slug = "aborted-apply"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+
+    def _fake_propose_from_text(path: Path, original_text: str) -> sweeper.Proposal:
+        return sweeper._aborted(path, original_text, "simulated FR-9 violation")
+
+    monkeypatch.setattr(sweeper, "_propose_from_text", _fake_propose_from_text)
+
+    result = sweeper.apply(repo, slug, run_id="run-abort", backup_root=backup_root)
+
+    assert result.outcome == "aborted"
+    assert result.wrote is False
+    assert result.backup_path is None
+    assert manifest.read_bytes() == before_bytes
+    assert not backup_root.exists()
+
+
+def test_apply_fails_closed_when_the_backup_cannot_be_written(tmp_path: Path) -> None:
+    """A genuine backup-write failure (a colliding path) aborts before the record is touched.
+
+    The collision is real, not simulated: a plain file sits where the
+    backup's own parent directory needs to be created, so
+    `Path.mkdir(parents=True)` raises a real `OSError` -- the fail-closed
+    path this test exercises is the one `apply()` actually hits, not a
+    monkeypatched stand-in.
+    """
+    repo = _init_repo(tmp_path)
+    slug = "backup-fails"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+    repo_slug_safe = sweeper._repo_slug_safe(repo)
+    collision = backup_root / "run-fail" / "files" / f"{repo_slug_safe}__{slug}"
+    collision.parent.mkdir(parents=True)
+    collision.write_text("a plain file where the backup directory must go")
+
+    result = sweeper.apply(repo, slug, run_id="run-fail", backup_root=backup_root)
+
+    assert result.outcome == "backup_failed"
+    assert result.wrote is False
+    assert manifest.read_bytes() == before_bytes
+
+
+def test_apply_on_missing_record_reports_read_failed(tmp_path: Path) -> None:
+    """A `--repo`/`--slug` pair with no `SUPERHUMAN.md` fails closed, not a crash."""
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, "nothing-here", backup_root=backup_root)
+
+    assert result.outcome == "read_failed"
+    assert result.wrote is False
+    assert result.backup_path is None
+    assert not backup_root.exists()
+
+
+def test_apply_writes_a_manifest_entry_for_the_backed_up_record(tmp_path: Path) -> None:
+    """A successful apply appends `{repo_root, slug, path, backed_up_at, pre_backup_head_sha}` to manifest.json."""
+    repo = _init_repo(tmp_path)
+    slug = "manifest-entry"
+    manifest_file = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
+    )
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, slug, run_id="run-manifest", backup_root=backup_root)
+
+    assert result.outcome == "applied"
+    manifest_json = backup_root / "run-manifest" / "manifest.json"
+    assert manifest_json.is_file()
+    entries = json.loads(manifest_json.read_text(encoding="utf-8"))
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["slug"] == slug
+    assert entry["path"] == str(manifest_file)
+    assert entry["repo_root"] == str(repo.resolve())
+    assert entry["backed_up_at"].endswith("Z")
+    assert entry["pre_backup_head_sha"]  # the disposable repo has a real HEAD commit
+
+
+def test_write_and_verify_backup_succeeds_for_matching_bytes(tmp_path: Path) -> None:
+    """The low-level backup helper writes and reads back byte-identical content."""
+    backup_path = tmp_path / "backups" / "run" / "files" / "r__s" / "SUPERHUMAN.md"
+    sweeper._write_and_verify_backup(backup_path, b"hello world")
+    assert backup_path.read_bytes() == b"hello world"
+
+
+def test_write_and_verify_backup_raises_on_a_corrupted_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A write that silently corrupts (read-back != what was requested) raises, never returns quietly."""
+    backup_path = tmp_path / "backups" / "run" / "files" / "r__s" / "SUPERHUMAN.md"
+    real_write_bytes = Path.write_bytes
+
+    def _corrupting_write_bytes(self: Path, data: bytes) -> int:
+        return real_write_bytes(self, data + b"\ncorruption")
+
+    monkeypatch.setattr(Path, "write_bytes", _corrupting_write_bytes)
+
+    with pytest.raises(sweeper.BackupVerificationError):
+        sweeper._write_and_verify_backup(backup_path, b"original content")
+
+
+def test_repo_slug_safe_is_filesystem_safe_and_deterministic(tmp_path: Path) -> None:
+    """`_repo_slug_safe` strips path separators/colons and is stable for the same repo."""
+    safe = sweeper._repo_slug_safe(tmp_path)
+    assert "/" not in safe and "\\" not in safe and ":" not in safe
+    assert safe == sweeper._repo_slug_safe(tmp_path)
+
+
+def test_apply_cli_reports_backup_failure_and_exits_nonzero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI surfaces a fail-closed backup error distinctly, and exits non-zero."""
+    repo = _init_repo(tmp_path)
+    slug = "cli-backup-fails"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+    repo_slug_safe = sweeper._repo_slug_safe(repo)
+    collision = backup_root / "will-collide" / "files" / f"{repo_slug_safe}__{slug}"
+    collision.parent.mkdir(parents=True)
+    collision.write_text("blocks the backup directory")
+    monkeypatch.setattr(sweeper, "_default_backup_root", lambda: backup_root)
+    monkeypatch.setattr(sweeper, "_new_run_id", lambda: "will-collide")
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--apply"])
+
+    assert exit_code != 0
+    assert manifest.read_bytes() == before_bytes
+    assert "backup" in capsys.readouterr().err.lower()
+
+
+def test_apply_cli_reports_unchanged_record_without_writing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--apply` on an already-normalised record reports the no-op and writes nothing."""
+    repo = _init_repo(tmp_path)
+    slug = "cli-unchanged"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n[2026-08-16T21:08:00Z] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T21:08:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+    monkeypatch.setattr(sweeper, "_default_backup_root", lambda: backup_root)
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--apply"])
+
+    assert exit_code == 0
+    assert manifest.read_bytes() == before_bytes
+    assert "no changes applied" in capsys.readouterr().out.lower()
+
+
+def test_apply_cli_reports_read_failed_for_a_missing_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--apply` against a nonexistent record exits non-zero and names the reason."""
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", "nothing-here", "--apply"])
+
+    assert exit_code == 1
+    assert "cannot read" in capsys.readouterr().err.lower()
+
+
+def test_apply_cli_reports_not_applicable_without_writing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--apply` on a record with no `## Decisions locked` block reports the no-op via the CLI."""
+    repo = _init_repo(tmp_path)
+    slug = "cli-not-applicable"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions log\n[2026-08-01T00:00:00Z] G0: baseline\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--apply"])
+
+    assert exit_code == 0
+    assert manifest.read_bytes() == before_bytes
+    assert "nothing to apply" in capsys.readouterr().out.lower()
+
+
+def test_apply_cli_reports_an_aborted_proposal_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--apply` surfaces an FR-9 abort exactly as the dry-run CLI path already does."""
+    repo = _init_repo(tmp_path)
+    slug = "cli-aborted"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+
+    def _fake_propose_from_text(path: Path, original_text: str) -> sweeper.Proposal:
+        return sweeper._aborted(path, original_text, "simulated FR-9 violation")
+
+    monkeypatch.setattr(sweeper, "_propose_from_text", _fake_propose_from_text)
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--apply"])
+
+    assert exit_code == 1
+    assert manifest.read_bytes() == before_bytes
+    assert "ABORTED" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Backup-layer helper coverage: `_default_backup_root`, `_long_path`, `_head_sha`,
+# and the corrupted-manifest.json fallback in `_append_manifest_entry`.
+# ---------------------------------------------------------------------------
+
+
+def test_default_backup_root_points_under_home_dot_superhuman() -> None:
+    """The real default (no override) is `~/.superhuman/gate-record-backups`."""
+    assert sweeper._default_backup_root() == Path.home() / ".superhuman" / "gate-record-backups"
+
+
+def test_long_path_is_a_noop_on_a_non_windows_platform(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`_long_path` never rewrites a path on a platform without the MAX_PATH limitation."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    target = tmp_path / "SUPERHUMAN.md"
+    assert sweeper._long_path(target) == target
+
+
+def test_long_path_is_idempotent_when_already_prefixed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path that already carries the `\\\\?\\` prefix is returned unchanged."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    already_prefixed = Path("\\\\?\\C:\\already\\prefixed")
+    assert sweeper._long_path(already_prefixed) == already_prefixed
+
+
+def test_long_path_absolutises_a_relative_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A relative path is made absolute before the `\\\\?\\` prefix is applied."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    result = sweeper._long_path(Path("relative") / "x.md")
+    text = str(result)
+    assert text.startswith("\\\\?\\")
+    assert "relative" in text
+    assert "/" not in text[4:]
+
+
+def test_head_sha_returns_none_when_git_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A `git` invocation failure (missing binary, etc.) is `None`, not a crash."""
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise OSError("git not found")
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    assert sweeper._head_sha(tmp_path) is None
+
+
+def test_head_sha_returns_none_for_a_repo_with_no_commits(tmp_path: Path) -> None:
+    """A freshly `git init`ed repo with no commits yet has no `HEAD` -- `None`, not a crash."""
+    repo = _init_repo(tmp_path)
+    assert sweeper._head_sha(repo) is None
+
+
+def test_head_sha_returns_the_real_sha_for_a_repo_with_a_commit(tmp_path: Path) -> None:
+    """`_head_sha` returns the actual `HEAD` SHA when one exists."""
+    repo = _init_repo(tmp_path)
+    _commit_manifest(
+        repo, "some-slug", "## Decisions log\n[2026-08-01T00:00:00Z] G0: x\n", "2026-08-01T00:00:00+00:00"
+    )
+    sha = sweeper._head_sha(repo)
+    assert sha is not None
+    log = subprocess.run(
+        ["git", "log", "--pretty=format:%H"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout
+    assert sha in log
+
+
+def test_append_manifest_entry_recovers_from_a_corrupted_manifest_json(tmp_path: Path) -> None:
+    """A pre-existing but corrupted `manifest.json` is treated as empty, not a crash."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text("{ this is not valid json", encoding="utf-8")
+    repo = _init_repo(tmp_path)
+    manifest_file = _commit_manifest(
+        repo, "some-slug", "## Decisions log\n[2026-08-01T00:00:00Z] G0: x\n", "2026-08-01T00:00:00+00:00"
+    )
+
+    sweeper._append_manifest_entry(run_dir, repo, "some-slug", manifest_file)
+
+    entries = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert len(entries) == 1
+    assert entries[0]["slug"] == "some-slug"

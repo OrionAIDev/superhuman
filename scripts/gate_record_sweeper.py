@@ -1,4 +1,4 @@
-"""FR-7/FR-8/FR-9 gate-record sweeper: propose repairs, never apply them (chunk 3).
+"""FR-7/FR-8/FR-9/FR-10 gate-record sweeper: propose repairs, and (chunk 4+) apply them.
 
 This module reconstructs each gate line's real time from the record's own
 `git log -p` history (FR-7) and proposes a normalised `## Decisions
@@ -29,13 +29,19 @@ against a population nobody has audited line by line. It never rewrites a
 decision's wording, because wording is not something git evidence can
 adjudicate (DESIGN's Sweep data flow).
 
-Chunk 3 is dry-run only: :func:`propose` never writes to disk, and the CLI
-below wires `--dry-run` as the only working mode. `--apply` is defined so
-its final shape is visible now, but it unconditionally refuses -- writing
-across ~18 repos, one of them PHI-adjacent, is chunk 4's responsibility,
-after the diffs this chunk renders have been reviewed (DESIGN's Foundation
-decision: "applying repairs ... before the diffs have been reviewed is not
-refactorable, only revertible").
+:func:`propose` never writes to disk -- it is the pure half of this module,
+used by both `--dry-run` and `--apply`. :func:`apply` is the write path,
+wired to the CLI's `--apply` flag: it backs up the record, verifies the
+backup is readable and byte-identical to the source, and only then
+overwrites the record -- failing closed (no write at all) if the backup
+step fails for any reason (`DECISIONS.md` G6-004-d). For this repo's own
+six records the backup is not belt-and-braces -- they are `.gitignore`d, so
+there is no git history to revert to, and the backup under
+`~/.superhuman/gate-record-backups/<run-id>/` is the only recovery
+mechanism that exists. `apply()` on a record with nothing to change (not
+applicable, already normalised, or aborted under FR-9) is a no-op: no
+backup is written and the record is never touched, because there is
+nothing to back up.
 
 FR-9 is a hard invariant, not a warning: every byte outside the matched
 `## Decisions locked` block must be identical before and after. This
@@ -71,6 +77,8 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
+import os
 import re
 import subprocess
 import sys
@@ -785,6 +793,24 @@ def propose(path: Path) -> Proposal:
     """
     raw_bytes = path.read_bytes()
     original_text = raw_bytes.decode("utf-8", errors="replace")
+    return _propose_from_text(path, original_text)
+
+
+def _propose_from_text(path: Path, original_text: str) -> Proposal:
+    """The pure half of :func:`propose`: build a `Proposal` from already-read text.
+
+    Split out so :func:`apply` can read the file's raw bytes exactly once
+    (for the backup) and reuse that same read for proposal construction,
+    rather than reading the file twice.
+
+    Args:
+        path: the `SUPERHUMAN.md` path this proposal targets (used only for
+            labelling the result; not re-read here).
+        original_text: the file's full text, already decoded.
+
+    Returns:
+        A `Proposal`. Never touches disk.
+    """
     lines = original_text.splitlines(keepends=True)
 
     bounds = _find_section_bounds(lines, gate_record_parser.LOCKED_HEADING)
@@ -839,6 +865,294 @@ def propose(path: Path) -> Proposal:
         unknown_count=unknown_count,
         lines=tuple(proposed_lines),
     )
+
+
+# ---------------------------------------------------------------------------
+# The write path (`apply()`, chunk 4): backup, verify, THEN overwrite.
+#
+# `DECISIONS.md` G6-004-d: for a `.gitignore`d record there is no git
+# history to revert to, so the local backup this section writes is not
+# belt-and-braces -- it is the only recovery mechanism that exists. The
+# mandatory order is: (1) compute the proposal, (2) if there is nothing to
+# write, stop -- no backup, no write; (3) otherwise write a full-file
+# pre-write backup; (4) verify the backup is readable and byte-identical to
+# the source; (5) only then overwrite the real file. Any failure at (3) or
+# (4) fails closed -- the real file is never touched.
+# ---------------------------------------------------------------------------
+
+
+class BackupVerificationError(Exception):
+    """Raised when a written backup does not read back byte-identical to the source."""
+
+
+#: `~/.superhuman/gate-record-backups` -- deliberately outside every git
+#: repo (this repo included), so a backup of a private repo's record can
+#: never land inside a tree this public repo could ever `git add` (TEST.md
+#: §8). A function, not a module-level constant, so tests can monkeypatch it
+#: without touching the real home directory.
+def _default_backup_root() -> Path:
+    """Return the default backup root, `~/.superhuman/gate-record-backups`.
+
+    Returns:
+        The default backup root path. Does not create it.
+    """
+    return Path.home() / ".superhuman" / "gate-record-backups"
+
+
+#: Characters unsafe (or merely inconvenient) in a filesystem path segment,
+#: collapsed to a single underscore.
+_UNSAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _repo_slug_safe(repo: Path) -> str:
+    """Filesystem-safe, deterministic encoding of a repo root for the backup layer.
+
+    Mirrors NFR-7's `(repo_root, slug)` identity rule inside the backup
+    layer too, so the same collision risk (two repos sharing a bare name)
+    does not recur one layer up (TEST.md §8).
+
+    Args:
+        repo: repository root.
+
+    Returns:
+        `repo`'s resolved absolute path with every path separator, drive
+        colon, and other filesystem-unsafe character collapsed to `_`.
+    """
+    resolved = str(Path(repo).resolve())
+    return _UNSAFE_PATH_CHARS.sub("_", resolved).strip("_")
+
+
+def _long_path(path: Path) -> Path:
+    """Return `path`, prefixed for the Windows extended-length namespace when needed.
+
+    Windows refuses to create or open a path longer than `MAX_PATH` (260
+    characters) unless it carries the `\\\\?\\` device-namespace prefix.
+    The backup layer's repo-root-flattened directory names (`TEST.md` §8)
+    combined with an already-deep `backup_root` can push a backup path over
+    that limit even when the record's own path is short and opens fine --
+    this keeps the write path robust without changing the on-disk layout
+    the design specifies.
+
+    Args:
+        path: the path about to be created, written, or read.
+
+    Returns:
+        `path` unchanged on any non-Windows platform, or unchanged if
+        already prefixed; otherwise the same absolute path with `\\\\?\\`
+        prepended.
+    """
+    if sys.platform != "win32":
+        return path
+    text = str(path)
+    if text.startswith("\\\\?\\"):
+        return path
+    if not os.path.isabs(text):
+        text = str(Path(text).absolute())
+    return Path("\\\\?\\" + text.replace("/", "\\"))
+
+
+def _backup_file_path(run_dir: Path, repo: Path, slug: str) -> Path:
+    """Return `<run_dir>/files/<repo-slug-safe>__<slug>/SUPERHUMAN.md` (TEST.md §8 layout).
+
+    Args:
+        run_dir: `<backup_root>/<run_id>`.
+        repo: repository root.
+        slug: project slug.
+
+    Returns:
+        The backup file's path. Does not create it.
+    """
+    return run_dir / "files" / f"{_repo_slug_safe(repo)}__{slug}" / "SUPERHUMAN.md"
+
+
+def _write_and_verify_backup(backup_path: Path, raw_bytes: bytes) -> None:
+    """Write `raw_bytes` to `backup_path`, then re-read and verify byte-identity.
+
+    This is the fail-closed core of the write path: a caller must not
+    proceed to overwrite the real file unless this function returns without
+    raising.
+
+    Args:
+        backup_path: where to write the backup.
+        raw_bytes: the exact bytes read from the source record.
+
+    Raises:
+        OSError: the backup directory or file could not be created/written
+            (disk full, permission denied, a colliding path).
+        BackupVerificationError: the backup was written but reading it back
+            produced different bytes than `raw_bytes`.
+    """
+    long_backup_path = _long_path(backup_path)
+    long_backup_path.parent.mkdir(parents=True, exist_ok=True)
+    long_backup_path.write_bytes(raw_bytes)
+    read_back = long_backup_path.read_bytes()
+    if read_back != raw_bytes:
+        raise BackupVerificationError(
+            f"backup at {backup_path} is not byte-identical to the source after being written"
+        )
+
+
+def _head_sha(repo: Path) -> str | None:
+    """Return `repo`'s current `HEAD` commit SHA, or `None` when unavailable.
+
+    Best-effort diagnostic metadata for `manifest.json` only -- `apply`
+    never depends on this succeeding (a `.gitignore`d record's own repo
+    still has a `HEAD`, even though the record itself was never committed).
+
+    Args:
+        repo: repository root.
+
+    Returns:
+        The full `HEAD` SHA, or `None` if `repo` is not a git repository,
+        has no commits yet, or `git` is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _new_run_id() -> str:
+    """Generate a fresh backup run identifier: a UTC timestamp at microsecond precision.
+
+    Returns:
+        A filesystem-safe run id, e.g. `"20260906T235959123456Z"`.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _append_manifest_entry(run_dir: Path, repo: Path, slug: str, path: Path) -> None:
+    """Append this record's backup metadata to `<run_dir>/manifest.json`.
+
+    Args:
+        run_dir: `<backup_root>/<run_id>`.
+        repo: repository root.
+        slug: project slug.
+        path: the record's own path (not the backup copy).
+    """
+    long_run_dir = _long_path(run_dir)
+    long_run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = long_run_dir / "manifest.json"
+    entries: list[dict[str, str | None]] = []
+    if manifest_path.is_file():
+        try:
+            entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            entries = []
+    entries.append(
+        {
+            "repo_root": str(Path(repo).resolve()),
+            "slug": slug,
+            "path": str(path),
+            "backed_up_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "pre_backup_head_sha": _head_sha(repo),
+        }
+    )
+    manifest_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyResult:
+    """The outcome of one `apply()` invocation against a single record.
+
+    Attributes:
+        path: the `SUPERHUMAN.md` path targeted.
+        run_id: the backup run identifier used for this invocation.
+        wrote: whether the target file was actually overwritten.
+        backup_path: where the pre-write backup was written, or `None` when
+            no write occurred (there was nothing to back up).
+        outcome: one of `"read_failed"` (the record could not be read),
+            `"not_applicable"` (no `## Decisions locked` block),
+            `"unchanged"` (already normalised -- a no-op), `"aborted"`
+            (FR-9's guarantee could not be verified -- refused before any
+            write), `"backup_failed"` (fail-closed: the backup could not be
+            written or verified -- refused before any write), or
+            `"applied"` (the backup was written, verified, and the record
+            overwritten).
+        detail: a human-readable explanation, or `None` when `outcome` is
+            self-explanatory (`"unchanged"`, `"applied"`).
+    """
+
+    path: Path
+    run_id: str
+    wrote: bool
+    backup_path: Path | None
+    outcome: str
+    detail: str | None
+
+
+def apply(
+    repo: Path,
+    slug: str,
+    *,
+    run_id: str | None = None,
+    backup_root: Path | None = None,
+) -> ApplyResult:
+    """Apply the sweep's proposed repair to one record: backup, verify, THEN overwrite.
+
+    Mandatory order (`DECISIONS.md` G6-004-d): read the record once; if
+    there is nothing to change (not applicable, already normalised, or the
+    proposal was aborted under FR-9), stop -- no backup, no write, the real
+    file is never touched. Otherwise write a full-file backup of the
+    pre-write bytes, verify it reads back byte-identical
+    (`_write_and_verify_backup`), and only then overwrite the record. Any
+    backup failure -- write error or verification mismatch -- fails closed:
+    the record is left exactly as it was.
+
+    Args:
+        repo: repository root containing the target project.
+        slug: project slug (`docs/superhuman/<slug>/SUPERHUMAN.md`).
+        run_id: backup run identifier; a fresh one is generated when
+            omitted.
+        backup_root: root of the backup tree; defaults to
+            `_default_backup_root()` (overridable for tests, so tests never
+            touch the real `~/.superhuman/gate-record-backups`).
+
+    Returns:
+        An `ApplyResult` describing what happened. Never raises for an
+        ordinary failure mode (unreadable record, backup failure) -- those
+        are reported in the result, not as an exception.
+    """
+    manifest = _project_manifest(repo, slug)
+    run_id = run_id if run_id is not None else _new_run_id()
+    backup_root = backup_root if backup_root is not None else _default_backup_root()
+
+    try:
+        raw_bytes = manifest.read_bytes()
+    except OSError as exc:
+        return ApplyResult(manifest, run_id, False, None, "read_failed", str(exc))
+
+    proposal = _propose_from_text(manifest, raw_bytes.decode("utf-8", errors="replace"))
+
+    if not proposal.applicable:
+        return ApplyResult(manifest, run_id, False, None, "not_applicable", proposal.skipped_reason)
+    if proposal.aborted:
+        return ApplyResult(manifest, run_id, False, None, "aborted", proposal.abort_reason)
+    if not proposal.changed:
+        return ApplyResult(manifest, run_id, False, None, "unchanged", None)
+
+    run_dir = backup_root / run_id
+    backup_path = _backup_file_path(run_dir, repo, slug)
+    try:
+        _write_and_verify_backup(backup_path, raw_bytes)
+    except (OSError, BackupVerificationError) as exc:
+        return ApplyResult(manifest, run_id, False, None, "backup_failed", str(exc))
+
+    _append_manifest_entry(run_dir, repo, slug, manifest)
+
+    manifest.write_bytes(proposal.proposed_text.encode("utf-8"))
+
+    return ApplyResult(manifest, run_id, True, backup_path, "applied", None)
 
 
 # ---------------------------------------------------------------------------
@@ -904,9 +1218,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help=(
-            "Reserved for a later chunk. Writing across the corpus is "
-            "gated on review of the dry-run diffs, so this refuses "
-            "unconditionally in this build."
+            "Write the proposed repair: back up the record, verify the "
+            "backup, then overwrite it. Fails closed -- refuses to write "
+            "if the backup cannot be written and verified first."
         ),
     )
     return parser
@@ -915,18 +1229,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the sweeper CLI.
 
-    `--apply` is defined for shape but always refuses in this chunk
-    (DESIGN's Foundation decision: applying repairs before the diffs have
-    been reviewed is not refactorable, only revertible). Every other path
-    only reads the target file and prints; it never writes.
+    `--dry-run` (the default) only reads the target file and prints the
+    proposed diff; it never writes. `--apply` writes: it backs up the
+    record, verifies the backup, then overwrites the record -- and fails
+    closed (refuses to write) if the backup cannot be written and verified
+    first (`DECISIONS.md` G6-004-d).
 
     Args:
         argv: command-line arguments, or `None` to use `sys.argv[1:]`.
 
     Returns:
-        `0` on a successful dry run (including "nothing to propose" and
-        "already normalised"); `1` when `--apply` was requested, the
-        target file could not be read, or a record was aborted under FR-9.
+        `0` on success -- a dry run (including "nothing to propose" and
+        "already normalised") or a completed/no-op apply; `1` when the
+        target file could not be read, a record was aborted under FR-9, or
+        (`--apply` only) the backup could not be written and verified.
     """
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -936,13 +1252,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.apply:
+        result = apply(Path(args.repo), args.slug)
+        if result.outcome == "read_failed":
+            print(f"gate-record-sweeper: cannot read {result.path}: {result.detail}", file=sys.stderr)
+            return 1
+        if result.outcome == "not_applicable":
+            print(f"gate-record-sweeper: {result.path}: {result.detail} -- nothing to apply")
+            return 0
+        if result.outcome == "aborted":
+            print(f"gate-record-sweeper: {result.path}: ABORTED -- {result.detail}", file=sys.stderr)
+            return 1
+        if result.outcome == "backup_failed":
+            print(
+                f"gate-record-sweeper: {result.path}: BACKUP FAILED -- {result.detail} -- "
+                "refusing to write (no backup, no write)",
+                file=sys.stderr,
+            )
+            return 1
+        if result.outcome == "unchanged":
+            print(f"gate-record-sweeper: {result.path}: already normalised -- no changes applied")
+            return 0
         print(
-            "gate-record-sweeper: --apply is not available in this build -- "
-            "writing across the corpus is chunk 4's responsibility, gated "
-            "on review of the dry-run diffs. Refusing.",
-            file=sys.stderr,
+            f"gate-record-sweeper: {result.path}: applied -- backup at "
+            f"{result.backup_path} (run {result.run_id})"
         )
-        return 1
+        return 0
 
     manifest = _project_manifest(Path(args.repo), args.slug)
     try:
