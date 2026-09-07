@@ -207,6 +207,7 @@ Ready to implement <feature-name>
 - Proceed with failing tests without asking
 
 **Always:**
+- Pair every worktree you create with the gate that closes it (Phase 4 step 3). An unreaped worktree holds its branch, and the next session's `git switch` is what pays for it
 - Run Step 0 detection first
 - Prefer native tools over git fallback
 - Follow directory priority: existing > global legacy > instruction file > default
