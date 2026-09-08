@@ -19,11 +19,11 @@ Thumbs.db
 # specific operator's environments, hosts, and internal vocabulary as a matter
 # of course. This repo is published, so they must never become tracked files
 # here. They are versioned — just by a different owner: the private repo
-# OrionAIDev/superhuman-project-docs is cloned into this path, and nothing
+# a separate private repository is cloned into this path, and nothing
 # about that clone is visible to this repo. Deliberately a plain nested clone
 # and not a submodule: a submodule would write the private URL into a tracked
 # .gitmodules and hand every public cloner a fetch that 403s. See
-# OrionAIDev/trapezia-roadmap#225.
+# the design note in the project tracker.
 #
 # The publication guard in tests/test_content.py scans `git ls-files`, which
 # means untracked content is invisible to it by construction — this rule is

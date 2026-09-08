@@ -14,12 +14,12 @@ All notable changes to this project will be documented in this file. Format adap
 
 - **`docs/superhuman/` is now a mount point and this repo tracks nothing in it.** Per-project
   working docs (VISION / REQUIREMENTS / DESIGN / PLAN / TEST / SUPERHUMAN / DECISIONS) are
-  versioned in the private repo `OrionAIDev/superhuman-project-docs`, cloned into that path as a
+  versioned in a separate private repository, cloned into that path as a
   plain nested repo — deliberately not a submodule, which would write the private URL into a
   tracked `.gitmodules` and hand every public cloner a fetch that 403s. Nothing about the clone is
   visible to this repo, so paths that `SKILL.md`, the phase recipes, `scripts/fleet/` and
   `scripts/superhuman_profile.py` reference are unchanged. Rationale and the rejected alternatives:
-  `OrionAIDev/trapezia-roadmap#225`.
+  see the design note in the project tracker.
 - **Published design specs moved `docs/superhuman/specs/` → `docs/specs/`.** A subtree published on
   purpose could not stay inside a directory owned by a private repo. This affects *this repo's own*
   specs only; the convention for a project using superhuman is still to write its specs to

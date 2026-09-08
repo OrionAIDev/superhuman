@@ -1007,8 +1007,8 @@ def test_no_per_project_docs_are_tracked(skill_root: Path) -> None:
     ``docs/superhuman/<project>/`` and carried the operator's environment names
     with them.
 
-    Those docs are versioned, just not here — the private repo
-    ``OrionAIDev/superhuman-project-docs`` is cloned into this path, and the
+    Those docs are versioned, just not here — a separate private
+    repository is cloned into this path, and the
     ``/docs/superhuman/`` rule in ``.gitignore`` keeps that clone invisible to
     this repo. There is no published exception to carve out: specs live at
     ``docs/specs/`` (see ``test_published_specs_are_tracked``), so the
@@ -1038,8 +1038,8 @@ def test_no_per_project_docs_are_tracked(skill_root: Path) -> None:
     ).stdout.split()
 
     assert not offenders, (
-        "docs/superhuman/ is a mount point for the private "
-        "OrionAIDev/superhuman-project-docs clone — nothing there may be "
+        "docs/superhuman/ is a mount point for a separate private "
+        "repository clone — nothing there may be "
         "tracked in this published repo. Untrack it (`git rm --cached`); if "
         "this is a gitlink, the nested clone was force-added:\n"
         + "\n".join(f"  {rel}" for rel in offenders)
