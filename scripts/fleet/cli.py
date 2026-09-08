@@ -26,6 +26,8 @@ from typing import Any
 from uuid import uuid4
 
 from .. import superhuman_profile
+from . import doctor as fleet_doctor
+from . import hook_payload as fleet_hook_payload
 from . import observe as fleet_observe
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
@@ -912,6 +914,48 @@ def _cmd_locate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Handle `fleet doctor` (PLAN.md Chunk 3, D6, FR-10, FR-13).
+
+    Read-only estate-health scan: for every `SUPERHUMAN.md` found under the
+    given `--scan` roots, report whether a hook could write to it right now
+    and, if not, why (`scripts.fleet.doctor.scan`'s four states). Also
+    reports the operator's git version and flags anything below the 2.31
+    floor `locate.py`'s root discovery depends on. Never a fail-closed
+    assertion — this diagnoses, it never edits a record or writes a
+    manifest row.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — a read-only scan has nothing to reject.
+    """
+    report = fleet_doctor.scan(args.scan)
+
+    print(f"scanned roots: {', '.join(str(root) for root in report.roots)}")
+
+    git = report.git_version
+    if git.ok:
+        print(f"git version: {git.raw or '(unknown)'}")
+    else:
+        floor = ".".join(str(part) for part in fleet_doctor.MIN_GIT_VERSION)
+        print(
+            f"git version: {git.raw or '(could not be determined)'} -- BELOW the "
+            f"{floor} floor locate.py's root discovery depends on "
+            "(`git rev-parse --path-format=absolute`); observation may be silently "
+            "dead on this machine"
+        )
+
+    if not report.records:
+        print("no project records found under the scanned roots")
+        return 0
+
+    for record in sorted(report.records, key=lambda r: (str(r.root), r.slug)):
+        print(f"{record.root}  {record.slug}  {record.state}  ({record.detail})")
+    return 0
+
+
 def _safe_build_adapter_for_observe(
     args: argparse.Namespace, *, event: str
 ) -> SessionAdapter | None:
@@ -1110,6 +1154,89 @@ def _cmd_observe_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_observe_session_start(args: argparse.Namespace) -> int:
+    """Handle `fleet observe session-start` (PLAN.md Chunk 3, FR-5/FR-13/FR-17/D2a/D6).
+
+    `--hook-payload <file|->` (D2b) is mutually exclusive in effect with
+    `--workspace`/`--slug`: when given, `--workspace`/`--slug` are derived
+    from the payload's `cwd` via `locate.locate_project`, and the harness's
+    own `session_id` (FR-17) is threaded through as `--session-id`
+    (`--harness claude`) / `--local-id` (`--harness portable`/`subagent`) —
+    whichever the selected harness actually consumes — unless the caller
+    already supplied one explicitly. A malformed/absent payload or a
+    locator refusal both mean "nothing to do here": exit 0, having written
+    nothing, exactly like every other `observe` outcome (D2b).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` (see `_cmd_observe_dispatch`).
+    """
+    workspace = args.workspace
+    slug = args.slug
+
+    if args.hook_payload is not None:
+        payload = fleet_hook_payload.read_hook_payload(args.hook_payload)
+        if payload is None:
+            return 0
+        location = locate_project(payload.cwd)
+        if location is None:
+            return 0
+        workspace = location.workspace
+        slug = location.slug
+        if args.session_id is None:
+            args.session_id = payload.session_id
+        if args.local_id is None:
+            args.local_id = payload.session_id
+
+    if workspace is None or slug is None:
+        print(
+            "fleet observe session-start: --workspace/--slug are required unless "
+            "--hook-payload resolves them",
+            file=sys.stderr,
+        )
+        return 0
+    args.workspace = workspace
+    args.slug = slug
+
+    adapter = _safe_build_adapter_for_observe(args, event="session-start")
+    if adapter is None:
+        return 0
+
+    prompt_text: str | None = None
+    if args.prompt_file is not None:
+        try:
+            prompt_text = args.prompt_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(
+                f"fleet observe session-start: could not read --prompt-file "
+                f"{args.prompt_file}, continuing without an id-anchored flip: {exc}",
+                file=sys.stderr,
+            )
+
+    result = fleet_observe.observe_session_start(
+        adapter,
+        workspace=workspace,
+        slug=slug,
+        handoff_id=args.handoff_id,
+        prompt_text=prompt_text,
+        writer_role=args.writer_role,
+    )
+    if result.error_class == "identity_unresolved":
+        # D6: the ONE line `observe.py` itself never prints (its loudness
+        # tiers reserve stdout entirely for CLI callers). At SessionStart
+        # this stdout becomes session context, reaching a human and the
+        # model — the whole point of FR-13.
+        print(
+            f"fleet observe session-start: project {slug!r} resolved at {workspace} but "
+            "its SUPERHUMAN.md has no **Project-id:** line, so nothing was recorded -- "
+            "run `fleet project mint` (or `fleet doctor --scan <root>...` for the "
+            "estate-wide picture)"
+        )
+    return 0
+
+
 def _cmd_observe_status(args: argparse.Namespace) -> int:
     """Handle `fleet observe status` (fleet-wiring Chunk 1, W-FR-8).
 
@@ -1219,6 +1346,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_view_subparsers(subparsers)
     _add_observe_subparsers(subparsers)
     _add_locate_subparser(subparsers)
+    _add_doctor_subparser(subparsers)
 
     return parser
 
@@ -1241,6 +1369,30 @@ def _add_locate_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="the directory to resolve from (default: the process cwd)",
     )
     locate_parser.set_defaults(func=_cmd_locate)
+
+
+def _add_doctor_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `doctor` subcommand (PLAN.md Chunk 3, D6, FR-10, FR-13).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Read-only estate-health scan: which project records can write right now, "
+        "and why not (D6, FR-10, FR-13). Always exits 0.",
+    )
+    doctor_parser.add_argument(
+        "--scan",
+        nargs="+",
+        required=True,
+        type=Path,
+        metavar="ROOT",
+        help="one or more roots to scan under (each expected to be a git repository "
+        "root; shell glob expansion, e.g. ~/dev/*, is expected to already have turned "
+        "a wildcard into one argument per repository)",
+    )
+    doctor_parser.set_defaults(func=_cmd_doctor)
 
 
 def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1364,6 +1516,42 @@ def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
     )
     _add_harness_arguments(launch_parser)
     launch_parser.set_defaults(func=_cmd_observe_launch)
+
+    session_start_parser = observe_subparsers.add_parser(
+        "session-start",
+        help="Observe a plain session start with no pending handoff (FR-5, D2a). "
+        "Always exits 0.",
+    )
+    session_start_parser.add_argument(
+        "--workspace", type=Path, default=None, help="required unless --hook-payload resolves it"
+    )
+    session_start_parser.add_argument(
+        "--slug", default=None, help="the superhuman project slug (see --workspace)"
+    )
+    session_start_parser.add_argument(
+        "--hook-payload",
+        default=None,
+        help="read a harness hook JSON payload from this file, or '-' for stdin (D2b); "
+        "derives --workspace/--slug via the locator from the payload's cwd, and threads "
+        "the harness's own session id through (FR-17)",
+    )
+    session_start_parser.add_argument(
+        "--handoff-id",
+        default=None,
+        help="an explicit, id-anchored handoff to attempt flipping first "
+        "(D2a: never a fuzzy cwd/branch match)",
+    )
+    session_start_parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="grep this file's FLEET-HANDOFF-ID line when --handoff-id is not given directly",
+    )
+    session_start_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    _add_harness_arguments(session_start_parser)
+    session_start_parser.set_defaults(func=_cmd_observe_session_start)
 
     status_parser = observe_subparsers.add_parser(
         "status", help="Report enablement/activity for a workspace (W-FR-8). Always exits 0."
