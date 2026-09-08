@@ -53,6 +53,7 @@ from .handoff import emit as handoff_emit
 from .handoff import extract_handoff_id
 from .handoff import self_register as handoff_self_register
 from .handoff import stale_report
+from .locate import locate_project
 from .view import render_status_table, write_fleet_md
 
 #: `fleet --version` output. Not tied to `VERSION` at the skill root — this
@@ -892,6 +893,25 @@ def _cmd_gen_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_locate(args: argparse.Namespace) -> int:
+    """Handle `fleet locate` (PLAN.md Chunk 2, FR-4, D1).
+
+    Prints the resolved slug on a resolvable `--cwd`, prints nothing on an
+    ambiguous/unresolvable one — never a traceback, never a nonzero exit
+    (`locate_project` never raises; see `locate.py`'s module docstring).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0`.
+    """
+    result = locate_project(args.cwd)
+    if result is not None:
+        print(result.slug)
+    return 0
+
+
 def _safe_build_adapter_for_observe(
     args: argparse.Namespace, *, event: str
 ) -> SessionAdapter | None:
@@ -1198,8 +1218,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_query_subparsers(subparsers)
     _add_view_subparsers(subparsers)
     _add_observe_subparsers(subparsers)
+    _add_locate_subparser(subparsers)
 
     return parser
+
+
+def _add_locate_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `locate` subcommand (PLAN.md Chunk 2, D1).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    locate_parser = subparsers.add_parser(
+        "locate",
+        help="Resolve --cwd to its (workspace, slug) superhuman project (D1). "
+        "Prints the slug or nothing; always exits 0.",
+    )
+    locate_parser.add_argument(
+        "--cwd",
+        type=Path,
+        default=Path.cwd(),
+        help="the directory to resolve from (default: the process cwd)",
+    )
+    locate_parser.set_defaults(func=_cmd_locate)
 
 
 def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
