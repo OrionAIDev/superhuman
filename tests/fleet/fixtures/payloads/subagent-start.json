@@ -1,0 +1,10 @@
+{
+  "agent_id": "redacted-agent-id",
+  "agent_type": "triage-classifier",
+  "cwd": "C:\\Users\\example\\.claude\\skills\\superhuman\\docs\\superhuman\\fleet-deterministic-seams",
+  "hook_event_name": "SubagentStart",
+  "prompt_id": "redacted-prompt-id",
+  "scratchpad_dir": "C:\\Users\\example\\AppData\\Local\\Temp\\claude\\C--Users-example--claude-skills-superhuman\\00000000-0000-4000-8000-000000000000\\scratchpad",
+  "session_id": "redacted-session-id",
+  "transcript_path": "C:\\Users\\example\\.claude\\projects\\C--Users-example--claude-skills-superhuman\\00000000-0000-4000-8000-000000000000.jsonl"
+}
