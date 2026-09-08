@@ -1,7 +1,6 @@
 """Tests for `scripts.fleet.project_id` — fail-closed minting + validation.
 
-TDD scaffold only (Phase 2.1). Stubs with `pytest.mark.skip`; the Chunk 4
-Developer implements each, TDD-first, per `TEST.md` TC-25..TC-34.
+Chunk 4, per `TEST.md` TC-25..TC-34.
 
 Deliberately a separate module and a separate test file from
 `scripts/fleet/project.py` / `tests/fleet/test_project.py` — `project.py`'s
@@ -12,19 +11,67 @@ tests never import `project.py` internals either.
 
 from __future__ import annotations
 
+import hashlib
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from scripts.fleet.cli import build_parser
+from scripts.fleet.project_id import check_project_id, mint_project_id
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: 16 lowercase hex characters — `uuid4().hex[:16]`'s exact shape.
+_HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _write_superhuman_md(
+    workspace: Path, slug: str, *, project_id: str | None = None, file_slug: str | None = None
+) -> Path:
+    """Write `<workspace>/docs/superhuman/<slug>/SUPERHUMAN.md`.
+
+    Matches `test_project.py`'s `_write_superhuman_md` idiom, extended
+    with keyword control over whether/what `**Project-id:**` and
+    `**Slug:**` carry, since this module's tests need both "absent" and
+    "already present" record shapes.
+
+    Args:
+        workspace: the working tree root.
+        slug: the project directory name under `docs/superhuman/`.
+        project_id: the `**Project-id:**` value to write, or `None` to
+            omit the line entirely.
+        file_slug: the `**Slug:**` value to write (defaults to `slug`).
+
+    Returns:
+        Path: the written `SUPERHUMAN.md` path.
+    """
+    project_dir = workspace / "docs" / "superhuman" / slug
+    project_dir.mkdir(parents=True, exist_ok=True)
+    record = project_dir / "SUPERHUMAN.md"
+    lines = [f"# Superhuman: {slug}\n\n", f"**Slug:** {file_slug or slug}\n"]
+    if project_id is not None:
+        lines.append(f"**Project-id:** {project_id}\n")
+    lines.append("**Started:** 2026-09-08T00:00:00Z\n")
+    record.write_text("".join(lines), encoding="utf-8")
+    return record
+
 
 class TestMinting:
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-25")
     def test_mint_project_id_is_16_hex_from_uuid4(self, tmp_path: Path) -> None:
         """A newly minted id is 16 lowercase hex characters
         (`uuid4().hex[:16]`), and contains neither the slug string nor any
         substring derived from a git remote URL."""
+        slug = "wobbly-widget-forge"
+        _write_superhuman_md(tmp_path, slug)
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-26")
+        minted = mint_project_id(tmp_path, slug)
+
+        assert _HEX16_RE.fullmatch(minted), f"{minted!r} is not 16 lowercase hex chars"
+        assert slug not in minted
+        assert "github.com" not in minted
+
     def test_mint_project_id_differs_for_same_slug_different_remote(
         self, tmp_path: Path
     ) -> None:
@@ -33,57 +80,253 @@ class TestMinting:
         sharing the SAME slug in two different repos (different remotes)
         must not collide, and neither id must be derivable from the
         other's remote+slug pair."""
+        slug = "shared-slug-name"
+        repo_a = tmp_path / "repo-a"
+        repo_b = tmp_path / "repo-b"
+        for repo, remote in ((repo_a, "https://example.invalid/org/repo-a.git"),
+                              (repo_b, "https://example.invalid/org/repo-b.git")):
+            repo.mkdir()
+            _write_superhuman_md(repo, slug)
+            # The remote is recorded on disk only to prove mint_project_id
+            # never consults it — the function's signature takes no remote
+            # argument at all, so this is a belt-and-braces regression
+            # anchor rather than an exercised code path.
+            (repo / ".git-remote-for-test").write_text(remote, encoding="utf-8")
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-27")
+        id_a = mint_project_id(repo_a, slug)
+        id_b = mint_project_id(repo_b, slug)
+
+        assert id_a != id_b
+        assert "repo-a" not in id_a and "repo-b" not in id_a
+        assert "repo-a" not in id_b and "repo-b" not in id_b
+
     def test_mint_is_a_noop_on_a_record_that_already_has_an_id(
         self, tmp_path: Path
     ) -> None:
         """Re-running `mint_project_id` against a `SUPERHUMAN.md` that
         already carries a `**Project-id:**` line leaves that value
         unchanged (FR-11: an id is minted once, never re-derived)."""
+        slug = "already-has-one"
+        _write_superhuman_md(tmp_path, slug, project_id="fixed1234567890a")
+
+        first = mint_project_id(tmp_path, slug)
+        second = mint_project_id(tmp_path, slug)
+
+        assert first == "fixed1234567890a"
+        assert second == "fixed1234567890a"
+
+        record = tmp_path / "docs" / "superhuman" / slug / "SUPERHUMAN.md"
+        assert record.read_text(encoding="utf-8").count("**Project-id:**") == 1
+
+    def test_mint_replaces_a_blank_project_id_value_in_place(self, tmp_path: Path) -> None:
+        """A record whose `**Project-id:**` key exists but carries a blank
+        value (e.g. a copied template whose value was never filled in) is
+        treated as absent: the existing blank line is replaced in place
+        with the freshly minted id, rather than a second line being
+        inserted alongside it.
+
+        The blank `**Project-id:**` line is deliberately the LAST line in
+        the fixture (matching `test_project.py`'s own
+        `test_blank_project_id_value_returns_none` precedent): `_PROJECT_ID_RE`'s
+        `\\s*` is greedy across `re.MULTILINE` line boundaries, so a blank
+        value immediately followed by another `**field:**` line would
+        consume into it and match that field's key as if it were the id
+        value — a pre-existing characteristic of the unmodified
+        `project.py` regex (D3, TestModuleIsolation), not something this
+        module's fixture should exercise here.
+        """
+        slug = "blank-value-record"
+        project_dir = tmp_path / "docs" / "superhuman" / slug
+        project_dir.mkdir(parents=True)
+        record = project_dir / "SUPERHUMAN.md"
+        record.write_text(
+            f"**Slug:** {slug}\n**Project-id:**   \n", encoding="utf-8"
+        )
+
+        minted = mint_project_id(tmp_path, slug)
+
+        assert _HEX16_RE.fullmatch(minted)
+        text = record.read_text(encoding="utf-8")
+        assert text.count("**Project-id:**") == 1
+        assert f"**Project-id:** {minted}" in text
+
+    def test_mint_prepends_when_no_slug_line_exists_to_anchor_on(
+        self, tmp_path: Path
+    ) -> None:
+        """A badly malformed record with no `**Slug:**` line at all still
+        gets an id minted (degrades to prepending) rather than failing to
+        mint."""
+        slug = "no-slug-line-at-all"
+        project_dir = tmp_path / "docs" / "superhuman" / slug
+        project_dir.mkdir(parents=True)
+        record = project_dir / "SUPERHUMAN.md"
+        record.write_text("# Superhuman: malformed\n\nNo Slug line here.\n", encoding="utf-8")
+
+        minted = mint_project_id(tmp_path, slug)
+
+        assert _HEX16_RE.fullmatch(minted)
+        text = record.read_text(encoding="utf-8")
+        assert text.startswith(f"**Project-id:** {minted}\n")
 
 
 class TestFailClosedValidator:
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-28")
     def test_check_project_id_exits_nonzero_when_absent(self, tmp_path: Path) -> None:
         """`fleet project check` against a record with no `Project-id:`
         exits with a NON-ZERO code — a fail-closed assertion, deliberately
         outside the `observe.py` fail-soft façade (FR-12)."""
+        slug = "no-id-yet"
+        _write_superhuman_md(tmp_path, slug)
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-29")
-    def test_check_project_id_exits_zero_when_present(self, tmp_path: Path) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["project", "check", "--workspace", str(tmp_path), "--slug", slug]
+        )
+        exit_code = args.func(args)
+
+        assert exit_code != 0
+
+    def test_check_project_id_exits_zero_when_present(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """`fleet project check` against a fully-configured record exits 0
         and reports the id."""
+        slug = "fully-configured"
+        _write_superhuman_md(tmp_path, slug, project_id="abcdef0123456789")
+
+        parser = build_parser()
+        args = parser.parse_args(
+            ["project", "check", "--workspace", str(tmp_path), "--slug", slug]
+        )
+        exit_code = args.func(args)
+
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert "abcdef0123456789" in captured.out
 
 
 class TestModuleIsolation:
     """D3: `project_id.py` is a strictly separate module from
     `project.py`, and `project.py` stays unmodified by this chunk."""
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-30")
+    #: Golden SHA-256 of `scripts/fleet/project.py` as of Chunk 3 (this
+    #: chunk must not modify it — D3). Regenerate ONLY if `project.py` is
+    #: deliberately changed by a later, unrelated chunk.
+    _PROJECT_PY_SHA256 = "b0e2d3af6aac54d09e49c7b51875028bfcbf99462b534a134982f2c68dc36556"
+
     def test_project_py_is_unmodified(self) -> None:
         """Content-hash guard on `scripts/fleet/project.py`, matching the
         `TestCoreUntouched` idiom already used for `scripts/fleet/core/` —
         a golden SHA-256 of the file, asserted unchanged."""
+        project_py = _REPO_ROOT / "scripts" / "fleet" / "project.py"
+        actual = hashlib.sha256(project_py.read_bytes()).hexdigest()
+        assert actual == self._PROJECT_PY_SHA256, (
+            "scripts/fleet/project.py changed. D3 requires it stay byte-unchanged so "
+            "its 'never invents an id' read contract stays literally true; minting "
+            "and validation belong in scripts/fleet/project_id.py instead."
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-31")
+    #: Matches any import spelling that would pull in `project_id.py`:
+    #: `import project_id`, `from . import project_id`, `from .project_id
+    #: import ...`, or the fully-qualified `scripts.fleet.project_id`
+    #: form. Deliberately NOT a bare substring check on `"project_id"` —
+    #: `observe.py` legitimately names an unrelated `project_id` keyword
+    #: argument (the owning project's id, per W-FR-6) throughout its
+    #: source, which a substring check would false-positive on.
+    _IMPORTS_PROJECT_ID_MODULE_RE = re.compile(
+        r"^\s*(?:from\s+\.(?:\s+import\s+project_id\b|project_id\s+import\b)"
+        r"|import\s+(?:scripts\.fleet\.)?project_id\b)",
+        re.MULTILINE,
+    )
+
     def test_project_id_py_never_imported_by_observe_py(self) -> None:
         """Static source check: neither `import project_id` nor `from .
         import project_id` (nor any equivalent import spelling) appears
         anywhere in `scripts/fleet/observe.py`'s source text — the
         fail-soft façade must never gain a dependency on the fail-closed
         minting module."""
+        observe_py = _REPO_ROOT / "scripts" / "fleet" / "observe.py"
+        text = observe_py.read_text(encoding="utf-8")
+        match = self._IMPORTS_PROJECT_ID_MODULE_RE.search(text)
+        assert match is None, (
+            f"scripts/fleet/observe.py imports scripts/fleet/project_id ({match.group(0)!r} "
+            "found) — D3: the fail-soft façade must not depend on the fail-closed module"
+        )
+
+
+def _merge_base_with_main() -> str | None:
+    """Return the merge-base commit of `HEAD` and `origin/main`, or `None`.
+
+    Mirrors `test_seams.py`'s `_merge_base_with_main` helper (same
+    additive-diff idiom, TC-24), duplicated here rather than imported —
+    this module's own tests should not depend on another chunk's test
+    module staying importable/unchanged.
+    """
+    merge_head = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if merge_head.returncode == 0 and merge_head.stdout.strip():
+        return merge_head.stdout.strip()
+
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "HEAD", "origin/main"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 class TestKickoffSeam:
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-32")
     def test_kickoff_seam_calls_check_then_mint_additively(self) -> None:
         """Content test on `phases/0-kickoff.md`: the new step text is
-        present and additive — diffing the file against the merge-base
-        with `origin/main` shows zero REMOVED lines (the same additive-edit
-        idiom `test_seams.py` already uses for Phase 1.1's seams)."""
+        present, additive (diff against merge-base has zero removed lines,
+        per the existing additive-edit idiom in `test_seams.py`)."""
+        kickoff = _REPO_ROOT / "phases" / "0-kickoff.md"
+        text = kickoff.read_text(encoding="utf-8")
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-33")
+        assert "project check" in text
+        assert "project mint" in text
+        assert "python -m scripts.fleet.cli project check" in text
+        assert "python -m scripts.fleet.cli project mint" in text
+
+        merge_base = _merge_base_with_main()
+        if merge_base is None:
+            pytest.skip("git or origin/main merge-base unavailable in this environment")
+
+        result = subprocess.run(
+            ["git", "diff", merge_base, "--", "phases/0-kickoff.md"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"git diff against {merge_base} failed in this environment")
+
+        removed_lines = [
+            line
+            for line in result.stdout.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        ]
+        assert removed_lines == [], (
+            f"phases/0-kickoff.md: diff against merge-base {merge_base} removed lines:\n"
+            + "\n".join(removed_lines)
+        )
+
     def test_superhuman_md_tpl_no_longer_suggests_remote_plus_slug_hash(
         self,
     ) -> None:
@@ -91,15 +334,37 @@ class TestKickoffSeam:
         suggesting 'a stable hash of repo-remote + slug' as a minting
         option — D3's correction, since that scheme is slug-derived and
         forbidden by FR-11."""
+        tpl = _REPO_ROOT / "templates" / "SUPERHUMAN.md.tpl"
+        text = tpl.read_text(encoding="utf-8")
+        assert "stable hash of repo-remote" not in text
+        assert "Decision F" in text, (
+            "the correction must keep the rule and its Decision F reference, "
+            "only drop the slug-derived suggestion"
+        )
+        assert "never re-minted" in text or "never derived from the slug" in text
 
 
 class TestThisProjectsOwnException:
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 4, TC-34")
-    def test_this_projects_own_project_id_is_not_reminted(self) -> None:
+    def test_this_projects_own_project_id_is_not_reminted(
+        self, tmp_path: Path
+    ) -> None:
         """Regression anchor for PLAN.md Chunk 4's explicit note: this
         project's own `SUPERHUMAN.md` (`Project-id: 7124ce46ccd0a49a`,
         minted under the now-forbidden scheme before this rule existed)
         must NOT be silently re-minted by any mint/backfill pass — a
         `Project-id` is never re-minted once assigned (Phase 1 Decision
-        F). Assert the value on disk stays byte-identical after running
-        the mint path against this project's own record."""
+        F). A FIXTURE reproduces the real record's shape (the real record
+        itself lives outside this worktree, in the private docs mount,
+        and must never be edited by a test)."""
+        slug = "fleet-deterministic-seams"
+        live_exception_id = "7124ce46ccd0a49a"
+        _write_superhuman_md(tmp_path, slug, project_id=live_exception_id)
+        record = tmp_path / "docs" / "superhuman" / slug / "SUPERHUMAN.md"
+        before = record.read_bytes()
+
+        result = mint_project_id(tmp_path, slug)
+
+        after = record.read_bytes()
+        assert result == live_exception_id
+        assert before == after, "mint must not touch a record that already has an id"
+        assert check_project_id(tmp_path, slug) == live_exception_id
