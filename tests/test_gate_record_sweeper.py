@@ -1629,3 +1629,575 @@ def test_append_manifest_entry_recovers_from_a_corrupted_manifest_json(tmp_path:
     entries = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert len(entries) == 1
     assert entries[0]["slug"] == "some-slug"
+
+
+# ---------------------------------------------------------------------------
+# Chunk 4e: pre-write divergence check (a newer committed version of the
+# record may live on an unmerged branch or worktree; the checked-out copy
+# must never be swept over it -- see the chunk brief and the module
+# docstring's divergence note).
+# ---------------------------------------------------------------------------
+
+
+def _checkout_new_branch(repo: Path, name: str) -> None:
+    """Create and switch to a new branch `name` from the current `HEAD`."""
+    _run_git(repo, "checkout", "-b", name)
+
+
+def _current_head_sha(repo: Path) -> str:
+    """Return `repo`'s current `HEAD` commit SHA."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def test_check_divergence_detects_a_newer_commit_on_an_unmerged_branch(tmp_path: Path) -> None:
+    """A record newest on an unmerged branch is reported unsafe to write, with that branch named."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "divergent-project"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature")
+    newer_manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    newer_sha = _current_head_sha(repo)
+    _run_git(repo, "checkout", "trunk")
+
+    result = sweeper.check_divergence(manifest)
+
+    assert result.safe_to_write is False
+    assert result.divergent is True
+    assert result.newest_commit == newer_sha
+    assert "feature" in result.branches
+    assert result.reason is not None and newer_sha in result.reason
+
+
+def test_check_divergence_is_safe_after_the_unmerged_branch_merges(tmp_path: Path) -> None:
+    """Once the feature branch merges in, the checked-out copy is the newest known version."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "will-merge"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature")
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    _run_git(repo, "checkout", "trunk")
+    _run_git(repo, "merge", "feature", "--ff-only")
+
+    result = sweeper.check_divergence(manifest)
+
+    assert result.safe_to_write is True
+    assert result.divergent is False
+    assert result.head_commit == result.newest_commit
+    assert result.reason is None
+
+
+def test_check_divergence_treats_a_genuinely_untracked_record_as_safe(tmp_path: Path) -> None:
+    """A record with no commit touching it, on any ref, has no newer version by definition."""
+    repo = _init_repo(tmp_path)
+    _commit_manifest(
+        repo,
+        "unrelated",
+        "## Decisions log\n[2026-01-01T00:00:00Z] G0: unrelated\n",
+        "2026-01-01T00:00:00+00:00",
+    )
+    manifest_dir = repo / "docs" / "superhuman" / "untracked-divergence"
+    manifest_dir.mkdir(parents=True)
+    manifest = manifest_dir / "SUPERHUMAN.md"
+    manifest.write_text(
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        encoding="utf-8",
+        newline="",
+    )
+
+    result = sweeper.check_divergence(manifest)
+
+    assert result.safe_to_write is True
+    assert result.divergent is False
+    assert result.head_commit is None
+    assert result.newest_commit is None
+    assert result.reason is None
+
+
+def test_git_log_one_sha_reports_not_ok_when_git_exits_nonzero_without_raising(
+    tmp_path: Path,
+) -> None:
+    """A path outside any git repository makes `git log` exit nonzero -- `ok=False`, no exception.
+
+    Distinct from `test_check_divergence_fails_closed_on_a_subprocess_error`,
+    which simulates the binary being entirely absent (an `OSError`): here
+    `git` runs fine and simply reports "not a git repository" via its exit
+    code, the other route by which `_git_log_one_sha` must report
+    "could not tell" (`ok=False`) rather than mistaking it for "no history"
+    (`ok=True, sha=None`).
+    """
+    outside_any_repo = tmp_path / "no-repo-here" / "docs" / "superhuman" / "orphan" / "SUPERHUMAN.md"
+    outside_any_repo.parent.mkdir(parents=True)
+    outside_any_repo.write_text("## Decisions locked\n- [UNKNOWN] G0: x\n", encoding="utf-8")
+
+    ok, sha = sweeper._git_log_one_sha(outside_any_repo, all_refs=False)
+
+    assert ok is False
+    assert sha is None
+
+
+def test_branches_containing_returns_empty_when_git_exits_nonzero_without_raising(
+    tmp_path: Path,
+) -> None:
+    """An unresolvable commit SHA makes `git branch --contains` exit nonzero -- `()`, no exception."""
+    repo = _init_repo(tmp_path)
+    _commit_manifest(
+        repo, "some-slug", "## Decisions log\n[2026-08-01T00:00:00Z] G0: x\n", "2026-08-01T00:00:00+00:00"
+    )
+
+    branches = sweeper._branches_containing(repo / "docs" / "superhuman" / "some-slug" / "SUPERHUMAN.md", "0" * 40)
+
+    assert branches == ()
+
+
+def test_branches_containing_skips_blank_lines_and_the_remote_head_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A blank line and a `HEAD -> origin/main` alias line are both filtered, never appended.
+
+    `git branch -a` output can contain a blank trailing line and, when a
+    remote is configured, a `remotes/origin/HEAD -> origin/main` alias line
+    -- neither is a real branch name. This exercises that filtering
+    directly via a stubbed `subprocess.run`, since none of this module's
+    disposable test repos configure a remote.
+    """
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "  main\n* feature\n\nremotes/origin/HEAD -> origin/main\nremotes/origin/feature\n"
+
+    def _fake_run(*_args: object, **_kwargs: object) -> _FakeResult:
+        return _FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    branches = sweeper._branches_containing(tmp_path / "SUPERHUMAN.md", "deadbeef")
+
+    assert branches == ("main", "feature", "remotes/origin/feature")
+
+
+def test_check_divergence_fails_closed_on_a_subprocess_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `git` invocation failure (missing binary, etc.) is reported unsafe, never safe."""
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise OSError("git not found")
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+
+    result = sweeper.check_divergence(tmp_path / "some-repo" / "SUPERHUMAN.md")
+
+    assert result.safe_to_write is False
+    assert result.divergent is False
+    assert result.reason is not None and "fail" in result.reason.lower()
+
+
+def test_check_divergence_handles_detached_head_in_sync_with_the_branch_tip(tmp_path: Path) -> None:
+    """A detached checkout exactly at the only branch's tip is still safe to write (no divergence)."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    manifest = _commit_manifest(
+        repo,
+        "detached-in-sync",
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    tip_sha = _current_head_sha(repo)
+    _run_git(repo, "checkout", tip_sha)  # detach HEAD, exactly at trunk's tip
+
+    result = sweeper.check_divergence(manifest)
+
+    assert result.safe_to_write is True
+    assert result.divergent is False
+
+
+def test_check_divergence_detects_divergence_from_a_detached_head_behind_the_tip(
+    tmp_path: Path,
+) -> None:
+    """A detached checkout at an older commit is behind the branch's real tip -- unsafe to write."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "detached-behind"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    old_sha = _current_head_sha(repo)
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    newest_sha = _current_head_sha(repo)
+    _run_git(repo, "checkout", old_sha)  # detach HEAD, behind trunk's real tip
+
+    result = sweeper.check_divergence(manifest)
+
+    assert result.safe_to_write is False
+    assert result.divergent is True
+    assert result.newest_commit == newest_sha
+    assert result.head_commit == old_sha
+
+
+def test_branches_containing_lists_the_branch_carrying_the_newer_commit(tmp_path: Path) -> None:
+    """`_branches_containing` names the branch(es) that actually carry a given commit."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    manifest = _commit_manifest(
+        repo,
+        "branch-listing",
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature-x")
+    _commit_manifest(
+        repo,
+        "branch-listing",
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    sha = _current_head_sha(repo)
+
+    branches = sweeper._branches_containing(manifest, sha)
+
+    assert "feature-x" in branches
+
+
+def test_branches_containing_returns_empty_on_a_subprocess_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failure listing branches never raises -- it degrades to an empty diagnostic tuple."""
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise OSError("git not found")
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+
+    assert sweeper._branches_containing(tmp_path / "SUPERHUMAN.md", "deadbeef") == ()
+
+
+# ---------------------------------------------------------------------------
+# `apply()` gates on the divergence check; `--dry-run` surfaces it prominently
+# ---------------------------------------------------------------------------
+
+
+def test_apply_refuses_to_write_a_divergent_record(tmp_path: Path) -> None:
+    """`apply()` refuses to overwrite a record that is not the newest known version."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "apply-divergent"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature")
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    _run_git(repo, "checkout", "trunk")
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, slug, run_id="run-divergent", backup_root=backup_root)
+
+    assert result.outcome == "divergent"
+    assert result.wrote is False
+    assert result.backup_path is None
+    assert manifest.read_bytes() == before_bytes
+    assert not backup_root.exists()
+    assert result.detail is not None and "feature" in result.detail
+
+
+def test_apply_writes_a_genuinely_untracked_record_normally(tmp_path: Path) -> None:
+    """`apply()` still writes a record with no git history anywhere -- untracked is safe (D-4/G6-004-d)."""
+    repo = _init_repo(tmp_path)
+    _commit_manifest(
+        repo,
+        "unrelated",
+        "## Decisions log\n[2026-01-01T00:00:00Z] G0: unrelated\n",
+        "2026-01-01T00:00:00+00:00",
+    )
+    manifest_dir = repo / "docs" / "superhuman" / "untracked-apply"
+    manifest_dir.mkdir(parents=True)
+    manifest = manifest_dir / "SUPERHUMAN.md"
+    manifest.write_text(
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        encoding="utf-8",
+        newline="",
+    )
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, "untracked-apply", run_id="run-untracked", backup_root=backup_root)
+
+    assert result.outcome == "applied"
+    assert result.wrote is True
+    assert manifest.read_text(encoding="utf-8") == "## Decisions locked\n[UNKNOWN] G0: baseline decided\n## Decisions log\n"
+
+
+def test_apply_fails_closed_when_the_divergence_check_itself_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the divergence check cannot be run at all, `apply()` refuses to write (fail closed)."""
+    repo = _init_repo(tmp_path)
+    slug = "divergence-check-errors"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
+    )
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise OSError("git not found")
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+
+    result = sweeper.apply(repo, slug, run_id="run-check-fails", backup_root=backup_root)
+
+    assert result.outcome == "divergence_unknown"
+    assert result.wrote is False
+    assert result.backup_path is None
+    assert manifest.read_bytes() == before_bytes
+    assert not backup_root.exists()
+
+
+def test_apply_continues_processing_other_records_after_skipping_a_divergent_one(
+    tmp_path: Path,
+) -> None:
+    """One divergent record among several is skipped without aborting the others (no raise, ever)."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    divergent_slug = "batch-divergent"
+    divergent_manifest = _commit_manifest(
+        repo,
+        divergent_slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature")
+    _commit_manifest(
+        repo,
+        divergent_slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    _run_git(repo, "checkout", "trunk")
+    normal_slug_a = _commit_and_slug(repo, "batch-normal-a")
+    normal_slug_b = _commit_and_slug(repo, "batch-normal-b")
+    backup_root = tmp_path / "backups"
+
+    results = {
+        slug: sweeper.apply(repo, slug, run_id="run-batch", backup_root=backup_root)
+        for slug in (divergent_slug, normal_slug_a, normal_slug_b)
+    }
+
+    assert results[divergent_slug].outcome == "divergent"
+    assert results[divergent_slug].wrote is False
+    assert results[normal_slug_a].outcome == "applied"
+    assert results[normal_slug_a].wrote is True
+    assert results[normal_slug_b].outcome == "applied"
+    assert results[normal_slug_b].wrote is True
+    # The divergent manifest itself was never touched.
+    assert "kickoff decided" not in divergent_manifest.read_text(encoding="utf-8")
+
+
+def _commit_and_slug(repo: Path, slug: str) -> str:
+    """Commit a normalisable record for `slug` on the current branch; return `slug`."""
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    return slug
+
+
+def test_apply_cli_refuses_to_write_a_divergent_record_and_reports_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--apply` surfaces a divergent record loudly on stderr and exits non-zero, writing nothing."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "cli-divergent"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature")
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    _run_git(repo, "checkout", "trunk")
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+    monkeypatch.setattr(sweeper, "_default_backup_root", lambda: backup_root)
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--apply"])
+
+    assert exit_code == 1
+    assert manifest.read_bytes() == before_bytes
+    err = capsys.readouterr().err
+    assert "DIVERGENT" in err
+    assert "feature" in err
+
+
+def test_dry_run_cli_surfaces_divergence_prominently_but_still_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--dry-run` still renders the diff, but a loud divergence warning precedes it."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "cli-dry-run-divergent"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    _checkout_new_branch(repo, "feature")
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    _run_git(repo, "checkout", "trunk")
+    before_bytes = manifest.read_bytes()
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--dry-run"])
+
+    assert exit_code == 0
+    assert manifest.read_bytes() == before_bytes
+    captured = capsys.readouterr()
+    assert "DIVERGENT" in captured.err
+    assert "feature" in captured.err
+    assert captured.out  # the diff itself is still rendered
+
+
+def test_dry_run_cli_is_silent_about_divergence_when_there_is_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-divergent record's dry-run never mentions divergence at all."""
+    repo = _init_repo(tmp_path)
+    slug = "cli-dry-run-in-sync"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [2026-08-16] G0: baseline decided\n## Decisions log\n",
+        "2026-08-16T00:00:00+00:00",
+    )
+
+    exit_code = sweeper.main(["--repo", str(repo), "--slug", slug, "--dry-run"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "DIVERGENT" not in captured.err
+    assert captured.out
+
+
+# ---------------------------------------------------------------------------
+# G6-005-e constructed-case requirement (TEST.md 9.1): the live-corpus run is
+# necessary but not sufficient. This is the SAME detached-HEAD constructed
+# case already exercised above at the `check_divergence` unit level
+# (`test_check_divergence_handles_detached_head_in_sync_with_the_branch_tip`,
+# `test_check_divergence_detects_divergence_from_a_detached_head_behind_the_tip`);
+# this test pins it end-to-end through `apply()`, which is the write path
+# G6-005-e's rule actually governs.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_end_to_end_with_a_detached_head_repository(tmp_path: Path) -> None:
+    """`apply()` refuses a detached-HEAD checkout that is behind the branch's real tip."""
+    repo = _init_repo(tmp_path)
+    _checkout_new_branch(repo, "trunk")
+    slug = "detached-apply"
+    manifest = _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n- [UNKNOWN] G0: baseline decided\n## Decisions log\n",
+        "2026-08-01T00:00:00+00:00",
+    )
+    old_sha = _current_head_sha(repo)
+    _commit_manifest(
+        repo,
+        slug,
+        "## Decisions locked\n"
+        "- [UNKNOWN] G0: baseline decided\n"
+        "- [UNKNOWN] G1: kickoff decided\n"
+        "## Decisions log\n",
+        "2026-08-02T00:00:00+00:00",
+    )
+    _run_git(repo, "checkout", old_sha)
+    before_bytes = manifest.read_bytes()
+    backup_root = tmp_path / "backups"
+
+    result = sweeper.apply(repo, slug, run_id="run-detached", backup_root=backup_root)
+
+    assert result.outcome == "divergent"
+    assert result.wrote is False
+    assert manifest.read_bytes() == before_bytes
+    assert not backup_root.exists()

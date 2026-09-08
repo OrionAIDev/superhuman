@@ -43,6 +43,16 @@ applicable, already normalised, or aborted under FR-9) is a no-op: no
 backup is written and the record is never touched, because there is
 nothing to back up.
 
+Before any write, `--apply` also refuses a record whose checked-out copy is
+not the newest known version (`check_divergence`): a record's real newest
+commit can live on a branch or worktree that has not merged here, typically
+because a project closeout happened somewhere else. FR-9's byte-equality
+invariant only guarantees the sweep does not disturb bytes in the file it
+*read* -- it says nothing about a newer version existing elsewhere -- so this
+is a separate, write-path-only guard. `--dry-run` still renders the proposed
+diff for a divergent record, but prints a loud warning ahead of it; it never
+refuses anything, because `--dry-run` never writes regardless.
+
 FR-9 is a hard invariant, not a warning: every byte outside the matched
 `## Decisions locked` block must be identical before and after. This
 module guarantees that structurally -- the text before and after the block
@@ -870,16 +880,213 @@ def _propose_from_text(path: Path, original_text: str) -> Proposal:
 
 
 # ---------------------------------------------------------------------------
+# Pre-write divergence check (chunk 4e): refuse to overwrite a record whose
+# checked-out copy is not the newest known version.
+#
+# A record's newest committed version can live on a branch or worktree that
+# has not merged into whatever is checked out here -- typically because a
+# session did its project closeout somewhere else. FR-9's byte-equality
+# invariant guarantees the sweep does not disturb bytes in the file it
+# *read*; it says nothing about a newer version existing elsewhere. Sweeping
+# the stale checked-out copy rewrites it, so whoever later merges the branch
+# carrying the real version gets a genuine conflict in a file this tool
+# corrupted from their point of view. This section closes that gap on the
+# `--apply` path only -- `--dry-run` surfaces it as a warning instead of
+# refusing anything, since nothing is written under `--dry-run` regardless.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DivergenceCheck:
+    """Whether a record's checked-out copy is safe to overwrite, per git.
+
+    Compares the newest commit touching the record reachable from `HEAD`
+    against the newest commit touching it reachable from ANY ref
+    (`git log --all`). A record whose checked-out copy is not the newest
+    known version must never be written.
+
+    Attributes:
+        safe_to_write: `True` when the checked-out copy already IS the
+            newest known version, or when the record has no commit history
+            anywhere -- genuinely untracked, so no newer version can exist
+            by construction (this is what keeps this repo's own
+            `.gitignore`d records, G6-004-d, writable). `False` otherwise.
+        divergent: `True` only when a strictly newer version was positively
+            found on some other ref. `False` for both "in sync" and
+            "could not tell" -- callers must key skip/write decisions on
+            `safe_to_write`, never on this field alone.
+        head_commit: newest commit touching the record reachable from
+            `HEAD`, or `None` when none exists or the check could not run.
+        newest_commit: newest commit touching the record reachable from any
+            ref, or `None` when none exists anywhere or the check could not
+            run.
+        branches: branch names (`git branch -a --contains <newest_commit>`)
+            carrying the newer version -- populated only when `divergent`
+            is `True`. Diagnostic only: a failure to list them never
+            changes the verdict, only narrows the report.
+        reason: a human-readable explanation, populated whenever
+            `safe_to_write` is `False`; `None` otherwise.
+    """
+
+    safe_to_write: bool
+    divergent: bool
+    head_commit: str | None
+    newest_commit: str | None
+    branches: tuple[str, ...]
+    reason: str | None
+
+
+def _git_log_one_sha(path: Path, *, all_refs: bool) -> tuple[bool, str | None]:
+    """Run `git log -1 --format=%H [--all] -- path`, resolved from `path`'s own repo.
+
+    Args:
+        path: the record whose history is being queried.
+        all_refs: when `True`, adds `--all` (every ref, not just `HEAD`).
+
+    Returns:
+        `(ok, sha)`. `ok` is `True` exactly when git ran and exited 0 --
+        including when no commit matches at all, a legitimate,
+        positively-determined "no history" result. `ok` is `False` for
+        anything git itself could not answer: a missing binary, `path` not
+        inside a git repository, a timeout, or any other subprocess
+        failure -- the "could not tell" case that must fail closed. `sha`
+        is the newest matching commit hash, or `None` when `ok` is `False`
+        or no commit matches.
+    """
+    args = ["git", "log"]
+    if all_refs:
+        args.append("--all")
+    args += ["-1", "--format=%H", "--", str(path)]
+    try:
+        result = subprocess.run(args, cwd=path.parent, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    sha = result.stdout.strip()
+    return True, (sha or None)
+
+
+def _branches_containing(path: Path, sha: str) -> tuple[str, ...]:
+    """Return branch names carrying `sha`, for the divergence report.
+
+    Best-effort and diagnostic only: a failure here never changes a
+    `DivergenceCheck`'s verdict, only the detail attached to it.
+
+    Args:
+        path: any path inside the repository to query (only its parent
+            directory is used, as the `cwd` for the `git` invocation).
+        sha: the commit to search for.
+
+    Returns:
+        Every local and remote-tracking branch name reported by
+        `git branch -a --contains <sha>`, or `()` if the command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "branch", "-a", "--contains", sha],
+            cwd=path.parent,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0:
+        return ()
+    branches: list[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip().lstrip("*").strip()
+        if name and "->" not in name:
+            branches.append(name)
+    return tuple(branches)
+
+
+def check_divergence(path: Path) -> DivergenceCheck:
+    """Refuse-to-write check: is `path`'s checked-out copy the newest known version?
+
+    Compares the newest commit touching `path` reachable from `HEAD`
+    against the newest commit touching it reachable from any ref. A
+    record's newest committed version can live on a branch that has not
+    merged into whatever is checked out here -- typically because a session
+    closed a project out from a worktree or feature branch. Sweeping the
+    stale checked-out copy would rewrite it out from under whoever later
+    merges the branch carrying the real version, producing a genuine
+    conflict in a file this tool corrupted.
+
+    Fails closed: any inability to determine the answer -- `git` missing,
+    `path` not inside a git repository, a subprocess error -- reports
+    `safe_to_write=False`, never `True`. The one positive exception is a
+    record with NO commit history at all, on any ref: that has no newer
+    version by construction, so it is reported safe.
+
+    Args:
+        path: the record (`SUPERHUMAN.md`) to check.
+
+    Returns:
+        A `DivergenceCheck` describing whether it is safe to overwrite
+        `path`.
+    """
+    head_ok, head_sha = _git_log_one_sha(path, all_refs=False)
+    all_ok, all_sha = _git_log_one_sha(path, all_refs=True)
+
+    if not head_ok or not all_ok:
+        return DivergenceCheck(
+            safe_to_write=False,
+            divergent=False,
+            head_commit=head_sha,
+            newest_commit=all_sha,
+            branches=(),
+            reason=(
+                "could not determine whether a newer version of this record "
+                "exists elsewhere (git unavailable, not a git repository, or "
+                "a subprocess error) -- refusing to write (fail closed)"
+            ),
+        )
+
+    if head_sha == all_sha:
+        # Equal in both cases, including both `None` -- a record with no
+        # commit touching it on any ref is genuinely untracked and has no
+        # newer version to diverge from, by construction.
+        return DivergenceCheck(
+            safe_to_write=True,
+            divergent=False,
+            head_commit=head_sha,
+            newest_commit=all_sha,
+            branches=(),
+            reason=None,
+        )
+
+    branches = _branches_containing(path, all_sha) if all_sha else ()
+    return DivergenceCheck(
+        safe_to_write=False,
+        divergent=True,
+        head_commit=head_sha,
+        newest_commit=all_sha,
+        branches=branches,
+        reason=(
+            f"a newer version of this record exists at commit {all_sha}, not "
+            "reachable from the checked-out HEAD "
+            f"({head_sha if head_sha else 'no commits at all'}); found on: "
+            f"{', '.join(branches) if branches else '<no branch listing available>'}"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # The write path (`apply()`, chunk 4): backup, verify, THEN overwrite.
 #
 # `DECISIONS.md` G6-004-d: for a `.gitignore`d record there is no git
 # history to revert to, so the local backup this section writes is not
 # belt-and-braces -- it is the only recovery mechanism that exists. The
 # mandatory order is: (1) compute the proposal, (2) if there is nothing to
-# write, stop -- no backup, no write; (3) otherwise write a full-file
-# pre-write backup; (4) verify the backup is readable and byte-identical to
-# the source; (5) only then overwrite the real file. Any failure at (3) or
-# (4) fails closed -- the real file is never touched.
+# write, stop -- no backup, no write; (3) check the record is not diverged
+# from a newer version elsewhere (chunk 4e) -- stop, no backup, no write, if
+# it is or if that cannot be determined; (4) otherwise write a full-file
+# pre-write backup; (5) verify the backup is readable and byte-identical to
+# the source; (6) only then overwrite the real file. Any failure at (4) or
+# (5) fails closed -- the real file is never touched.
 # ---------------------------------------------------------------------------
 
 
@@ -1077,10 +1284,15 @@ class ApplyResult:
             `"not_applicable"` (no `## Decisions locked` block),
             `"unchanged"` (already normalised -- a no-op), `"aborted"`
             (FR-9's guarantee could not be verified -- refused before any
-            write), `"backup_failed"` (fail-closed: the backup could not be
-            written or verified -- refused before any write), or
-            `"applied"` (the backup was written, verified, and the record
-            overwritten).
+            write), `"divergent"` (a strictly newer version of this record
+            was positively found on another ref -- refused before any
+            write, per the chunk 4e pre-write divergence check),
+            `"divergence_unknown"` (the divergence check itself could not
+            be run -- fails closed identically to `"divergent"`, refused
+            before any write), `"backup_failed"` (fail-closed: the backup
+            could not be written or verified -- refused before any write),
+            or `"applied"` (the backup was written, verified, and the
+            record overwritten).
         detail: a human-readable explanation, or `None` when `outcome` is
             self-explanatory (`"unchanged"`, `"applied"`).
     """
@@ -1102,14 +1314,18 @@ def apply(
 ) -> ApplyResult:
     """Apply the sweep's proposed repair to one record: backup, verify, THEN overwrite.
 
-    Mandatory order (`DECISIONS.md` G6-004-d): read the record once; if
-    there is nothing to change (not applicable, already normalised, or the
-    proposal was aborted under FR-9), stop -- no backup, no write, the real
-    file is never touched. Otherwise write a full-file backup of the
-    pre-write bytes, verify it reads back byte-identical
-    (`_write_and_verify_backup`), and only then overwrite the record. Any
-    backup failure -- write error or verification mismatch -- fails closed:
-    the record is left exactly as it was.
+    Mandatory order (`DECISIONS.md` G6-004-d; divergence check added
+    chunk 4e): read the record once; if there is nothing to change (not
+    applicable, already normalised, or the proposal was aborted under
+    FR-9), stop -- no backup, no write, the real file is never touched.
+    Otherwise check that the checked-out copy is still the newest known
+    version (`check_divergence`); if a strictly newer version was found
+    elsewhere, or that could not be determined at all, stop -- no backup,
+    no write. Only then write a full-file backup of the pre-write bytes,
+    verify it reads back byte-identical (`_write_and_verify_backup`), and
+    only then overwrite the record. Any backup failure -- write error or
+    verification mismatch -- fails closed: the record is left exactly as
+    it was.
 
     Args:
         repo: repository root containing the target project.
@@ -1142,6 +1358,11 @@ def apply(
         return ApplyResult(manifest, run_id, False, None, "aborted", proposal.abort_reason)
     if not proposal.changed:
         return ApplyResult(manifest, run_id, False, None, "unchanged", None)
+
+    divergence = check_divergence(manifest)
+    if not divergence.safe_to_write:
+        outcome = "divergent" if divergence.divergent else "divergence_unknown"
+        return ApplyResult(manifest, run_id, False, None, outcome, divergence.reason)
 
     run_dir = backup_root / run_id
     backup_path = _backup_file_path(run_dir, repo, slug)
@@ -1264,6 +1485,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if result.outcome == "aborted":
             print(f"gate-record-sweeper: {result.path}: ABORTED -- {result.detail}", file=sys.stderr)
             return 1
+        if result.outcome in ("divergent", "divergence_unknown"):
+            print(
+                f"gate-record-sweeper: {result.path}: DIVERGENT -- {result.detail} -- "
+                "refusing to write (a newer version may exist elsewhere)",
+                file=sys.stderr,
+            )
+            return 1
         if result.outcome == "backup_failed":
             print(
                 f"gate-record-sweeper: {result.path}: BACKUP FAILED -- {result.detail} -- "
@@ -1296,6 +1524,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not proposal.changed:
         print(f"gate-record-sweeper: {manifest}: already normalised -- no changes proposed")
         return 0
+
+    divergence = check_divergence(manifest)
+    if not divergence.safe_to_write:
+        print(
+            f"gate-record-sweeper: {manifest}: DIVERGENT -- {divergence.reason} -- "
+            "this record must NOT be applied until resolved",
+            file=sys.stderr,
+        )
 
     print(proposal.diff, end="")
     return 0
