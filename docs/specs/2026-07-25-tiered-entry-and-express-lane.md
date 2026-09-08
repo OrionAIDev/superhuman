@@ -22,7 +22,7 @@ accordingly.
 
 ### 1.1 The measured record
 
-Across `~/dev` and `~/.claude/skills` (2026-07-25):
+Across `~/dev` and `~/.claude/skills`, **as first measured 2026-07-25**:
 
 | Path | Repos | Artifacts | Where the recent activity is |
 |---|---|---|---|
@@ -35,7 +35,43 @@ coverage, and its reviewers caught a Windows log-rotation defect (the service mo
 framework earns its cost when it is used.
 
 The problem is what happens to everything else. The two projects that stopped, stopped at G4 —
-the design/implementation boundary — and the seventeen light-path repos never entered at all.
+the design/implementation boundary — and the light-path repos never entered at all.
+
+### 1.1.1 Re-measured 2026-09-08 — the argument changes shape
+
+The figures above are preserved as the record that motivated this spec. They were re-measured 41
+days later, before implementation began, because the whole case rests on the ratio between the two
+rows and a stale ratio is exactly the premise that produces confident wrong work. Repo identity was
+resolved by asking git (`rev-parse --path-format=absolute --git-common-dir`) rather than inferred
+from directory shape, so linked-worktree copies collapse onto their main checkout.
+
+| Measure | 2026-07-25 | 2026-09-08 |
+|---|---|---|
+| Full-orchestrator **project records** | 9 | **36** |
+| Light-path **repos** | 17 | **20** |
+| Light-path **documents** | ~79 | **95** |
+
+Compared like-for-like by repo rather than projects-against-repos: **17** repos hold a
+full-orchestrator project, **20** hold light-path docs, **7** hold both — so **13 repos, not 17,
+are genuinely outside the full orchestrator**, and over those six weeks the full path grew fourfold
+while the light path added three repos.
+
+**So the original framing does not survive, and the honest replacement is stronger.** "Superhuman
+is pricing itself out of the estate" is not what the data says. What the data now says is this:
+**53% of every light-path document sits in two repos that also run full superhuman projects** — one
+of them carrying eleven superhuman projects alongside thirty-one light-path documents. The light
+path is not mainly where repos go because they cannot afford the orchestrator. It is substantially
+**a per-task choice made inside repos that have already adopted it**.
+
+That is a sharper argument for this spec than the one it replaces. A per-repo adoption gap would be
+an onboarding problem, and tiering would be an odd fix for it. A per-task choice made repeatedly by
+developers who *already know and use the full lane* is precisely a routing problem: the same repo,
+the same developer, the same week, picking the light path because the full lane is priced for a
+different question. That is the missing middle, and T0/T1/T2 resolved per request is the shape of
+the answer.
+
+The measurement is reproducible in about a second and should be re-run rather than trusted at any
+later date; treat every figure here as carrying its date.
 
 ### 1.2 The load-bearing observation
 
@@ -84,8 +120,9 @@ The light path discards the framework's most valuable output. From that same pro
 > offer "replace with a config/env mechanism" as an explicit option, not just variants of keeping
 > the data.`
 
-This is the system learning its operator across projects. Seventy-nine light-path documents produced
-none of it, because the light path has nowhere to write it.
+This is the system learning its operator across projects. The light-path corpus — seventy-nine
+documents when this was written, ninety-five by 2026-09-08 — produced none of it, because the light
+path has nowhere to write it.
 
 ---
 
@@ -113,7 +150,8 @@ none of it, because the light path has nowhere to write it.
   process*; HITL answers *who approves it*; the profile answers *what is permitted here*. Three
   orthogonal axes; this spec moves one.
 - **NG-4.** Any new artifact directory. Express writes to `docs/superhuman/{specs,plans}/` — the
-  convention already declared in the operator's `CLAUDE.md` and already populated in 17 repos.
+  convention already declared in the operator's `CLAUDE.md` and already populated in 20 repos
+  (2026-09-08; 17 when first measured).
 
 ---
 
@@ -304,8 +342,8 @@ Two edits outside the phase machinery, both required for the tiering to be reach
 
 | Existing state | Effect |
 |---|---|
-| 9 repos with `docs/superhuman/<slug>/SUPERHUMAN.md` | none — resume path is checked before routing |
-| ~79 light-path docs in 17 repos | retroactively valid T1 artifacts; no backfill |
+| 36 project records under `docs/superhuman/<slug>/SUPERHUMAN.md`, across 17 repos (2026-09-08) | none — resume path is checked before routing |
+| 95 light-path docs in 20 repos, 13 of them with no full-orchestrator project (2026-09-08) | retroactively valid T1 artifacts; no backfill |
 | `public-release-cutover` (in flight, same repo) | none — it holds an open `SUPERHUMAN.md`; step 1 short-circuits |
 | Profile / rung ladder | none — orthogonal axis (NG-3) |
 | Users with no profile | none — router's rung signal degrades to "unknown", resolves upward |
@@ -352,3 +390,17 @@ anti-pattern SKILL.md forbids, same precedent as the public-release-cutover lega
 SUPERHUMAN.md and is the rationalization the HARD-GATE blocks.
 [2026-07-25] Router in Python with argparse and no third-party deps; basis: matches
 scripts/superhuman_profile.py precedent and development principle #7.
+[2026-09-08] Section 1.1's measured record re-measured before implementation and section 1.1.1
+appended rather than the original table overwritten; basis: the 2026-07-25 figures are the record
+that motivated the spec and are worth keeping legible, but the case rests on the ratio between the
+two rows and the ratio moved — 9 full-orchestrator projects became 36 while 17 light-path repos
+became 20.
+[2026-09-08] The missing middle is re-argued as a per-task choice inside adopting repos rather than
+a per-repo adoption gap; basis: 13 repos (not 17) are genuinely outside the full orchestrator, and
+53% of all light-path documents sit in two repos that also run full superhuman projects. A per-repo
+gap would be an onboarding problem that tiering fixes only incidentally; a repeated per-task choice
+by developers who already use the full lane is a routing problem, which is what this spec builds.
+[2026-09-08] Ledger placement reopened at G6 (was OQ-1, resolved at G3 to a single
+docs/superhuman/LEDGER.md); basis: that path became gitignored in this repo when docs/superhuman/
+was made a mount point for a private docs clone, and a test fails the build if anything under it
+becomes tracked — so the spec's own repo could not hold the artifact the spec depends on.
