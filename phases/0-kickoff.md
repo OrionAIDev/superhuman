@@ -32,6 +32,18 @@ consulted: [business-expert]
      check above, just recorded as a declared fact for later gating (HITL-L's rollback-plan
      precondition reads this field — see Step 3 below).
 
+1.5. **Project-id minting (D3, FR-11/FR-12; a code step, not a prose reminder).**
+   - Run `python -m scripts.fleet.cli project check --workspace <project-root> --slug <slug>`
+     (`<dispatch:bash>`).
+   - If it exits non-zero (no `**Project-id:**` yet), run
+     `python -m scripts.fleet.cli project mint --workspace <project-root> --slug <slug>`
+     (`<dispatch:bash>`) to assign one. `mint` is a no-op on a record that already has an id —
+     an id is never re-minted (Phase 1 Decision F, reaffirmed by this project's own
+     DECISIONS.md D3).
+   - This exists so a project record cannot silently lack a `**Project-id:**` the way ~24
+     records across the estate did before this chunk — the check is fail-closed by
+     construction, not something that depends on anyone remembering to fill in a field.
+
 2. **Vision elicitation (conversational; G0's approval is presented in Step 3, not here).**
    - Probe purpose and reason. Use the patterns from DESIGN.md §2 G0 (e.g. "stock trading" → backtest+paper+live+strategy discovery; "health app" → probe for personal health context).
    - May dispatch Business Expert in parallel if domain is clear; multiple parallel invocations OK for multi-domain projects.

@@ -29,6 +29,7 @@ from .. import superhuman_profile
 from . import doctor as fleet_doctor
 from . import hook_payload as fleet_hook_payload
 from . import observe as fleet_observe
+from . import project_id as fleet_project_id
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
@@ -956,6 +957,51 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_project_mint(args: argparse.Namespace) -> int:
+    """Handle `fleet project mint` (PLAN.md Chunk 4, D3, FR-11).
+
+    Mints a random 16-hex `**Project-id:**` for a record that lacks one; a
+    no-op (never a re-mint) on a record that already has one. Always exits
+    0 — minting is a write helper, not the fail-closed assertion (`check`
+    is that).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0`.
+    """
+    project_id = fleet_project_id.mint_project_id(args.workspace, args.slug)
+    print(project_id)
+    return 0
+
+
+def _cmd_project_check(args: argparse.Namespace) -> int:
+    """Handle `fleet project check` (PLAN.md Chunk 4, D3, FR-12).
+
+    The fail-closed assertion D3 calls for: exits non-zero when the record
+    has no `**Project-id:**`, deliberately outside `observe.py`'s
+    fail-soft posture (this is an assertion, not observation).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` when the id is present (also printed to stdout); `1`
+        when it is absent.
+    """
+    project_id = fleet_project_id.check_project_id(args.workspace, args.slug)
+    if project_id is None:
+        print(
+            f"no **Project-id:** found for slug {args.slug!r} under {args.workspace} "
+            "-- run `python -m scripts.fleet.cli project mint` to assign one",
+            file=sys.stderr,
+        )
+        return 1
+    print(project_id)
+    return 0
+
+
 def _safe_build_adapter_for_observe(
     args: argparse.Namespace, *, event: str
 ) -> SessionAdapter | None:
@@ -1347,6 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_observe_subparsers(subparsers)
     _add_locate_subparser(subparsers)
     _add_doctor_subparser(subparsers)
+    _add_project_subparsers(subparsers)
 
     return parser
 
@@ -1393,6 +1440,41 @@ def _add_doctor_subparser(subparsers: argparse._SubParsersAction) -> None:
         "a wildcard into one argument per repository)",
     )
     doctor_parser.set_defaults(func=_cmd_doctor)
+
+
+def _add_project_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `project mint|check` subcommands (PLAN.md Chunk 4, D3, FR-11/FR-12).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    project_parser = subparsers.add_parser(
+        "project",
+        help="Project-id minting and fail-closed validation (D3, FR-11/FR-12).",
+    )
+    project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
+
+    mint_parser = project_subparsers.add_parser(
+        "mint",
+        help="Mint a random 16-hex Project-id if the record lacks one; a no-op "
+        "(never a re-mint) if it already has one. Always exits 0.",
+    )
+    mint_parser.add_argument(
+        "--workspace", required=True, type=Path, help="the working tree root"
+    )
+    mint_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    mint_parser.set_defaults(func=_cmd_project_mint)
+
+    check_parser = project_subparsers.add_parser(
+        "check",
+        help="Fail-closed assertion (FR-12): exits non-zero when the record has "
+        "no **Project-id:**, 0 when it does.",
+    )
+    check_parser.add_argument(
+        "--workspace", required=True, type=Path, help="the working tree root"
+    )
+    check_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    check_parser.set_defaults(func=_cmd_project_check)
 
 
 def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
