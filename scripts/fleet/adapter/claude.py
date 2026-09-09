@@ -74,7 +74,10 @@ class ClaudeAdapter(SessionAdapter):
     what it must be told by its orchestrator.
 
     Attributes:
-        workspace: the working tree this adapter reports git facts for.
+        workspace: the resolved project's working tree root (D1) -- namespaces
+            the node id, reported verbatim as this session's `workspace`
+            field. NOT necessarily where this session is running (see
+            `git_facts_root`).
         slug: the owning superhuman project's slug (used to namespace node ids).
     """
 
@@ -87,12 +90,40 @@ class ClaudeAdapter(SessionAdapter):
         sessions: list[dict[str, Any]] | None = None,
         session_relay_script: Path | str | None = None,
         git_timeout: float | None = None,
+        git_facts_root: Path | str | None = None,
     ) -> None:
         """Initialize a ClaudeAdapter.
 
         Args:
-            workspace: the working tree this adapter reports git facts for.
+            workspace: the resolved project's working tree root (D1) --
+                namespaces the node id and is reported verbatim as this
+                session's `workspace` field. For a session in a linked
+                worktree, D1 deliberately resolves this OUTWARD to the main
+                checkout (so the project's `SUPERHUMAN.md` docs mount can be
+                found) -- correct for that purpose, and NOT where this
+                session is actually running.
             slug: the owning superhuman project's slug.
+            git_facts_root: the directory `git_facts()` actually queries for
+                branch/commit/dirty state. Defaults to `workspace` when
+                omitted -- byte-identical to every caller before this
+                parameter existed. Pass the session's own launch directory
+                (`$CLAUDE_PROJECT_DIR`/payload `cwd`, BEFORE D1's outward
+                hop) here for a session in a linked worktree: `workspace`
+                and the session's own working tree are different
+                repositories' worth of git state whenever an outward hop
+                occurred, and running `git branch --show-current` against
+                `workspace` in that case reports the MAIN CHECKOUT's
+                currently-checked-out branch -- a real value that answers a
+                different question, and non-deterministic besides, since
+                that checkout's branch can change from unrelated activity in
+                another session entirely. Measured: a session in
+                `fleet-deterministic-seams` (its own worktree) had its
+                `session_registered` row recorded with
+                `branch="fix/242-arm-guards-everywhere"` -- the main
+                checkout's branch at that moment, not this session's.
+                `git -C <dir> ...` auto-discovers the enclosing worktree from
+                any subdirectory (see `adapter.portable.run_git`), so this
+                need not be an exact repo root.
             current_session_id: THIS session's native Claude session id, as
                 known by the orchestrating agent turn. There is no
                 Python-accessible source for this on Claude (see module
@@ -125,6 +156,9 @@ class ClaudeAdapter(SessionAdapter):
             Path(session_relay_script) if session_relay_script is not None else None
         )
         self._git_timeout = git_timeout
+        self._git_facts_root = (
+            Path(git_facts_root) if git_facts_root is not None else self.workspace
+        )
 
     def current_session(self) -> SessionInfo:
         """Return this session's identity from the orchestrator-supplied id.
@@ -271,18 +305,21 @@ class ClaudeAdapter(SessionAdapter):
         return enriched
 
     def git_facts(self) -> GitFacts:
-        """Return real git plumbing facts for `self.workspace`.
+        """Return real git plumbing facts for this session's own working tree.
 
         Returns:
-            GitFacts: as `adapter.portable.collect_git_facts(self.workspace)`
-            — identical mechanism to `PortableAdapter`, since git plumbing is
-            equally Python-accessible on either harness. Honors this
-            adapter's `git_timeout` override if one was given at
-            construction.
+            GitFacts: as
+            `adapter.portable.collect_git_facts(self._git_facts_root)` --
+            identical mechanism to `PortableAdapter`, since git plumbing is
+            equally Python-accessible on either harness. Queries
+            `_git_facts_root`, NOT `workspace` -- see the constructor's
+            `git_facts_root` parameter for why the two differ whenever D1's
+            outward hop fired. Honors this adapter's `git_timeout` override
+            if one was given at construction.
         """
         if self._git_timeout is None:
-            return collect_git_facts(self.workspace)
-        return collect_git_facts(self.workspace, git_timeout=self._git_timeout)
+            return collect_git_facts(self._git_facts_root)
+        return collect_git_facts(self._git_facts_root, git_timeout=self._git_timeout)
 
     def emit_prompt(self, text: str, handoff_id: str) -> str:
         """Append the literal handoff-id marker line to `text`.
