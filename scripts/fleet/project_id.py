@@ -47,6 +47,43 @@ _PROJECT_ID_LINE_RE = re.compile(r"^\*\*Project-id:\*\*.*$", re.MULTILINE)
 #: matching `templates/SUPERHUMAN.md.tpl`'s own field order.
 _SLUG_LINE_RE = re.compile(r"^\*\*Slug:\*\*.*$", re.MULTILINE)
 
+#: Values that are *syntactically* present but are not identities — an
+#: unfilled template placeholder (`{{project_id}}`), or a hand-authored
+#: `TODO`/`REPLACE_ME` marker. These matter because `project.py`'s reader
+#: matches any non-blank `\S+`, so a record straight out of
+#: `templates/SUPERHUMAN.md.tpl` reads as though it already carried an id.
+#: Left unguarded, EVERY new project would register manifest rows under the
+#: same literal `{{project_id}}` — collapsing unrelated projects into one
+#: phantom project, which is strictly worse than having no id at all.
+#:
+#: This guard lives here rather than in `project.py` deliberately: D3 keeps
+#: that module's "never invents an id" read contract literal and unmodified.
+#: The template deliberately KEEPS its `{{project_id}}` placeholder rather
+#: than shipping a blank value. A blank is strictly worse: `project.py`'s
+#: `\s*` crosses the newline under `re.MULTILINE`, so a blank value makes
+#: the reader capture the *next* line and return `'<!--'` as the id —
+#: measured, not theorised. A visible placeholder is both human-legible and
+#: reliably detectable here; a blank is neither.
+_SENTINEL_ID_RE = re.compile(
+    r"^(?:\{\{.*|.*\}\}|TODO|REPLACE(?:_ME)?|<!--.*|<.*>)$",
+    re.IGNORECASE,
+)
+
+
+def is_sentinel_id(value: str | None) -> bool:
+    """Return True when `value` is present but is not a real identity.
+
+    Args:
+        value: a `**Project-id:**` value exactly as read from a record.
+
+    Returns:
+        bool: True for `None`, blank, an unfilled `{{...}}` template
+        placeholder, or a `TODO`/`REPLACE_ME`/`<...>` marker.
+    """
+    if value is None or not value.strip():
+        return True
+    return bool(_SENTINEL_ID_RE.match(value.strip()))
+
 
 def _superhuman_md_path(workspace: Path | str, slug: str) -> Path:
     """Return the path to a project's `SUPERHUMAN.md`.
@@ -86,6 +123,11 @@ def check_project_id(workspace: Path | str, slug: str) -> str | None:
     if identity is None:
         return None
     project_id, _file_slug = identity
+    # A sentinel is *present* but is not an identity — treat it as absent so
+    # `check` stays fail-closed and `mint` will replace it. See
+    # `is_sentinel_id`.
+    if is_sentinel_id(project_id):
+        return None
     return project_id
 
 

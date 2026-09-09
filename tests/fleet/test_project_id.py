@@ -368,3 +368,73 @@ class TestThisProjectsOwnException:
         assert result == live_exception_id
         assert before == after, "mint must not touch a record that already has an id"
         assert check_project_id(tmp_path, slug) == live_exception_id
+
+
+class TestSentinelIdsAreNotIdentities:
+    """The unfilled-template-placeholder gap, found during chunk 4 review.
+
+    `project.py`'s reader matches any non-blank `\\S+`, so a record straight
+    out of `templates/SUPERHUMAN.md.tpl` used to read as though it already
+    carried an id. The consequence was worse than a missing id: `check`
+    passed, `mint` no-opped, and **every** new project would have written
+    manifest rows under the same literal ``{{project_id}}`` — collapsing
+    unrelated projects into one phantom project.
+
+    Fixed by making `is_sentinel_id` treat a placeholder as absent, so
+    `check` stays fail-closed and `mint` replaces it. `project.py` itself is
+    deliberately untouched — D3 keeps its read contract literal.
+
+    The template deliberately KEEPS its visible placeholder. Blanking the
+    value was tried first and measured to be strictly worse: `project.py`'s
+    `\\s*` crosses the newline under `re.MULTILINE`, so a blank makes the
+    reader capture the following comment line and return `'<!--'` as the id.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        # NB: the blank-value cases are deliberately absent. `project.py`'s
+        # `\s*` crosses the newline under re.MULTILINE, so a blank value never
+        # reaches this guard as a blank — the reader captures the NEXT line and
+        # returns its leading token (measured: `'<!--'`). That capture is covered
+        # by the `<!--` case below, which is the shape actually observed.
+        ["{{project_id}}", "{{ project_id }}", "TODO", "todo", "REPLACE_ME", "<project-id>", "<!--"],
+    )
+    def test_sentinel_values_are_reported_as_absent(self, tmp_path: Path, value: str) -> None:
+        """A placeholder is present-but-not-an-identity, so `check` says absent."""
+        _write_superhuman_md(tmp_path, "tpl-proj", project_id=value)
+        assert check_project_id(tmp_path, "tpl-proj") is None
+
+    def test_mint_replaces_a_placeholder_rather_than_no_opping(self, tmp_path: Path) -> None:
+        """`mint` must REPLACE a sentinel — no-op here would leave the record unwritable."""
+        record = _write_superhuman_md(tmp_path, "tpl-proj", project_id="{{project_id}}")
+        minted = mint_project_id(tmp_path, "tpl-proj")
+        assert _HEX16_RE.match(minted), f"expected a random 16-hex id, got {minted!r}"
+        assert "{{project_id}}" not in record.read_text(encoding="utf-8")
+        assert check_project_id(tmp_path, "tpl-proj") == minted
+
+    def test_a_real_id_is_never_mistaken_for_a_sentinel(self, tmp_path: Path) -> None:
+        """The guard must not swallow legitimate ids, including the legacy non-uuid ones.
+
+        `7124ce46ccd0a49a` is this project's own id, minted from the
+        now-forbidden remote+slug hash before the rule existed. Re-minting
+        it would orphan the history already written under it.
+        """
+        for real in ("7124ce46ccd0a49a", "fleet-f48a2e71a7bd", "3a483d02-8651-4ae3-85c1-7471ae47c189"):
+            _write_superhuman_md(tmp_path, "real-proj", project_id=real)
+            assert check_project_id(tmp_path, "real-proj") == real
+            assert mint_project_id(tmp_path, "real-proj") == real, "mint must stay a no-op"
+
+    def test_the_shipped_template_no_longer_carries_a_placeholder_value(self) -> None:
+        """Root-cause guard: the template must not ship a fillable id VALUE.
+
+        A content test rather than a behaviour test, because the defect was a
+        property of the shipped tree, not of any code path.
+        """
+        tpl = (_REPO_ROOT / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+        line = next(ln for ln in tpl.splitlines() if ln.startswith("**Project-id:**"))
+        assert line.strip() == "**Project-id:** {{project_id}}", (
+            f"template must ship a VISIBLE placeholder value, got {line!r}. Blanking it is "
+            "strictly worse and was measured: project.py's `\\s*` crosses the newline, so a "
+            "blank value makes the reader capture the comment leader and return '<!--' as the "
+            "project id, which no guard would naturally flag."
+        )
