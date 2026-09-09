@@ -41,7 +41,14 @@ fi
 
 # --ignore of a path that does not exist is harmless to pytest, so excluding the
 # integration smoke is safe even in repos that lack it.
-if "$PY" -m pytest tests/ -x --ignore=tests/test_integration_smoke.py -q; then
+#
+# `-rs` prints every skip with its reason, and it is load-bearing rather than
+# cosmetic. This hook is the last check before a commit, and several of the
+# tests it runs are GUARDS that skip when the artifact they read is absent.
+# Under plain `-q` such a guard reports as an increment to a skip count nobody
+# diffs, so a control that has stopped running looks exactly like a control that
+# holds. Naming each skip makes its disappearance something a human can notice.
+if "$PY" -m pytest tests/ -x --ignore=tests/test_integration_smoke.py -q -rs; then
     exit 0
 fi
 

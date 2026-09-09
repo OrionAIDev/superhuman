@@ -17,8 +17,10 @@ import pytest
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import superhuman_profile as sp  # noqa: E402
+from repo_artifacts import locate_ignored_artifact  # noqa: E402
 
 RESOLVER = Path(__file__).resolve().parents[1] / "scripts" / "superhuman_profile.py"
 
@@ -565,10 +567,53 @@ def _cli_out(args: list[str], profile: Path | None) -> str:
     return proc.stdout
 
 
-GOLDEN_CURRENT = (
-    Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "golden" / "ladder-current.yaml"
-)
+#: Repo-relative path to the golden policy fixture. Relative because it is
+#: gitignored, so WHICH working tree holds it is exactly the question --
+#: `locate_ignored_artifact` answers it per run.
+GOLDEN_RELPATH = "tests/fixtures/golden/ladder-current.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+GOLDEN_CURRENT = REPO_ROOT / GOLDEN_RELPATH
 LIVE_PROFILE = Path.home() / ".superhuman" / "profile.yaml"
+
+
+def golden_mirror_state(
+    live_present: bool, live_text: str, golden_present: bool
+) -> str:
+    """Decide what the golden-mirror check should do, as a pure function.
+
+    Extracted from the test so the policy itself is testable. The bug class in
+    roadmap#242 is a control whose not-run path nobody ever exercised; writing
+    a new not-run path and leaving it equally unexercised would repeat it.
+
+    ================  ============  ==============  =====================
+    live profile      names golden  golden present  Returns
+    ================  ============  ==============  =====================
+    absent            --            --              ``"no-profile"``
+    present           no            --              ``"no-claim"``
+    present           yes           no              ``"missing-mirror"``
+    present           yes           yes             ``"compare"``
+    ================  ============  ==============  =====================
+
+    Only ``"missing-mirror"`` is a failure. The two skip rows are genuine
+    not-applicable cases rather than a disarmed guard: a machine with no ladder
+    has nothing to mirror, and a profile that never claimed a mirror owes none.
+
+    Args:
+        live_present: Whether ``~/.superhuman/profile.yaml`` exists.
+        live_text: Its contents, or ``""`` when it does not exist.
+        golden_present: Whether the golden fixture exists.
+
+    Returns:
+        One of ``"no-profile"``, ``"no-claim"``, ``"missing-mirror"``,
+        ``"compare"``.
+    """
+    if not live_present:
+        return "no-profile"
+    if GOLDEN_CURRENT.name not in live_text:
+        return "no-claim"
+    if not golden_present:
+        return "missing-mirror"
+    return "compare"
 
 
 def test_golden_ladder_mirrors_the_live_profile() -> None:
@@ -581,16 +626,66 @@ def test_golden_ladder_mirrors_the_live_profile() -> None:
     rung order, any rung's detectors or approvals, or the fleet opt-in.
 
     Comments and formatting are deliberately NOT compared: the fixture carries
-    its own local-only preamble, and the drift that matters is semantic. Skips
-    when either file is absent, which is the normal case for anyone who is not
-    this operator — the fixture is local-only by design (see the
-    ``/tests/fixtures/golden/`` rule in .gitignore).
-    """
-    if not GOLDEN_CURRENT.is_file() or not LIVE_PROFILE.is_file():
-        pytest.skip("golden policy fixture or live profile absent — nothing to pin")
+    its own local-only preamble, and the drift that matters is semantic.
 
-    golden = yaml.safe_load(GOLDEN_CURRENT.read_text(encoding="utf-8"))
-    live = yaml.safe_load(LIVE_PROFILE.read_text(encoding="utf-8"))
+    **Why a missing fixture now FAILS instead of skipping** (roadmap#242,
+    instance 3). Skipping on either file's absence re-created the exact hole the
+    test was written to close: the mirror could go missing again and the check
+    would report green. But the fixture is gitignored and the live profile is a
+    per-machine file that is not in the repository at all, so "absent" covers
+    two completely different situations and they need opposite answers:
+
+    * **No live profile.** Not a machine that has a ladder — CI, a fork, a fresh
+      clone. There is nothing to mirror. Skip.
+    * **A live profile that does not name the fixture.** An ordinary user's
+      profile, which never claimed to be mirrored. Skip.
+    * **A live profile that NAMES the fixture, with the fixture missing.** A
+      profile that declares its own mirror, and the mirror is gone. That is the
+      regression. Fail.
+
+    Making the profile's own claim the trigger is what keeps this honest for
+    everyone: the obligation is declared by the artifact rather than inferred
+    from whose laptop this is, so no operator identity is encoded here.
+
+    This test still cannot run in CI, and that is correct rather than a defect
+    to re-file — a runner has no live profile to compare against. The portable
+    half of what it protects, the rung/``act_unattended`` policy semantics, is
+    pinned separately against synthetic profiles that ARE tracked; see
+    ``test_profile_onboarding.py``'s approvals assertions and this module's own
+    resolver cases. What is local-only here is drift between one machine's
+    profile and its mirror, which is only meaningful on that machine.
+    """
+    live_present = LIVE_PROFILE.is_file()
+    live_text = LIVE_PROFILE.read_text(encoding="utf-8") if live_present else ""
+    # The fixture is gitignored, so a linked worktree never receives it. Without
+    # this the failure row below would fire in EVERY worktree on a machine that
+    # has a live profile -- turning the fix for one instance of roadmap#242 into
+    # a fresh instance of the same class. Three of five worktrees on the machine
+    # this was written on lack the fixture.
+    golden = locate_ignored_artifact(REPO_ROOT, GOLDEN_RELPATH)
+    state = golden_mirror_state(live_present, live_text, golden.is_file())
+
+    if state == "no-profile":
+        pytest.skip(
+            "no live ~/.superhuman/profile.yaml — nothing to mirror. Expected in "
+            "CI and on any checkout without a configured ladder."
+        )
+    if state == "no-claim":
+        pytest.skip(
+            "the live profile does not claim to be mirrored by "
+            f"{GOLDEN_CURRENT.name} — nothing to pin"
+        )
+    if state == "missing-mirror":
+        pytest.fail(
+            f"the live profile names {GOLDEN_CURRENT.name} as its mirror, but "
+            f"{GOLDEN_CURRENT.name} is missing. The mirror has gone missing once "
+            f"before and the check skipped rather than said so. Restore the "
+            f"fixture, or drop the claim from the profile — do NOT fix this by "
+            f"deleting the check."
+        )
+
+    golden = yaml.safe_load(golden.read_text(encoding="utf-8"))
+    live = yaml.safe_load(live_text)
 
     assert golden["version"] == live["version"], "schema version drifted"
     assert golden["citation"] == live["citation"], "citation drifted"
@@ -611,3 +706,39 @@ def test_golden_ladder_mirrors_the_live_profile() -> None:
     assert [_policy(r) for r in golden["ladder"]] == [_policy(r) for r in live["ladder"]], (
         "ladder policy drifted between the golden fixture and the live profile"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The golden-mirror not-run policy (roadmap#242, instance 3)
+#
+# The defect class this closes is a control whose not-run path was never
+# exercised. These cases exercise it, so a future edit that turns the failure
+# row back into a skip fails here instead of going quiet.
+# --------------------------------------------------------------------------- #
+
+
+def test_golden_mirror_skips_when_there_is_no_live_profile() -> None:
+    """CI, a fork, a fresh clone: no ladder, so nothing to mirror."""
+    assert golden_mirror_state(False, "", False) == "no-profile"
+    assert golden_mirror_state(False, "", True) == "no-profile"
+
+
+def test_golden_mirror_skips_a_profile_that_claims_no_mirror() -> None:
+    """An ordinary user's profile owes no fixture and must not fail."""
+    assert golden_mirror_state(True, "version: 1\nladder: []\n", False) == "no-claim"
+
+
+def test_golden_mirror_fails_when_a_declared_mirror_is_missing() -> None:
+    """THE REGRESSION. The mirror went missing once and the check skipped.
+
+    A profile that names the fixture has declared the obligation, so the
+    fixture's absence is a broken promise rather than a not-applicable case.
+    """
+    claiming = f"# mirrored by tests/fixtures/golden/{GOLDEN_CURRENT.name}\n"
+    assert golden_mirror_state(True, claiming, False) == "missing-mirror"
+
+
+def test_golden_mirror_compares_when_both_sides_are_present() -> None:
+    """The ordinary maintainer case still runs the comparison."""
+    claiming = f"# mirrored by tests/fixtures/golden/{GOLDEN_CURRENT.name}\n"
+    assert golden_mirror_state(True, claiming, True) == "compare"

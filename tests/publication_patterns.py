@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from repo_artifacts import locate_ignored_artifact
+
 #: Infrastructure leaks that no published repository should contain. These are
 #: patterns, not names, so the guard is useful to anyone publishing a fork — not
 #: only to whoever wrote it.
@@ -129,6 +131,30 @@ def is_scanned(rel: str) -> bool:
         True when the file should be read and scanned.
     """
     return not rel.startswith(PUBLICATION_EXEMPT) and not rel.endswith(SKIPPED_SUFFIXES)
+
+
+def locate_tokens_file(repo_root: Path) -> Path:
+    """Return the path to the operator token list to use for ``repo_root``.
+
+    A named wrapper over :func:`repo_artifacts.locate_ignored_artifact`, which
+    carries the full rationale for the class. Kept as its own function because
+    callers should say WHICH artifact they mean, and because the token list is
+    the instance with the highest cost of being wrong: it is the last check
+    before a public push.
+
+    Compose it with :func:`resolve_tokens`, never instead of it. This decides
+    *where* to look; ``resolve_tokens`` decides what an absence MEANS. Widening
+    the search must not soften the policy, so the two stay separate:
+    ``resolve_tokens(locate_tokens_file(root))``.
+
+    Args:
+        repo_root: The working tree being scanned.
+
+    Returns:
+        The first existing token list — the working tree's own, else the main
+        checkout's — or the working tree's own path when neither exists.
+    """
+    return locate_ignored_artifact(repo_root, TOKENS_FILE)
 
 
 def load_tokens(tokens_path: Path) -> list[str]:

@@ -21,6 +21,7 @@ from publication_patterns import (  # noqa: E402
     find_tokens,
     is_scanned,
     load_tokens,
+    locate_tokens_file,
     resolve_tokens,
 )
 
@@ -981,7 +982,7 @@ def test_operator_tokens_are_absent(skill_root: Path) -> None:
     carrying this repository's own changes. On a fork pull request, where
     GitHub withholds the secret by design, it skips with a reason that says so.
     """
-    tokens = resolve_tokens(skill_root / TOKENS_FILE)
+    tokens = resolve_tokens(locate_tokens_file(skill_root))
 
     offenders: dict[str, list[str]] = {}
     for rel in _publication_candidates(skill_root):
