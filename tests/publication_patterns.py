@@ -192,13 +192,32 @@ def resolve_tokens(tokens_path: Path) -> list[str]:
         Failed: via :func:`pytest.fail`, for either failing row.
         Skipped: via :func:`pytest.skip`, for the fork row.
     """
+    required = bool(os.environ.get(REQUIRE_TOKENS_ENV))
+
     if tokens_path.is_file():
         tokens = load_tokens(tokens_path)
         if not tokens:
-            pytest.fail(f"{TOKENS_FILE} exists but lists no tokens")
+            # In CI the "absent" row below is unreachable -- the workflow step
+            # always creates the file -- so a broken secret arrives HERE, as an
+            # empty file, not as a missing one. Measured on the first real run:
+            # with no PUBLICATION_TOKENS secret set, `printf '%s\n' ""` writes a
+            # lone newline and every call site failed with a message that never
+            # named the secret. Say what to go and fix.
+            pytest.fail(
+                f"{TOKENS_FILE} exists but lists no tokens"
+                + (
+                    f" -- and {REQUIRE_TOKENS_ENV} is set, so this run expected "
+                    f"a real list. On CI that means the PUBLICATION_TOKENS "
+                    f"repository secret is missing, empty, or renamed. Do NOT "
+                    f"fix this by deleting the workflow step that writes the "
+                    f"file; that restores the defect this guard exists to catch."
+                    if required
+                    else ""
+                )
+            )
         return tokens
 
-    if os.environ.get(REQUIRE_TOKENS_ENV):
+    if required:
         pytest.fail(
             f"{TOKENS_FILE} was required on this run ({REQUIRE_TOKENS_ENV} is "
             f"set) and did not materialise -- check the PUBLICATION_TOKENS "
