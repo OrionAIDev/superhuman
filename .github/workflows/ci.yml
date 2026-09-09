@@ -41,8 +41,36 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r tests/requirements.txt
 
+      # The operator-token guard reads a gitignored `.publication-tokens` list,
+      # so until this step existed it skipped on every CI run: the control that
+      # keeps operator vocabulary out of a PUBLIC repo had never executed here.
+      # Commit cb7271d is the worked failure -- private repository names reached
+      # three tracked files through a green build and were removed afterwards.
+      #
+      # Repository secrets are unavailable to pull_request runs from FORKS, by
+      # GitHub's design. Gate on the run's SHAPE, which is knowable without the
+      # secret -- never on the secret's own presence, because gating on presence
+      # would let a deleted or renamed secret silently re-disable the guard,
+      # which is the defect this step exists to fix.
+      #
+      # The secret's value is a word list, not a credential: its disclosure cost
+      # is embarrassment, not compromise. That is why writing it into a runner
+      # workspace is acceptable here and would not be for a token. The file is
+      # gitignored, so the materialised copy cannot be committed.
+      - name: Materialise the operator token list
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          PUBLICATION_TOKENS: ${{ secrets.PUBLICATION_TOKENS }}
+        run: |
+          printf '%s\n' "$PUBLICATION_TOKENS" > .publication-tokens
+          echo "SUPERHUMAN_REQUIRE_OPERATOR_TOKENS=1" >> "$GITHUB_ENV"
+
       # Several tests shell out to scripts/*.sh and drive throwaway git repos.
       # They set their own per-repo user.name/user.email and disable commit
       # signing, so no global git identity is needed here.
+      #
+      # `-rs` prints every skip with its reason. Without it a guard that has
+      # stopped running is an unread integer in the summary line rather than a
+      # named line whose disappearance is visible.
       - name: Run test suite
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q -rs
