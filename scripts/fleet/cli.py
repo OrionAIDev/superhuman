@@ -1213,6 +1213,22 @@ def _cmd_observe_session_start(args: argparse.Namespace) -> int:
     locator refusal both mean "nothing to do here": exit 0, having written
     nothing, exactly like every other `observe` outcome (D2b).
 
+    `--anchor <dir>` (Chunk 6, ARCHITECTURE.md Addendum §A) is tried BEFORE
+    the payload's `cwd` when given and non-empty: `templates/hooks/claude-code/
+    session-start` passes `$CLAUDE_PROJECT_DIR` here, since it names the
+    session's outer root and is stable for the session's lifetime, whereas
+    `cwd` drifts as the shell moves. This option is deliberately named
+    generically (D4: no harness name in `scripts/fleet/**`) — the harness
+    knowledge that it should be `$CLAUDE_PROJECT_DIR` lives only in the
+    template. `--anchor` is harness-SUPPLIED (an environment variable only
+    the harness process can set), never repo-authored, which is exactly why
+    it is admissible as a locator input where a repo-authored string is not
+    (NFR-4). NFR-4 confinement itself is unweakened by this: the anchor is
+    only a starting point, and `locate_project` still derives the returned
+    workspace via `git rev-parse` — no path construction happens here. When
+    `--anchor` is absent (the default, `None`), behavior is byte-identical
+    to before this option existed: only `payload.cwd` is ever tried.
+
     Args:
         args: parsed CLI arguments.
 
@@ -1226,7 +1242,11 @@ def _cmd_observe_session_start(args: argparse.Namespace) -> int:
         payload = fleet_hook_payload.read_hook_payload(args.hook_payload)
         if payload is None:
             return 0
-        location = locate_project(payload.cwd)
+        location = None
+        if getattr(args, "anchor", None):
+            location = locate_project(args.anchor)
+        if location is None:
+            location = locate_project(payload.cwd)
         if location is None:
             return 0
         workspace = location.workspace
@@ -1616,6 +1636,14 @@ def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
         help="read a harness hook JSON payload from this file, or '-' for stdin (D2b); "
         "derives --workspace/--slug via the locator from the payload's cwd, and threads "
         "the harness's own session id through (FR-17)",
+    )
+    session_start_parser.add_argument(
+        "--anchor",
+        default=None,
+        help="with --hook-payload: try locating the project from THIS directory first, "
+        "falling back to the payload's cwd only if it does not resolve (ARCHITECTURE.md "
+        "Addendum §A) — a harness-supplied starting point (e.g. $CLAUDE_PROJECT_DIR), "
+        "never a repo-authored one; omitting this flag leaves behavior unchanged",
     )
     session_start_parser.add_argument(
         "--handoff-id",

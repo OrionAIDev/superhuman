@@ -251,21 +251,28 @@ class TestAdditiveDiffInvariant:
 # --- TC-14: hook templates contain no operator tokens and call the shipped
 # entry point (W-NFR-5, Chunk 3) --------------------------------------------
 
-#: The two operator-neutral hook templates Chunk 3 ships. Each must invoke
-#: the identical `observe <event>` verb the prose floor uses — never a
-#: parallel/divergent invocation (DESIGN's hybrid boundary). Matched on the
-#: real module invocation (`python -m scripts.fleet.cli observe <event>`),
-#: since no `fleet` executable is ever installed on `PATH`.
+#: The two operator-neutral hook templates. Each must invoke the identical
+#: `observe <event>` verb the prose floor uses — never a parallel/divergent
+#: invocation (DESIGN's hybrid boundary). Matched on the real module
+#: invocation (`python -m scripts.fleet.cli observe <event>`), since no
+#: `fleet` executable is ever installed on `PATH`.
+#:
+#: `templates/hooks/SessionStart` (Chunk 3's `observe launch` wrapper) was
+#: superseded at Chunk 6 by `templates/hooks/claude-code/session-start`
+#: (`observe session-start --hook-payload -`, FR-15/FR-16) and deleted;
+#: updated here rather than left to bit-rot against a file that no longer
+#: exists. `templates/hooks/PreToolUse` is unchanged (Chunk 7's file).
 _HOOK_TEMPLATES: dict[str, str] = {
-    "templates/hooks/SessionStart": "-m scripts.fleet.cli observe launch",
+    "templates/hooks/claude-code/session-start": "-m scripts.fleet.cli observe session-start",
     "templates/hooks/PreToolUse": "-m scripts.fleet.cli observe dispatch",
 }
 
 
 class TestHookTemplateSeamContent:
-    """TC-14: templates/hooks/{SessionStart,PreToolUse} exist, are clean, and
+    """TC-14: templates/hooks/{claude-code/session-start,PreToolUse} exist,
 
-    invoke the same CLI verb group the portable prose floor invokes.
+    are clean, and invoke the same CLI verb group the portable prose floor
+    invokes.
     """
 
     @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))

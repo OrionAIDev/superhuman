@@ -20,7 +20,7 @@ scripts/autonomous-iter.sh text eol=lf
 # shebang ending in a carriage return names no valid interpreter, and a
 # trailing backslash would escape that carriage return rather than
 # continue the line.
-templates/hooks/SessionStart text eol=lf
+templates/hooks/claude-code/session-start text eol=lf
 templates/hooks/PreToolUse text eol=lf
 
 # Reference scripts the docs invoke directly (`./find-polluter.sh`,

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# templates/hooks/claude-code/session-start — the deterministic SessionStart
+# hook for fleet session observation (fleet-deterministic-seams Chunk 6).
+# Supersedes templates/hooks/SessionStart, which hardcoded a
+# fill-in-your-project-slug placeholder and used an unsound cwd lookup.
+#
+# Installed via `fleet hooks install` (Chunk 8) into a harness's
+# SessionStart hook config (e.g. Claude Code's `~/.claude/settings.json`,
+# matchers startup|resume|clear|compact|fork). Never installed
+# automatically by this skill on its own — `templates/hooks/` ships
+# templates, not live hooks.
+#
+# Purpose: give the launch flip and plain session observation a
+# DETERMINISTIC ceiling that fires WITHOUT depending on a prompt ever
+# being read. This wrapper calls the SAME entry point the portable prose
+# floor calls -- `python -m scripts.fleet.cli observe session-start` --
+# so the hook and the floor can never diverge (FR-15; D4's boundary rule:
+# no parallel or divergent invocation may exist anywhere in this script).
+#
+# Best-effort by construction (NFR-1): this script's own exit status is
+# NEVER allowed to reach the harness as non-zero. `observe session-start`
+# itself always exits 0 (see scripts/fleet/observe.py's module docstring
+# -- it is fail-soft), and everything below additionally traps so an
+# interpreter failure or a moved skill root can never propagate.
+#
+# stdout is left ALONE deliberately -- nothing below redirects it. At
+# SessionStart, whatever `observe session-start` prints to stdout becomes
+# session context, reaching both a human and the model (DESIGN.md D6: the
+# ONE line `identity_unresolved` prints depends on exactly this). Only
+# stderr is discarded, so an unrelated diagnostic never reaches that
+# context.
+trap 'exit 0' EXIT
+
+# --- workspace/session identity: read from the harness's stdin JSON, ------
+# --- never from this process's own working directory ----------------------
+#
+# FR-16: the hook subprocess's own OS working directory is UNDOCUMENTED
+# and is not the session's workspace -- this is the exact defect
+# (fleet-wiring Phase 1.1) this rewrite exists to fix. `observe
+# session-start --hook-payload -` reads the session's real `cwd` straight
+# out of the JSON on stdin. Nothing in this script calls `pwd` for that
+# purpose, or for any purpose.
+
+# --- locate the superhuman skill checkout (no SLUG placeholder) -----------
+#
+# This script itself lives at templates/hooks/claude-code/session-start
+# inside the skill checkout, so its own path is a reliable anchor for the
+# skill root regardless of where the harness's config points at it from --
+# unlike the workspace under observation, this path is fixed at install
+# time. Overridable via $SUPERHUMAN_ROOT for a non-standard layout.
+SUPERHUMAN_ROOT="${SUPERHUMAN_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+
+# --- resolve a Python interpreter that actually RUNS (ARCHITECTURE.md §6.3) -
+#
+# Each candidate is EXECUTED, not merely tested for existence or the
+# executable bit. On Windows, a `python` found on PATH can be the
+# Microsoft Store "app execution alias" -- a stub that exists, is
+# executable, and exits 49 with an advert instead of running Python;
+# `command -v python` happily reports it as found. Mirrors
+# scripts/autonomous-precondition.sh's identical guard.
+PYTHON=""
+for candidate in \
+  "$(command -v python3 2>/dev/null || true)" \
+  "$(command -v python 2>/dev/null || true)"
+do
+  [ -n "$candidate" ] || continue
+  if "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+    PYTHON="$candidate"
+    break
+  fi
+done
+[ -z "$PYTHON" ] && exit 0
+
+# --- CLAUDE_PROJECT_DIR: the preferred anchor, payload cwd is the fallback -
+#
+# ARCHITECTURE.md Addendum §A / CHUNK-1-FINDINGS.md finding 8:
+# $CLAUDE_PROJECT_DIR is set by the harness (measured 17/17 captures) and
+# stable for the session's lifetime, unlike the payload's `cwd`, which
+# drifts as the shell moves. It is harness-supplied, never repo-authored
+# -- a repository cannot set an environment variable in the process that
+# invokes it -- which is exactly why it is an admissible locator input
+# here (NFR-4 confinement is unweakened: it is only a starting point, and
+# the locator still derives every returned workspace via `git
+# rev-parse`). Passed through to the portable CLI generically as
+# `--anchor`; `scripts/fleet/cli.py` names no harness (D4).
+ANCHOR_ARGS=()
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  ANCHOR_ARGS=(--anchor "$CLAUDE_PROJECT_DIR")
+fi
+
+(
+  cd "$SUPERHUMAN_ROOT" \
+    && "$PYTHON" -m scripts.fleet.cli observe session-start \
+      --hook-payload - \
+      --harness claude \
+      "${ANCHOR_ARGS[@]}"
+) 2>/dev/null
+
+exit 0
