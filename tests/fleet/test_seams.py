@@ -31,7 +31,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # `sys.path` outside pytest's own rootdir-relative import; this mirrors how
 # `tests/test_content.py` (a sibling of publication_patterns.py) imports it.
 sys.path.insert(0, str(_REPO_ROOT / "tests"))
-from publication_patterns import TOKENS_FILE, find_tokens, resolve_tokens  # noqa: E402
+from publication_patterns import (  # noqa: E402
+    find_tokens,
+    locate_tokens_file,
+    resolve_tokens,
+)
 
 #: The two prose files Chunk 2 is permitted to edit that actually carry the
 #: new handoff-emission subsection (`SKILL.md`/`phases/4-acceptance.md` were
@@ -77,7 +81,7 @@ def _operator_tokens() -> list[str]:
     carrying this repository's own changes). See `resolve_tokens`' state
     table.
     """
-    return resolve_tokens(_REPO_ROOT / TOKENS_FILE)
+    return resolve_tokens(locate_tokens_file(_REPO_ROOT))
 
 
 def _merge_base_with_main() -> str | None:
