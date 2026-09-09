@@ -21,6 +21,7 @@ from publication_patterns import (  # noqa: E402
     find_tokens,
     is_scanned,
     load_tokens,
+    resolve_tokens,
 )
 
 
@@ -972,15 +973,15 @@ def test_no_infrastructure_leaks(skill_root: Path) -> None:
 def test_operator_tokens_are_absent(skill_root: Path) -> None:
     """No shipped file may contain a token listed in `.publication-tokens`.
 
-    Skips silently when the file is absent, which is the normal case for anyone
-    who is not maintaining a private fork with its own vocabulary.
+    Whether this runs, fails, or skips is decided by
+    ``publication_patterns.resolve_tokens``, which is also what
+    ``tests/fleet/test_seams.py`` calls -- one mechanism, so the two cannot
+    drift. In particular an absent list is a **failure** on any run that set
+    ``SUPERHUMAN_REQUIRE_OPERATOR_TOKENS``, which CI does for every run
+    carrying this repository's own changes. On a fork pull request, where
+    GitHub withholds the secret by design, it skips with a reason that says so.
     """
-    tokens_path = skill_root / TOKENS_FILE
-    if not tokens_path.is_file():
-        pytest.skip(f"no {TOKENS_FILE} — nothing operator-specific to check")
-
-    tokens = load_tokens(tokens_path)
-    assert tokens, f"{TOKENS_FILE} exists but lists no tokens"
+    tokens = resolve_tokens(skill_root / TOKENS_FILE)
 
     offenders: dict[str, list[str]] = {}
     for rel in _publication_candidates(skill_root):

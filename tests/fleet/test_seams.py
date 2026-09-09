@@ -31,7 +31,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # `sys.path` outside pytest's own rootdir-relative import; this mirrors how
 # `tests/test_content.py` (a sibling of publication_patterns.py) imports it.
 sys.path.insert(0, str(_REPO_ROOT / "tests"))
-from publication_patterns import TOKENS_FILE, find_tokens, load_tokens  # noqa: E402
+from publication_patterns import TOKENS_FILE, find_tokens, resolve_tokens  # noqa: E402
 
 #: The two prose files Chunk 2 is permitted to edit that actually carry the
 #: new handoff-emission subsection (`SKILL.md`/`phases/4-acceptance.md` were
@@ -57,27 +57,27 @@ _PROCEEDS_MARKERS = ("proceed", "continue", "unaffected")
 def _operator_tokens() -> list[str]:
     """Read operator tokens the same way `test_content.py`'s canonical
     `test_operator_tokens_are_absent` guard does (W-NFR-5): via
-    `publication_patterns.load_tokens` against the gitignored
+    `publication_patterns.resolve_tokens` against the gitignored
     `.publication-tokens` file at the repo root, never hardcoded in this
-    tracked, shipped test file. Skips cleanly (matching the canonical
-    guard's own behavior) when the file is absent — the normal case for
-    anyone who is not maintaining a private fork with its own operator
-    vocabulary.
+    tracked, shipped test file.
 
-    Delegating to `load_tokens` (rather than re-parsing the file here) keeps
-    this module's token *loading* on the same single code path as the
-    canonical guard — matching is likewise delegated to `find_tokens` at
-    each call site below, so this module's operator-token checks and
-    `test_operator_tokens_are_absent` share their entire mechanism, not
-    just their token source.
+    Delegating the whole not-run decision to `resolve_tokens` — rather than
+    re-implementing it here — keeps this module on the same single code path
+    as the canonical guard. Matching is likewise delegated to `find_tokens`
+    at each call site below, so this module's operator-token checks and
+    `test_operator_tokens_are_absent` share their entire mechanism, not just
+    their token source.
+
+    **This function used to diverge, and the divergence was the bug.** It
+    skipped when the file existed but listed no tokens, where the canonical
+    guard failed — so a token file truncated to nothing silently disabled
+    half the guard while the other half stayed loud. Both now fail there, and
+    both now fail when the file is absent on a run that set
+    `SUPERHUMAN_REQUIRE_OPERATOR_TOKENS` (which CI does for every run
+    carrying this repository's own changes). See `resolve_tokens`' state
+    table.
     """
-    tokens_path = _REPO_ROOT / TOKENS_FILE
-    if not tokens_path.is_file():
-        pytest.skip(f"no {TOKENS_FILE} — nothing operator-specific to check")
-    tokens = load_tokens(tokens_path)
-    if not tokens:
-        pytest.skip(f"{TOKENS_FILE} exists but lists no tokens")
-    return tokens
+    return resolve_tokens(_REPO_ROOT / TOKENS_FILE)
 
 
 def _merge_base_with_main() -> str | None:

@@ -15,7 +15,10 @@ Kept in its own module for two reasons, both learned the hard way:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 #: Infrastructure leaks that no published repository should contain. These are
 #: patterns, not names, so the guard is useful to anyone publishing a fork — not
@@ -80,6 +83,12 @@ LEAK_PATTERNS: tuple[tuple[str, str, str, str], ...] = (
 #: names into a shared test.
 TOKENS_FILE = ".publication-tokens"
 
+#: Environment variable a run sets to declare that the operator token list was
+#: *supposed* to materialise on it. CI exports it on every run that carries the
+#: repository's own changes (see `.github/workflows/ci.yml`), so an absent list
+#: on such a run is a broken secret rather than an ordinary fork.
+REQUIRE_TOKENS_ENV = "SUPERHUMAN_REQUIRE_OPERATOR_TOKENS"
+
 #: Suffixes the guard SKIPS, because reading them as text is meaningless.
 #:
 #: A denylist, not an allowlist, and the direction is the entire point. This was
@@ -140,6 +149,88 @@ def load_tokens(tokens_path: Path) -> list[str]:
         for line in tokens_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
+
+
+def resolve_tokens(tokens_path: Path) -> list[str]:
+    """Return the operator token list, or skip/fail per the guard's state table.
+
+    This is the *whole* not-run policy for the operator-token guard, in one
+    place, so ``tests/test_content.py::test_operator_tokens_are_absent`` and
+    ``tests/fleet/test_seams.py`` share a single mechanism rather than two
+    hand-copied ones that drift. They had already drifted: ``test_seams.py``
+    *skipped* on an empty list where ``test_content.py`` *failed*, so a token
+    file truncated to nothing disabled half the guard silently.
+
+    ============================  ==========================  =============
+    ``.publication-tokens``       ``REQUIRE_TOKENS_ENV``      Behaviour
+    ============================  ==========================  =============
+    present, non-empty            either                      run the guard
+    present, empty                either                      **fail**
+    absent                        set (non-empty)             **fail**
+    absent                        unset or empty              skip, with a
+                                                              reason naming
+                                                              the fork case
+    ============================  ==========================  =============
+
+    The third row is the reason this function exists. Before it, an absent list
+    always skipped, so the guard that keeps operator vocabulary out of a public
+    repository had never executed in CI at all -- and a skip reported by ``-q``
+    as an integer nobody diffs reads exactly like a guard that holds.
+
+    Note the require-flag is honoured on *any* non-empty value, ``"0"``
+    included. That is deliberate: the only failure direction available here is
+    fail-closed, and a run that goes out of its way to set the variable at all
+    is a run that expected the list.
+
+    Args:
+        tokens_path: Path to the repo-root ``.publication-tokens`` file.
+
+    Returns:
+        Lowercased, non-empty tokens (only when the guard is to run).
+
+    Raises:
+        Failed: via :func:`pytest.fail`, for either failing row.
+        Skipped: via :func:`pytest.skip`, for the fork row.
+    """
+    required = bool(os.environ.get(REQUIRE_TOKENS_ENV))
+
+    if tokens_path.is_file():
+        tokens = load_tokens(tokens_path)
+        if not tokens:
+            # In CI the "absent" row below is unreachable -- the workflow step
+            # always creates the file -- so a broken secret arrives HERE, as an
+            # empty file, not as a missing one. Measured on the first real run:
+            # with no PUBLICATION_TOKENS secret set, `printf '%s\n' ""` writes a
+            # lone newline and every call site failed with a message that never
+            # named the secret. Say what to go and fix.
+            pytest.fail(
+                f"{TOKENS_FILE} exists but lists no tokens"
+                + (
+                    f" -- and {REQUIRE_TOKENS_ENV} is set, so this run expected "
+                    f"a real list. On CI that means the PUBLICATION_TOKENS "
+                    f"repository secret is missing, empty, or renamed. Do NOT "
+                    f"fix this by deleting the workflow step that writes the "
+                    f"file; that restores the defect this guard exists to catch."
+                    if required
+                    else ""
+                )
+            )
+        return tokens
+
+    if required:
+        pytest.fail(
+            f"{TOKENS_FILE} was required on this run ({REQUIRE_TOKENS_ENV} is "
+            f"set) and did not materialise -- check the PUBLICATION_TOKENS "
+            f"repository secret. Do NOT fix this by deleting the workflow step "
+            f"that writes the file; that restores the defect this guard exists "
+            f"to catch."
+        )
+
+    pytest.skip(
+        f"no {TOKENS_FILE} -- nothing operator-specific to check. Expected on a "
+        f"fork pull request: GitHub does not expose repository secrets to "
+        f"forks, so the operator-vocabulary guard cannot run there."
+    )
 
 
 def find_tokens(text: str, tokens: list[str]) -> list[str]:

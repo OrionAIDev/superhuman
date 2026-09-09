@@ -14,20 +14,31 @@ so that cannot recur.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from publication_patterns import (  # noqa: E402
     LEAK_PATTERNS,
     PUBLICATION_EXEMPT,
+    REQUIRE_TOKENS_ENV,
     SKIPPED_SUFFIXES,
+    TOKENS_FILE,
     is_scanned,
 )
+
+#: The workflow the meta-test below reads. One file, named once.
+_CI_WORKFLOW = Path(".github") / "workflows" / "ci.yml"
+
+#: The repository secret the materialisation step reads. Named here so the test
+#: and the failure messages cannot disagree about which secret is missing.
+_TOKENS_SECRET = "PUBLICATION_TOKENS"
 
 
 @pytest.mark.parametrize(
@@ -179,4 +190,128 @@ def test_guard_covers_every_tracked_file_but_binaries(skill_root: Path) -> None:
         assert is_scanned(previously_missed), (
             f"{previously_missed} is tracked but not scanned — the suffix "
             "blind spot has regressed"
+        )
+
+
+def _ci_test_job_steps(skill_root: Path) -> list[dict]:
+    """Return the steps of the workflow job that runs the test suite.
+
+    Parsed as YAML rather than grepped, so the assertions below are about the
+    workflow's real structure -- which step, which key -- and not about text
+    that happens to appear somewhere in the file, including inside a comment.
+
+    Args:
+        skill_root: Repository root.
+
+    Returns:
+        The job's ``steps`` list.
+    """
+    workflow = yaml.safe_load((skill_root / _CI_WORKFLOW).read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+
+    pytest_jobs = [
+        name for name, job in jobs.items()
+        if any("pytest" in str(step.get("run", "")) for step in job.get("steps", []))
+    ]
+    assert len(pytest_jobs) == 1, (
+        f"expected exactly one job in {_CI_WORKFLOW} to run pytest, found "
+        f"{pytest_jobs}. The token list is exported through $GITHUB_ENV, which "
+        "is scoped to a single job -- a second pytest job would run the suite "
+        "with the guard silently disabled."
+    )
+    return jobs[pytest_jobs[0]]["steps"]
+
+
+def test_ci_runs_the_operator_token_guard(skill_root: Path) -> None:
+    """CI must materialise the operator token list and print its skips.
+
+    **This is the control on the control, and it is the point of the change it
+    guards.** The operator-token guard reads a gitignored file, so for the
+    whole life of the workflow before this test it skipped on every CI run:
+    the check that keeps operator vocabulary out of a public repository had
+    never once executed there, and ``-q`` reported that as an integer in a
+    summary line rather than as anything a reader would notice. Commit
+    ``cb7271d`` is the worked failure -- private repository names reached three
+    tracked files through a green build.
+
+    The failure being fixed is therefore "a guard stopped running and nobody
+    noticed", so deleting the workflow step must not be a way to turn a red
+    build green. With this test present, deleting that step fails *two* tests
+    instead of zero.
+
+    It needs no secret and reads only a tracked file, so unlike the guard it
+    protects, it runs everywhere -- including on fork pull requests.
+
+    Args:
+        skill_root: Repository root.
+    """
+    steps = _ci_test_job_steps(skill_root)
+
+    materialise = [
+        i for i, step in enumerate(steps)
+        if TOKENS_FILE in str(step.get("run", ""))
+        and REQUIRE_TOKENS_ENV in str(step.get("run", ""))
+    ]
+    assert len(materialise) == 1, (
+        f"{_CI_WORKFLOW} must contain exactly one step that writes "
+        f"{TOKENS_FILE} and exports {REQUIRE_TOKENS_ENV}; found "
+        f"{len(materialise)}. Without it the operator-token guard skips on "
+        "every CI run and this repository publishes unguarded. Steps read "
+        f"from {skill_root / _CI_WORKFLOW} "
+        f"(mtime={(skill_root / _CI_WORKFLOW).stat().st_mtime_ns}, "
+        f"bytes={(skill_root / _CI_WORKFLOW).stat().st_size}): "
+        + repr([s.get("name") or f"<{sorted(s)[0]}>" for s in steps])
+    )
+    step = steps[materialise[0]]
+
+    # The secret reaches the step through `env:`, not through an inline
+    # expansion in `run:` -- the latter interpolates the value into the shell
+    # command before the shell sees it.
+    env = step.get("env") or {}
+    assert env.get(_TOKENS_SECRET) == "${{ secrets.%s }}" % _TOKENS_SECRET, (
+        f"the materialisation step must read the {_TOKENS_SECRET} repository "
+        f"secret through `env:`, got env={env!r}"
+    )
+
+    # The gate is on the run's SHAPE, never on the secret's presence. Gating on
+    # presence would let a deleted or renamed secret silently re-disable the
+    # guard, which is precisely the defect this step exists to fix.
+    condition = str(step.get("if", ""))
+    assert "github.event.pull_request.head.repo.full_name" in condition, (
+        "the materialisation step must be gated on the run not being a FORK "
+        f"pull request, got if={condition!r}"
+    )
+    assert "github.repository" in condition, (
+        "the fork gate must compare the PR head repo against github.repository, "
+        f"got if={condition!r}"
+    )
+    assert "secrets." not in condition, (
+        "the materialisation step must NOT be gated on the secret's presence "
+        f"-- a deleted or renamed secret would then silently re-disable the "
+        f"guard instead of failing the build. Got if={condition!r}"
+    )
+
+    # `-rs` turns each skip from an unread integer into a named line with its
+    # reason, which is what makes a guard that stops running visible at all.
+    pytest_steps = [
+        i for i, s in enumerate(steps) if "pytest" in str(s.get("run", ""))
+    ]
+    assert pytest_steps, f"no step in {_CI_WORKFLOW} runs pytest"
+    for i in pytest_steps:
+        flags = shlex.split(str(steps[i]["run"]))
+        reported = {
+            char
+            for flag in flags
+            if flag.startswith("-r") and not flag.startswith("--")
+            for char in flag[2:]
+        }
+        assert reported & {"s", "a", "A"}, (
+            f"the pytest step in {_CI_WORKFLOW} must pass `-rs` so every skip "
+            f"prints its reason; got {flags!r}. Without it a guard that has "
+            "stopped running shows up only as a count nobody diffs."
+        )
+        assert i > materialise[0], (
+            "the pytest step runs BEFORE the token list is materialised, so "
+            f"{TOKENS_FILE} does not exist yet and the guard skips anyway. "
+            f"pytest at step {i}, materialisation at step {materialise[0]}."
         )
