@@ -351,6 +351,7 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             current_session_id=args.session_id,
             sessions=sessions,
             session_relay_script=args.session_relay_script,
+            git_facts_root=getattr(args, "git_facts_root", None),
         )
     if args.harness == "subagent":
         if not args.local_id:
@@ -1243,14 +1244,34 @@ def _cmd_observe_session_start(args: argparse.Namespace) -> int:
         if payload is None:
             return 0
         location = None
+        resolved_from = None
         if getattr(args, "anchor", None):
             location = locate_project(args.anchor)
+            if location is not None:
+                resolved_from = args.anchor
         if location is None:
             location = locate_project(payload.cwd)
+            if location is not None:
+                resolved_from = payload.cwd
         if location is None:
             return 0
         workspace = location.workspace
         slug = location.slug
+        # `resolved_from` is whichever of --anchor/payload.cwd actually
+        # located this project -- the session's OWN working tree, before
+        # D1's outward hop to `workspace`. Chunk-6-review defect: with no
+        # git_facts_root, ClaudeAdapter's git_facts() queried `workspace`
+        # itself for branch/commit state, so a session in a linked worktree
+        # got the MAIN CHECKOUT's currently-checked-out branch recorded as
+        # its own -- a real value answering a different question, and
+        # non-deterministic besides (that checkout's branch can change from
+        # unrelated activity in another session). Measured in production:
+        # a fleet-deterministic-seams-worktree session's row recorded
+        # branch="fix/242-arm-guards-everywhere", the MAIN checkout's branch
+        # at that moment. `git -C <dir>` auto-discovers the enclosing
+        # worktree from any subdirectory, so `resolved_from` need not be an
+        # exact repo root.
+        args.git_facts_root = resolved_from
         if args.session_id is None:
             args.session_id = payload.session_id
         if args.local_id is None:

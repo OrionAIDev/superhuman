@@ -10,6 +10,7 @@ them, and a fake ``session_scan.py``-shaped script for the enrichment path.
 
 from __future__ import annotations
 
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -209,3 +210,81 @@ class TestClaudeAdapterBlankSessionIdFailsClosed:
         adapter = ClaudeAdapter(tmp_path, "demo-slug", current_session_id="   ")
         with pytest.raises(SessionIdentityUnresolved):
             adapter.current_session()
+
+
+# --------------------------------------------------------------------------- #
+# `git_facts_root`: `workspace` and the session's own working tree can be
+# DIFFERENT repositories' worth of git state. D1 deliberately resolves
+# `workspace` outward to a linked worktree's MAIN checkout (so the project's
+# `SUPERHUMAN.md` docs mount can be found) -- correct for that, and wrong for
+# "what branch is this session on". Measured in production: a session
+# running in its own worktree had its `session_registered` row recorded with
+# the MAIN checkout's currently-checked-out branch, not its own -- a real
+# value answering a different question, and non-deterministic besides, since
+# that checkout's branch can change from unrelated activity in another
+# session entirely.
+# --------------------------------------------------------------------------- #
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", *args],
+        cwd=str(cwd), check=True, capture_output=True,
+    )
+
+
+class TestClaudeAdapterGitFactsRoot:
+    def test_default_git_facts_root_is_workspace_byte_identical_behaviour(
+        self, tmp_path: Path
+    ) -> None:
+        """No `git_facts_root` given: behaviour is unchanged from before this
+        parameter existed -- `git_facts()` queries `workspace` itself.
+        """
+        _git(tmp_path, "init")
+        _git(tmp_path, "checkout", "-b", "workspace-branch")
+        (tmp_path / "f.txt").write_text("x", encoding="utf-8")
+        _git(tmp_path, "add", "f.txt")
+        _git(tmp_path, "commit", "-m", "init")
+
+        adapter = ClaudeAdapter(tmp_path, "demo-slug", current_session_id="s1")
+        assert adapter._git_facts_root == adapter.workspace
+        assert adapter.git_facts().branch == "workspace-branch"
+
+    def test_git_facts_root_overrides_workspace_for_branch_detection(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression this parameter exists for: a session in a linked
+        worktree gets ITS OWN branch, not `workspace`'s (the outward-hopped
+        main checkout).
+        """
+        main = tmp_path / "main"
+        main.mkdir()
+        _git(main, "init")
+        (main / "f.txt").write_text("x", encoding="utf-8")
+        _git(main, "add", "f.txt")
+        _git(main, "commit", "-m", "init")
+        _git(main, "checkout", "-b", "main-checkout-branch")
+
+        linked = tmp_path / "linked"
+        _git(main, "worktree", "add", str(linked), "-b", "the-session-own-branch")
+
+        adapter = ClaudeAdapter(
+            workspace=main,
+            slug="demo-slug",
+            current_session_id="s1",
+            git_facts_root=linked,
+        )
+        info = adapter.current_session()
+
+        assert info.workspace == str(main), (
+            "workspace field must stay the D1-resolved main checkout -- "
+            "unaffected by this fix, still what namespaces the node id and "
+            "locates the docs mount"
+        )
+        assert info.branch == "the-session-own-branch", (
+            "branch must come from git_facts_root (the session's own "
+            "worktree), never from workspace (the outward-hopped main "
+            "checkout) -- this is the exact defect: a session recorded the "
+            "MAIN checkout's branch as its own"
+        )
+        assert info.branch != "main-checkout-branch"
