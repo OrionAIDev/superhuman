@@ -45,6 +45,7 @@ from typing import Sequence
 
 from . import config as fleet_config
 from . import project as fleet_project
+from . import project_id as fleet_project_id
 from .locate import locate_project
 
 #: The minimum git version `locate.py`'s `--path-format=absolute` needs
@@ -224,6 +225,20 @@ def _classify(root: Path, entry: Path) -> ProjectHealth:
         )
 
     project_id, _file_slug = identity
+    # A record can be *syntactically* fine and still carry no identity: an
+    # unfilled `{{project_id}}` template placeholder matches `project.py`'s
+    # `\S+` reader. Reporting that as "ok" would be the worst outcome for
+    # FR-10 — the backfill would skip exactly the records that most need an
+    # id, and every such project would write rows under one shared literal.
+    # See `project_id.is_sentinel_id`.
+    if fleet_project_id.is_sentinel_id(project_id):
+        return ProjectHealth(
+            root=root,
+            slug=slug,
+            state="no_project_id",
+            detail=f"**Project-id:** is an unfilled placeholder ({project_id!r}), not an identity",
+        )
+
     return ProjectHealth(root=root, slug=slug, state="ok", detail=f"project_id={project_id}")
 
 
