@@ -1,0 +1,4 @@
+[project]
+name = "sample-widget-service"
+version = "0.1.0"
+description = "Synthetic fixture project used by route.py's test suite."
