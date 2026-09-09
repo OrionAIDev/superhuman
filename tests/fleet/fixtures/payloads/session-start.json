@@ -1,8 +1,8 @@
 {
-  "cwd": "C:\\Users\\example\\PycharmProjects\\trapezia_lab",
+  "cwd": "C:\\Users\\example\\PycharmProjects\\example_project",
   "hook_event_name": "SessionStart",
-  "scratchpad_dir": "C:\\Users\\example\\AppData\\Local\\Temp\\claude\\C--Users-example-PycharmProjects-trapezia-lab\\00000000-0000-4000-8000-000000000000\\scratchpad",
+  "scratchpad_dir": "C:\\Users\\example\\AppData\\Local\\Temp\\claude\\C--Users-example-PycharmProjects-example-project\\00000000-0000-4000-8000-000000000000\\scratchpad",
   "session_id": "redacted-session-id",
   "source": "startup",
-  "transcript_path": "C:\\Users\\example\\.claude\\projects\\C--Users-example-PycharmProjects-trapezia-lab\\00000000-0000-4000-8000-000000000000.jsonl"
+  "transcript_path": "C:\\Users\\example\\.claude\\projects\\C--Users-example-PycharmProjects-example-project\\00000000-0000-4000-8000-000000000000.jsonl"
 }
