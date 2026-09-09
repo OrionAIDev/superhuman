@@ -2,6 +2,12 @@
 
 This file is the ONLY place that knows about platform-specific tool names. When porting superhuman to a different harness (e.g., Claude Code → OpenClaw), edit only this file.
 
+> **Every `<dispatch:agent>` call carries `conventions/subagent-constraints.md` verbatim**, in the
+> `declared conventions` position. A subagent inherits its parent's TOOLS but not its parent's
+> ENVIRONMENT — the harness preamble about worktrees, shared stash stacks and forbidden operations
+> reaches the orchestrator and stops there. Restating it per-brief from memory failed on
+> 2026-09-09 and lost nothing only by luck; that file records the incident and the block to paste.
+
 > For the *patterns* these symbols compose into — direct dispatch, sequential pipeline, parallel
 > fan-out with merge, research isolation — and the anti-patterns to avoid, see
 > `references/orchestration-patterns.md`. This file resolves the symbols; that catalog governs how

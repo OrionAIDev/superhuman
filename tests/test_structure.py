@@ -57,7 +57,7 @@ EXPECTED_PHASES = {
 
 EXPECTED_CONVENTIONS = {
     "python.md", "testing.md", "git.md", "autonomous.md", "source-cited.md",
-    "subagent-return-schema.md",
+    "subagent-return-schema.md", "subagent-constraints.md",
 }
 
 EXPECTED_REFERENCES = {
@@ -149,7 +149,7 @@ def test_phases_match_spec(skill_root: Path) -> None:
 
 
 def test_conventions_match_spec(skill_root: Path) -> None:
-    """All 3 convention files exist."""
+    """All declared convention files exist, and only those."""
     actual = {p.name for p in (skill_root / "conventions").iterdir() if p.is_file()}
     assert actual == EXPECTED_CONVENTIONS, f"Conventions mismatch: {actual}"
 
