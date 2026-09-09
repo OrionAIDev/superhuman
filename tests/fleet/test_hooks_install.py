@@ -5,7 +5,7 @@ Developer implements each, TDD-first, per `TEST.md` TC-54..TC-62.
 
 **HARD RULE, enforced by this module's own fixtures, not merely intended:
 every test here operates on a TEMPORARY `settings.json` under `tmp_path`.
-No test may write to the real `C:\\Users\\Chris\\.claude\\settings.json`.**
+No test may write to the real `~/.claude/settings.json`.**
 
 Enforcement layers (see TEST.md's Chunk 8 section for the full rationale):
   1. `hooks_install.install()` / `uninstall()` / `status()` must accept an

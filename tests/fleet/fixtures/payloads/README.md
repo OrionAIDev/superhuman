@@ -10,7 +10,7 @@ harness's stdin contract (`REQUIREMENTS.md` A1).
 - Every `session_id` value replaced with a fixed placeholder
   (`"redacted-session-id"`).
 - Every absolute path containing the operator's username or a
-  machine-specific segment (`C:\Users\Chris\...`) replaced with a neutral
+  machine-specific segment (`C:\Users\<operator>\...`) replaced with a neutral
   placeholder root (`C:\example\workspace\...`), preserving path *shape*
   (worktree vs. plain repo, depth) since the shape is what the tests
   exercise.
