@@ -78,9 +78,17 @@ def _scripts_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "scripts"
 
 
-def _hook_path() -> Path:
-    """Path to the real pre-commit hook script."""
-    return _scripts_dir() / "git-hooks" / "pre-commit"
+#: Every hook `install-hooks.sh` installs. The installer fails when a source is
+#: missing, deliberately: installing only some of the hooks is the "remember to
+#: also do the other one" hole that roadmap#242 is about. So this list must stay
+#: in step with the installer's own loop, and a fixture that stages only one
+#: hook makes the installer fail rather than silently half-install.
+INSTALLED_HOOKS: tuple[str, ...] = ("pre-commit", "commit-msg")
+
+
+def _hook_path(name: str = "pre-commit") -> Path:
+    """Path to a real hook script under `scripts/git-hooks/`."""
+    return _scripts_dir() / "git-hooks" / name
 
 
 def _installer_path() -> Path:
@@ -158,8 +166,11 @@ def test_install_hooks_installs_executable_pre_commit(skill_root: Path, tmp_path
     repo_scripts = repo / "scripts"
     repo_hooks = repo_scripts / "git-hooks"
     repo_hooks.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(_hook_path(), repo_hooks / "pre-commit")
+    for hook_name in INSTALLED_HOOKS:
+        shutil.copy2(_hook_path(hook_name), repo_hooks / hook_name)
     shutil.copy2(_installer_path(), repo_scripts / "install-hooks.sh")
+    # The message hook execs this; stage it so the installed hook is runnable.
+    shutil.copy2(_scripts_dir() / "check_commit_message.py", repo_scripts / "check_commit_message.py")
 
     installer = repo_scripts / "install-hooks.sh"
 
@@ -176,15 +187,20 @@ def test_install_hooks_installs_executable_pre_commit(skill_root: Path, tmp_path
         f"install-hooks.sh failed.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
 
-    installed = repo / ".git" / "hooks" / "pre-commit"
-    assert installed.exists() or installed.is_symlink(), (
-        f"pre-commit hook was not installed at {installed}"
-    )
-    # Executable, or a symlink (symlink target carries the exec bit).
-    is_exec = os.access(str(installed), os.X_OK)
-    assert is_exec or installed.is_symlink(), (
-        f"Installed pre-commit hook is neither executable nor a symlink: {installed}"
-    )
+    # Assert EVERY hook, not just the first. Asserting only pre-commit would let
+    # a change that quietly stopped installing the message guard pass green --
+    # a control that does not exist, reported as working, which is the defect
+    # roadmap#242 is about.
+    for hook_name in INSTALLED_HOOKS:
+        installed = repo / ".git" / "hooks" / hook_name
+        assert installed.exists() or installed.is_symlink(), (
+            f"{hook_name} hook was not installed at {installed}"
+        )
+        # Executable, or a symlink (symlink target carries the exec bit).
+        is_exec = os.access(str(installed), os.X_OK)
+        assert is_exec or installed.is_symlink(), (
+            f"Installed {hook_name} hook is neither executable nor a symlink: {installed}"
+        )
 
     # Idempotent: a second run must also succeed.
     result2 = subprocess.run(

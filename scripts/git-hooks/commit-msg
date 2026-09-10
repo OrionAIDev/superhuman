@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# commit-msg — keep private vocabulary out of commit MESSAGES (roadmap#242).
+#
+# The pre-commit guard scans tracked FILES. A commit message is a published
+# surface too, and nothing looked at it: 14 of 27 commits on the published
+# branch carried an operator token in the message body when this was written.
+#
+# This hook is deliberately SEPARATE from the file guard rather than a step
+# inside it. The incident that motivated it was a commit whose files were clean
+# and whose message was not, so a message check reached only from the file
+# guard's findings would have missed precisely that case.
+#
+# INSTALL (per clone):
+#   scripts/install-hooks.sh
+#     -> creates .git/hooks/commit-msg (symlink, or a copy as fallback).
+#
+# BYPASS (emergencies only — prefer fixing the message):
+#   git commit --no-verify
+#
+# Git calls this hook with one argument: the path to the file holding the
+# proposed message. cwd is the top level of the working tree being committed in,
+# which is what the checker needs in order to locate this clone's token list —
+# including from a linked worktree, which has no list of its own.
+
+set -euo pipefail
+
+MSG_FILE="${1:?commit-msg: git did not pass a message file}"
+
+# See the pre-commit hook for why these are cleared: git exports them pointing at
+# the repo being committed, and anything that shells out to git would otherwise
+# operate on this repo instead of its own target.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY
+
+# The laptop has `python`; a deployed Linux environment may have only `python3`.
+PY="$(command -v python || command -v python3 || true)"
+if [ -z "$PY" ]; then
+    echo "commit-msg: no python interpreter found (need python or python3)." >&2
+    echo "commit-msg: refusing rather than passing unchecked." >&2
+    exit 1
+fi
+
+# Resolve the checker relative to THIS script, so the hook works whether it was
+# installed as a symlink or copied into .git/hooks/.
+HOOK_PATH="$0"
+if [ -L "$HOOK_PATH" ]; then
+    HOOK_PATH="$(readlink "$HOOK_PATH")"
+fi
+HOOK_DIR="$(cd "$(dirname "$HOOK_PATH")" && pwd)"
+CHECKER="$HOOK_DIR/../check_commit_message.py"
+
+if [ ! -f "$CHECKER" ]; then
+    # A copied hook in .git/hooks/ cannot see scripts/; fall back to the repo.
+    REPO_TOP="$(git rev-parse --show-toplevel)"
+    CHECKER="$REPO_TOP/scripts/check_commit_message.py"
+fi
+
+if [ ! -f "$CHECKER" ]; then
+    echo "commit-msg: cannot find check_commit_message.py — refusing rather" >&2
+    echo "            than passing unchecked. Re-run scripts/install-hooks.sh" >&2
+    exit 1
+fi
+
+exec "$PY" "$CHECKER" "$MSG_FILE" "$(git rev-parse --show-toplevel)"
