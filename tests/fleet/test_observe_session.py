@@ -514,3 +514,105 @@ class TestFleetDoctorViaObserveSession:
         report = scan([repo1, repo2])
 
         assert {record.slug for record in report.records} == {"one", "two"}
+
+
+# --------------------------------------------------------------------------- #
+# `--git-facts-root` wiring: chunk-6 branch-attribution defect (workspace and
+# the session's own working tree can be different repositories' worth of git
+# state whenever D1's outward hop fired -- ClaudeAdapter.git_facts() must
+# query the LATTER, and only a --hook-payload consumer that explicitly
+# threads `resolved_from` through as `args.git_facts_root` makes that happen).
+# --------------------------------------------------------------------------- #
+
+
+def _observe_subcommands_accepting_hook_payload() -> list[str]:
+    """Every `observe <verb>` that registers a `--hook-payload` argument.
+
+    Introspects the real parser rather than hardcoding `["session-start"]`,
+    so a FUTURE hook-payload verb (chunk 7's `SubagentStart` consumer, not
+    yet built) is picked up automatically the moment it registers one --
+    the whole point being that `test_every_hook_payload_verb_threads_git_facts_root`
+    below then exercises it without anyone remembering to extend this list.
+    """
+    parser = build_parser()
+    verbs: list[str] = []
+    for action in parser._subparsers._group_actions:  # noqa: SLF001 -- introspection only
+        if "observe" not in getattr(action, "choices", {}):
+            continue
+        observe_parser = action.choices["observe"]
+        for sub_action in observe_parser._subparsers._group_actions:  # noqa: SLF001
+            for name, sub_parser in sub_action.choices.items():
+                if any(a.dest == "hook_payload" for a in sub_parser._actions):  # noqa: SLF001
+                    verbs.append(name)
+    return verbs
+
+
+def test_at_least_one_hook_payload_verb_exists() -> None:
+    """Guards the introspection helper itself -- AND is a deliberate tripwire
+    for whoever builds chunk 7's `SubagentStart` hook-payload verb.
+
+    If `_observe_subcommands_accepting_hook_payload()` ever returned `[]`, the
+    parametrized test below would silently collect zero cases and the whole
+    protection would be void without a single visible failure -- that alone
+    would justify a `!= []` check.
+
+    But this asserts EXACT equality on purpose, not `>= 1` or `!= []`. The
+    moment a second hook-payload verb is registered (chunk 7), this line goes
+    red, which FORCES whoever added it to come here, read this docstring, and
+    consciously extend the list -- at which point
+    `test_every_hook_payload_verb_threads_git_facts_root` immediately starts
+    exercising that new verb too, and either it threads `git_facts_root`
+    correctly or THAT goes red next.
+
+    DO NOT weaken this to `>= 1` to make a "spurious" chunk-7 failure go away.
+    That relaxation is exactly the failure mode this whole file exists to
+    prevent: it would look like an unrelated brittle test breaking on
+    unrelated chunk-7 work, the obvious fix would be to loosen it, and
+    loosening it is precisely what lets chunk 7 silently reintroduce the
+    branch-attribution defect this pin was built to catch. If you are here
+    because this failed: good, that is the point -- go add the verb to the
+    list, then go make the new verb set `git_facts_root`.
+    """
+    assert _observe_subcommands_accepting_hook_payload() == ["session-start"]
+
+
+@pytest.mark.parametrize("verb", _observe_subcommands_accepting_hook_payload())
+def test_every_hook_payload_verb_threads_git_facts_root(
+    verb: str, enabled_project: tuple[Path, str]
+) -> None:
+    """Chunk-6 regression, written to survive chunk 7.
+
+    Any `observe <verb> --hook-payload` consumer that resolves a location
+    MUST set `args.git_facts_root` to that location's own working tree
+    (never leave it at the `None` default, which silently falls back to
+    `workspace` -- D1's outward-hopped root, the exact defect this pins).
+    Parametrized over every REGISTERED hook-payload verb via
+    `_observe_subcommands_accepting_hook_payload()`, so chunk 7's own verb
+    (once it exists) is exercised here with no further edit to this file --
+    it either threads `git_facts_root` correctly or this goes red.
+    """
+    workspace, slug = enabled_project
+    payload = json.dumps({"session_id": f"{verb}-thread-check", "cwd": str(workspace)})
+
+    parser = build_parser()
+    args = parser.parse_args(["observe", verb, "--hook-payload", "-"])
+
+    import sys as _sys
+
+    original_stdin = _sys.stdin
+    _sys.stdin = io.StringIO(payload)
+    try:
+        args.func(args)
+    finally:
+        _sys.stdin = original_stdin
+
+    assert args.git_facts_root is not None, (
+        f"observe {verb} resolved a --hook-payload location but never set "
+        "args.git_facts_root -- ClaudeAdapter.git_facts() will silently query "
+        "`workspace` instead (D1's outward-hopped root), reintroducing the "
+        "chunk-6 branch-attribution defect for this verb"
+    )
+    assert Path(args.git_facts_root) == workspace, (
+        "git_facts_root must be the location that actually resolved this "
+        "session (the session's OWN working tree), not merely non-None"
+    )

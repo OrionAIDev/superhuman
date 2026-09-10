@@ -351,7 +351,11 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             current_session_id=args.session_id,
             sessions=sessions,
             session_relay_script=args.session_relay_script,
-            git_facts_root=getattr(args, "git_facts_root", None),
+            # Always a real attribute now (`_add_harness_arguments` registers
+            # `--git-facts-root` on every observe subcommand) -- direct access,
+            # not a getattr fallback that would hide the attribute's existence
+            # from a reader.
+            git_facts_root=args.git_facts_root,
         )
     if args.harness == "subagent":
         if not args.local_id:
@@ -1412,6 +1416,18 @@ def build_parser() -> argparse.ArgumentParser:
         "current process id); --harness subagent: the PM-minted dispatch id (required)",
     )
     register_parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "--harness claude only: see the identical flag on the `observe` "
+            "subcommands (_add_harness_arguments). `register` has no "
+            "--hook-payload of its own, so this stays at its default here; "
+            "registered anyway so `_build_adapter` never sees a Namespace "
+            "missing the attribute regardless of which subcommand built it."
+        ),
+    )
+    register_parser.add_argument(
         "--fleet-dir",
         type=Path,
         default=None,
@@ -1542,6 +1558,27 @@ def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
         "--session-relay-script", type=Path, default=None, help="--harness claude only"
     )
     parser.add_argument("--local-id", default=None, help="--harness portable or subagent only (required for subagent)")
+    parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "--harness claude only: directory git_facts() actually queries "
+            "for branch/commit state, when it must differ from --workspace "
+            "(chunk-6 branch-attribution defect). Not meant to be typed by a "
+            "human -- a --hook-payload consumer sets this programmatically "
+            "on `args` before adapter construction, threading through "
+            "whichever of --anchor/payload.cwd actually resolved the "
+            "project (the session's own working tree, BEFORE D1's outward "
+            "hop). Registered here, not left as an ad-hoc Namespace "
+            "attribute, so every future --hook-payload verb inherits a "
+            "visible default=None rather than a getattr fallback nothing "
+            "signals the existence of. Any new payload-consuming verb MUST "
+            "set this explicitly or it silently inherits the stale-"
+            "workspace default -- see test_git_facts_root_wiring.py, which "
+            "fails red for exactly that omission."
+        ),
+    )
 
 
 def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
