@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from publication_patterns import LEAK_PATTERNS  # noqa: E402
+from publication_patterns import LEAK_PATTERNS, REQUIRE_TOKENS_ENV  # noqa: E402
 
 from check_commit_message import (  # noqa: E402
     SCISSORS,
@@ -42,6 +42,26 @@ def _write_tokens(root: Path, *tokens: str) -> None:
 def _git(root: Path, *args: str) -> None:
     """Run a git command in ``root``, failing the test on a non-zero exit."""
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_require_flag(monkeypatch) -> None:
+    """Default every test to "the require-flag is not set", explicitly.
+
+    CI exports ``SUPERHUMAN_REQUIRE_OPERATOR_TOKENS=1`` for the whole run, which
+    turns the "this clone never declared that it publishes" row from an allow
+    into a hard failure. Tests asserting that row therefore passed locally and
+    failed on all four CI versions -- the precise divergence this project had
+    already written down about a different tier: *a maintainer's local green
+    stops predicting CI*, and it stops silently, because both environments are
+    green until one of them is not.
+
+    Stating the environment rather than inheriting it is the fix, and it belongs
+    on every test in the file rather than the two that happened to fail: a new
+    test asserting the same row would inherit the same trap. The one test that
+    exercises the flag sets it itself, which runs after this fixture and wins.
+    """
+    monkeypatch.delenv(REQUIRE_TOKENS_ENV, raising=False)
 
 
 @pytest.fixture
@@ -191,7 +211,7 @@ def test_empty_list_is_refused_not_ignored(repo: Path) -> None:
 
 def test_absent_list_fails_closed_when_required(repo: Path, monkeypatch) -> None:
     """The require-flag turns the fork row into a hard failure."""
-    monkeypatch.setenv("SUPERHUMAN_REQUIRE_OPERATOR_TOKENS", "1")
+    monkeypatch.setenv(REQUIRE_TOKENS_ENV, "1")
     with pytest.raises(ValueError, match="was required on this run"):
         token_state(repo)
 
