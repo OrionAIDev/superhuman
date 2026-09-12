@@ -34,6 +34,18 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **The G1 git step no longer overrides the operator's git identity.** `roles/pm.md` told the PM
+  to write a repo-local `user.name`/`user.email` into every project, and `phases/0-kickoff.md`'s
+  seed commit pinned one with `-c`. Both beat conditional includes (`includeIf`) in the global
+  config, so every new project silently stopped committing as the identity the operator had routed
+  for that remote. The PM now configures the remote first, checks what git already resolves
+  (`git config --show-scope --get`), and writes a repo-local value only for a field that resolves
+  to nothing — or when the user explicitly asks for a project-specific identity. Pinned by
+  `tests/test_content.py::test_kickoff_inherits_git_identity_instead_of_writing_one` and
+  `::test_documented_identity_check_sees_remote_routing`, which runs the doc's own check command
+  against a sandboxed routing config. The `W-NFR-4` additive-diff checks gain a second exemption,
+  as narrow as the first, for the one removed sentence.
+
 ### Security
 
 ## [1.1.0] - 2026-08-15
