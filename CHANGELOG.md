@@ -45,6 +45,14 @@ All notable changes to this project will be documented in this file. Format adap
   `::test_documented_identity_check_sees_remote_routing`, which runs the doc's own check command
   against a sandboxed routing config. The `W-NFR-4` additive-diff checks gain a second exemption,
   as narrow as the first, for the one removed sentence.
+- **The routable-IPv4 leak pattern no longer flags dotted numbers that cannot be an address.**
+  Every octet must be 0-255 and the match must be exactly four parts, never a window onto a
+  longer dotted run such as an OID or a five-part build number. The pattern is shared with the
+  `commit-msg` guard, where a false positive refuses a legitimate commit. A bare four-part
+  version is spelled exactly like an address, so it stays flagged on purpose; the label now tells
+  the author to write it as `v1.2.3.4`, which passes. Pinned by three new tests in
+  `tests/test_publication_guard.py`, which also check that real addresses in config values, URLs,
+  ranges and sentence-final positions are still caught.
 
 ### Security
 

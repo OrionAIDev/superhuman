@@ -33,8 +33,21 @@ LEAK_PATTERNS: tuple[tuple[str, str, str, str], ...] = (
     (
         # Routable IPv4 only. Loopback and wildcard binds are legitimate in
         # shipped code — servers bind them by default — and are not leaks.
-        r"\b(?!0\.0\.0\.0\b)(?!127\.)(?:\d{1,3}\.){3}\d{1,3}\b",
-        "routable IP address",
+        #
+        # Only things that CAN be an address match: every octet 0-255, and
+        # exactly four parts — never a window onto a longer dotted run (an OID,
+        # a five-part build number), which is why a digit-dot may not precede
+        # the match and a digit or dot-digit may not follow it. What remains
+        # ambiguous is a bare four-part version such as the one in "pandoc
+        # 2.17.1.1": it is spelled exactly like an address, so no pattern can
+        # pass it without passing real addresses too. It stays flagged — a
+        # leaked address is the costlier mistake — and the label says how to
+        # write a version so it is not mistaken for one.
+        r"(?<!\w)(?<!\d\.)(?!0\.0\.0\.0(?!\.?\d))(?!127\.)"
+        r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+        r"(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}"
+        r"(?!\.?\d)(?!\w)",
+        "routable IP address (a version number written v1.2.3.4 is not one)",
         "deploy to 203.0.113.7 nightly",
         'BIND_HOST="127.0.0.1"  # or 0.0.0.0',
     ),
