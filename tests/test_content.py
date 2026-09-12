@@ -416,6 +416,90 @@ def test_pm_has_phase3_heartbeat(skill_root: Path) -> None:
     )
 
 
+# A git invocation that pins identity per command. `-c` beats every config file,
+# so it defeats identity routing exactly as a repo-local value does.
+_IDENTITY_OVERRIDE_RE = re.compile(r"git(?: -C \S+)? -c user\.(?:email|name)")
+_IDENTITY_CHECK_RE = re.compile(r"`(git -C <project> config --show-scope --get user\.email)`")
+
+
+def test_kickoff_inherits_git_identity_instead_of_writing_one(skill_root: Path) -> None:
+    """The G1 git step must inherit a resolved identity, not pin a new one.
+
+    It used to tell the PM to set a repo-local identity in every project, and the
+    seed commit pinned one with `-c`. Both override conditional includes
+    (`includeIf`) in the operator's global config, so every new project quietly
+    stopped using the identity the operator had routed for that remote.
+    """
+    pm = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    kickoff = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+    for name, text in (("roles/pm.md", pm), ("phases/0-kickoff.md", kickoff)):
+        hit = _IDENTITY_OVERRIDE_RE.search(text)
+        assert hit is None, f"{name} pins identity per command: {hit.group(0) if hit else ''}"
+    assert _IDENTITY_CHECK_RE.search(pm), "pm.md must check the resolved identity before writing one"
+    assert "Remote first" in pm, "pm.md must configure the remote before checking identity"
+    assert "configure the remote before this commit" in kickoff, (
+        "the seed commit must come after the remote, or remote-keyed routing misses it"
+    )
+
+
+def _git_version() -> tuple[int, ...]:
+    """Return the installed git's version as a tuple of ints, e.g. ``(2, 55, 0)``."""
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+    assert match, f"unparseable git version: {out!r}"
+    return tuple(int(part) for part in match.groups())
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None or _git_version() < (2, 36, 0),
+    reason="includeIf hasconfig:remote needs git >= 2.36",
+)
+def test_documented_identity_check_sees_remote_routing(
+    skill_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run pm.md's own check command against remote-keyed routing.
+
+    Proves the three git facts the G1 git step depends on, using the command as
+    written in the doc: routing applies only once the remote exists (why the
+    remote comes first), the check reports the routed identity once it does, and a
+    repo-local value overrides the routing (why the PM must not write one).
+    """
+    match = _IDENTITY_CHECK_RE.search((skill_root / "roles" / "pm.md").read_text(encoding="utf-8"))
+    assert match, "pm.md must document the identity check command"
+    template = match.group(1).split()
+
+    home = tmp_path / "home"
+    home.mkdir()
+    routed = home / "routed"
+    routed.write_text("[user]\n\temail = routed@example.invalid\n", encoding="utf-8")
+    config = home / "gitconfig"
+    config.write_text(
+        "[user]\n\tname = Default\n\temail = default@example.invalid\n"
+        '[includeIf "hasconfig:remote.*.url:https://github.com/acme/**"]\n'
+        f"\tpath = {routed.as_posix()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("HOME", str(home))
+
+    project = tmp_path / "project"
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    check = [str(project) if part == "<project>" else part for part in template]
+
+    def resolved() -> str:
+        return subprocess.run(check, capture_output=True, text=True, check=True).stdout.strip()
+
+    assert resolved() == "global\tdefault@example.invalid", "routing must not apply before the remote"
+    subprocess.run(
+        ["git", "-C", str(project), "remote", "add", "origin", "https://github.com/acme/p.git"],
+        check=True,
+    )
+    assert resolved() == "global\trouted@example.invalid", "the check must report the routed identity"
+    subprocess.run(["git", "-C", str(project), "config", "user.email", "local@example.invalid"], check=True)
+    assert resolved() == "local\tlocal@example.invalid", "a repo-local value overrides routing"
+
+
 def test_skill_md_gates_autonomy_on_the_profile(skill_root: Path) -> None:
     """SKILL.md must gate autonomy on the resolver, not on named environments.
 

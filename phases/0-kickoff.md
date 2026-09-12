@@ -187,7 +187,7 @@ consulted: [business-expert]
        approval, append **both** a G0 and a G1 entry to the Decisions log, timestamped from this
        one exchange.
 
-   **3.5 Seed commit (if git enabled).** If G1 selected git (local or remote), make an initial commit so subagents can query git state without errors: `git -c user.email="$EMAIL" -c user.name="$NAME" add VISION.md SUPERHUMAN.md && git -c user.email="$EMAIL" -c user.name="$NAME" commit -m "chore: project kickoff (VISION + SUPERHUMAN initialized)"`. Use the repo-local identity set per `conventions/git.md` (see also B2 in roles/pm.md — set repo-local config first, then the `-c` overrides are not needed for subsequent commits).
+   **3.5 Seed commit (if git enabled).** If G1 selected git (local or remote), make an initial commit so subagents can query git state without errors: `git -C <project> add VISION.md SUPERHUMAN.md && git -C <project> commit -m "chore: project kickoff (VISION + SUPERHUMAN initialized)"`. No `-c user.*` overrides: the commit uses the identity resolved by the G1 git step in `roles/pm.md` (inherited, or set repo-local only where nothing resolved). If G1 chose remote, configure the remote before this commit, so identity routing keyed on the remote URL applies to it too.
 
 ## Outputs
 
