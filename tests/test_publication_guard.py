@@ -85,6 +85,72 @@ def test_pattern_rejects_its_negative_sample(
     )
 
 
+#: The IPv4 pattern, looked up by label so these samples follow the table.
+_IPV4 = next(p for p, label, _, _ in LEAK_PATTERNS if label.startswith("routable IP address"))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "HOST=198.51.100.23",
+        "http://192.0.2.10:8080/health",
+        "the box at 10.20.30.40.",
+        "tailnet peer 100.101.102.103",
+        "range 192.0.2.1-192.0.2.9",
+        "(172.16.0.1)",
+        "see ...192.0.2.44",
+        "ssh root@10.1.2.3",
+    ],
+)
+def test_ipv4_pattern_still_catches_addresses(text: str) -> None:
+    """Tightening the pattern must not open a hole for a real address.
+
+    Each sample is an address in a position a leak actually takes: a config
+    value, a URL, the end of a sentence, one end of a range, after an ellipsis.
+
+    Args:
+        text: A string containing an address that must be flagged.
+    """
+    assert re.search(_IPV4, text, re.IGNORECASE), f"IPv4 pattern missed the address in {text!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SNMP oid 1.3.6.1.4.1",
+        "build 1.2.3.4.5",
+        "Windows 10.0.19045.2965",
+        "octets 999.1.1.1 and 10.0.0.256",
+        "pandoc v2.17.1.1",
+    ],
+)
+def test_ipv4_pattern_ignores_what_cannot_be_an_address(text: str) -> None:
+    """Dotted numbers that cannot be an IPv4 address must not fire.
+
+    An octet above 255 is not an address, and neither is any four-part window
+    onto a longer dotted run. The commit-message guard reuses this pattern, so a
+    false positive here refuses a legitimate commit — roadmap#246 found one.
+
+    Args:
+        text: A string with a dotted number that is not an address.
+    """
+    hit = re.search(_IPV4, text, re.IGNORECASE)
+    assert hit is None, f"IPv4 pattern flagged {hit.group(0) if hit else ''!r} in {text!r}"
+
+
+def test_ipv4_pattern_keeps_flagging_a_bare_four_part_version() -> None:
+    """A bare four-part version is spelled like an address, so it stays flagged.
+
+    Pinned so the trade-off is a decision rather than an accident: exempting
+    "pandoc 2.17.1.1" would also exempt "server 2.17.1.1", and a leaked
+    address costs more than a reworded commit. The label tells the author the
+    unambiguous spelling, which the case above shows passing.
+    """
+    assert re.search(_IPV4, "pandoc 2.17.1.1")
+    label = next(lbl for p, lbl, _, _ in LEAK_PATTERNS if p == _IPV4)
+    assert "v1.2.3.4" in label, "the label must say how to write a version unambiguously"
+
+
 @pytest.mark.parametrize(
     ("pattern", "label"),
     [(p, lbl) for p, lbl, _, _ in LEAK_PATTERNS],
