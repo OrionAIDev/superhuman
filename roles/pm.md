@@ -112,7 +112,14 @@ Present 3-4 multiple-choice questions at G1 (Type A gate, `<dispatch:ask>`). The
 
 If user picks **remote**: follow the remote-sync flow in `conventions/git.md` (ask existing URL or create new; branch strategy; test reachability; first push).
 
-If git is enabled (local or remote), also set **repo-local** (not global) git identity to avoid per-commit `-c user.email=…` overrides. Ask the user for `user.name` and `user.email` (one short question via `<dispatch:ask>`); apply with `git -C <project> config user.name "..."` and `git -C <project> config user.email "..."`. Never modify global git config.
+If git is enabled (local or remote), **inherit the git identity the project already resolves — do not write one.** Operators commonly route identity per remote or per directory with conditional includes (`includeIf`) in their global config, and both a repo-local `user.name`/`user.email` and a per-commit `-c user.email=…` override that routing silently, for every commit they touch. So:
+
+1. **Remote first.** If G1 chose remote, configure it (step 5 of the remote-sync flow in `conventions/git.md`) before checking or committing anything — identity routing keyed on the remote URL only takes effect once the remote exists.
+2. **Check** (`<dispatch:bash>`): `git -C <project> config --show-scope --get user.email` and `git -C <project> config --show-scope --get user.name`.
+3. **Both resolve** (exit 0, at any scope) → use them. Write nothing, and pass no `-c user.*` overrides on commits.
+4. **Either is missing** (exit 1) → ask the user for the missing value(s) only (one short question via `<dispatch:ask>`), then set just those, repo-local: `git -C <project> config user.email "..."` / `git -C <project> config user.name "..."`.
+
+Write a repo-local identity over one that already resolves only when the user explicitly asks for a project-specific identity — and tell them it will override any identity routing in their global config. Never modify global git config.
 
 **Operator model-tier elicitation (#139).** Alongside the four preferences above, `phases/0-kickoff.md`
 Step 3 also elicits the operator's global `most_capable` / `standard` / `cheap` model tiers into

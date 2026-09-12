@@ -121,6 +121,17 @@ _LEGACY_BARE_FLEET_INVOCATION_RE = re.compile(
     r"`fleet (?:observe|status|handoff|register|query|gen-view|done)\b"
 )
 
+#: The second, equally narrow exemption: the G1 instruction that told the PM to
+#: write a repo-local git identity into every project. That line is the defect
+#: itself — a repo-local identity overrides any conditional identity routing in
+#: the operator's global config — so no additive edit can correct it while it
+#: survives. It matches ONLY that sentence and expires the same way once main no
+#: longer carries it. Gate order is untouched: G1 still fires where it did, and a
+#: resumed project that has already passed G1 never re-reads the step.
+_LEGACY_REPO_LOCAL_IDENTITY_RE = re.compile(
+    r"set \*\*repo-local\*\* \(not global\) git identity"
+)
+
 
 def _disallowed_removed_lines(diff_stdout: str) -> list[str]:
     """Return removed diff lines that W-NFR-4 rule 1 does not permit."""
@@ -130,6 +141,7 @@ def _disallowed_removed_lines(diff_stdout: str) -> list[str]:
         if line.startswith("-")
         and not line.startswith("---")
         and not _LEGACY_BARE_FLEET_INVOCATION_RE.search(line)
+        and not _LEGACY_REPO_LOCAL_IDENTITY_RE.search(line)
     ]
 
 
