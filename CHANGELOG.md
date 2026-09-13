@@ -32,8 +32,23 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Removed
 
+- **The `W-NFR-4` rule-1 line freeze (TC-24) is retired.** `TestAdditiveDiffInvarianceFullScope`
+  and `test_seams.py::TestAdditiveDiffInvariant` failed any branch that removed or reworded a line
+  in `roles/pm.md`, `phases/3-implementation.md`, `phases/4-acceptance.md` or `SKILL.md`. That was
+  fleet-wiring's own scope fence, written for a project that merged in August, but it ran on every
+  branch afterwards. Each later correction to those files needed its own regex exemption (two so far,
+  duplicated across both files), and the freeze never protected gate order anyway. It covered two of
+  the nine phase recipes that declare gates. Both exemption regexes go with it.
+
 ### Fixed
 
+- **TC-25 now catches a renamed, deleted or added gate-bearing phase recipe.** It used to compare
+  each HEAD recipe's `gates:` list against the same path at the merge-base, and it skipped paths
+  that were missing on either side. So renaming `phases/2.1-test-plan.md` (which moves G4) or
+  deleting `phases/1-requirements.md` (which drops G2) passed every test. It now compares the whole
+  recipe → gates map, ignoring gate-less recipes, and it refuses to compare two empty maps. The new
+  `TestGateMapDifferences` pins the comparison failing on a reorder, a move between phases, a rename,
+  a deletion, an added gate-bearing phase, a new gate and a gate made conditional.
 - **The G1 git step no longer overrides the operator's git identity.** `roles/pm.md` told the PM
   to write a repo-local `user.name`/`user.email` into every project, and `phases/0-kickoff.md`'s
   seed commit pinned one with `-c`. Both beat conditional includes (`includeIf`) in the global
