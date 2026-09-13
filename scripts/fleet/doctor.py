@@ -33,6 +33,16 @@ older than 2.31 (PM addition, PLAN.md Chunk 3, from the Chunk 2 review):
 On an older git that call fails, the locator refuses silently, and
 observation is dead on that machine with nothing to diagnose it — exactly
 #217's failure mode wearing a new mechanism.
+
+**Role-gate section (chunk 7a, D7.7, FR-21).** For every `"ok"` record,
+`fleet doctor` additionally reports chunk 7a's role-gate activity: how many
+role dispatches registered (chunk 7's own rows), how many non-role
+dispatches were seen, and how many were denied. **Missing data is reported
+as `"unknown"`, never as zero violations** (D7.7: "Missing data prints as
+`UNKNOWN`... never as zero violations") — an absent or empty
+`role-gate.jsonl` is fully ambiguous between "the gate is installed and
+every dispatch complied" and "the gate never fired at all", and TC-90
+forbids ever collapsing that ambiguity into a confident-looking zero.
 """
 
 from __future__ import annotations
@@ -46,7 +56,9 @@ from typing import Sequence
 from . import config as fleet_config
 from . import project as fleet_project
 from . import project_id as fleet_project_id
+from .core.events import read_all as read_all_events
 from .locate import locate_project
+from .role_block import Verdict, read_role_gate_log
 
 #: The minimum git version `locate.py`'s `--path-format=absolute` needs
 #: (git >= 2.31, released March 2021). Below this, root discovery fails
@@ -63,6 +75,32 @@ _GIT_VERSION_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True, slots=True)
+class RoleGateHealth:
+    """`fleet doctor`'s chunk-7a role-gate section for one project (D7.7, FR-21).
+
+    Attributes:
+        state: `"unknown"` when `role-gate.jsonl` is absent or empty (D7.7:
+            never reported as zero violations); `"ok"` once at least one
+            decision line has ever been logged.
+        role_rows: count of `session_registered` events in this project's
+            manifest with `payload.origination == "spawned"` — chunk 7's
+            registered role-dispatch rows. `None` when `state ==
+            "unknown"`.
+        non_role_count: count of `NON_ROLE` decisions in `role-gate.jsonl`.
+            `None` when `state == "unknown"`.
+        denial_count: count of `MISMATCH`/`UNMARKED` (denied) decisions in
+            `role-gate.jsonl`. `None` when `state == "unknown"`.
+        detail: a short, human-readable summary.
+    """
+
+    state: str
+    role_rows: int | None
+    non_role_count: int | None
+    denial_count: int | None
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectHealth:
     """One project record's writability, as `fleet doctor` sees it.
 
@@ -73,12 +111,17 @@ class ProjectHealth:
         state: one of `"ok"`, `"no_project_id"`, `"fleet_disabled"`,
             `"unresolvable"`.
         detail: a short, human-readable explanation of `state`.
+        role_gate: chunk 7a's role-gate section (D7.7), populated only for
+            `state == "ok"` records — every other state already means no
+            manifest write could have happened, so there is nothing
+            role-gate-shaped to report. `None` for every other state.
     """
 
     root: Path
     slug: str
     state: str
     detail: str
+    role_gate: RoleGateHealth | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +228,60 @@ def _enumerate_all_records(root: Path) -> list[Path]:
     return found
 
 
+def role_gate_health(workspace: Path, slug: str) -> RoleGateHealth:
+    """Summarize chunk 7a's role-gate activity for one resolved project.
+
+    Never raises: `read_role_gate_log`/`read_all_events` already tolerate a
+    missing/malformed log or manifest by returning `[]`.
+
+    Args:
+        workspace: the project's working tree root.
+        slug: the superhuman project slug.
+
+    Returns:
+        RoleGateHealth: `state="unknown"` (D7.7/TC-90) when
+        `role-gate.jsonl` is absent or empty — the sole trigger for
+        "unknown", regardless of whether any dispatch rows exist; `"ok"`
+        otherwise, with `role_rows` counted independently from
+        `events.jsonl`.
+    """
+    cfg = fleet_config.resolve_fleet_config(workspace)
+    fleet_dir = cfg.manifest_dir or (Path(workspace) / "docs" / "superhuman" / slug / "fleet")
+
+    decisions = read_role_gate_log(fleet_dir)
+    if not decisions:
+        return RoleGateHealth(
+            state="unknown",
+            role_rows=None,
+            non_role_count=None,
+            denial_count=None,
+            detail="no gate decisions or dispatch rows recorded; hooks may not be "
+            "installed or firing",
+        )
+
+    non_role_count = sum(1 for row in decisions if row.get("verdict") == Verdict.NON_ROLE.value)
+    denial_count = sum(
+        1
+        for row in decisions
+        if row.get("verdict") in (Verdict.MISMATCH.value, Verdict.UNMARKED.value)
+    )
+
+    events = read_all_events(fleet_dir / "events.jsonl")
+    role_rows = sum(
+        1
+        for event in events
+        if event.type == "session_registered" and event.payload.get("origination") == "spawned"
+    )
+
+    return RoleGateHealth(
+        state="ok",
+        role_rows=role_rows,
+        non_role_count=non_role_count,
+        denial_count=denial_count,
+        detail=f"role_rows={role_rows} non_role={non_role_count} denials={denial_count}",
+    )
+
+
 def _classify(root: Path, entry: Path) -> ProjectHealth:
     """Classify one `<root>/docs/superhuman/<slug>/` entry.
 
@@ -239,7 +336,13 @@ def _classify(root: Path, entry: Path) -> ProjectHealth:
             detail=f"**Project-id:** is an unfilled placeholder ({project_id!r}), not an identity",
         )
 
-    return ProjectHealth(root=root, slug=slug, state="ok", detail=f"project_id={project_id}")
+    return ProjectHealth(
+        root=root,
+        slug=slug,
+        state="ok",
+        detail=f"project_id={project_id}",
+        role_gate=role_gate_health(location.workspace, slug),
+    )
 
 
 def scan(roots: Sequence[Path | str]) -> DoctorReport:

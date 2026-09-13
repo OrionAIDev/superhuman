@@ -22,6 +22,7 @@ scripts/autonomous-iter.sh text eol=lf
 # continue the line.
 templates/hooks/claude-code/session-start text eol=lf
 templates/hooks/claude-code/subagent-start text eol=lf
+templates/hooks/claude-code/pre-tool-use-role-gate text eol=lf
 
 # Reference scripts the docs invoke directly (`./find-polluter.sh`,
 # `./render-graphs.js`, `scripts/start-server.sh`). Same reasoning as above:

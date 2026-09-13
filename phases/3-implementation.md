@@ -24,7 +24,7 @@ consulted: []
    - **Parallel:** for each chunk, create a worktree (`git worktree add .worktrees/chunk-N`) and dispatch Developer with that worktree as cwd. After Developer DONE, PM merges the worktree branch back and removes the worktree. See `roles/pm.md` "Per-chunk worktree" subsection.
 2. **For each chunk to be dispatched:**
    - Choose model tier per `adaptation/dispatch.md`.
-   - Dispatch Developer with: chunk text from PLAN.md + acceptance criteria + paths to DESIGN.md / TEST.md / declared conventions.
+   - Dispatch Developer with: `roles/developer.md`'s full, unedited content first, per SKILL.md's cache-stable ordering, then chunk text from PLAN.md + acceptance criteria + paths to DESIGN.md / TEST.md / declared conventions.
    - Developer executes the chunk per `roles/developer.md` (TDD; self-review; commit; push if remote).
 3. **Collect status:** DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED.
 4. **Handle status** per references/subagent-driven-development/SKILL.md "Handling Implementer Status" section.

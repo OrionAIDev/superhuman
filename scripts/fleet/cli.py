@@ -30,6 +30,7 @@ from . import doctor as fleet_doctor
 from . import hook_payload as fleet_hook_payload
 from . import observe as fleet_observe
 from . import project_id as fleet_project_id
+from . import role_block as fleet_role_block
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
@@ -63,6 +64,11 @@ from .view import render_status_table, write_fleet_md
 #: is the manifest CLI's own schema-facing version, matching `schema_version`
 #: in `core/schema.py` (both are v1 for Phase 1).
 CLI_VERSION = "0.1.0 (schema v1)"
+
+#: This file lives at <skill_root>/scripts/fleet/cli.py — used only as the
+#: default `--roles-dir` for `role-block check` (chunk 7a), matching
+#: `pre_tool_use_role_gate.py`'s identical `_SKILL_ROOT` derivation.
+_SKILL_ROOT = Path(__file__).resolve().parents[2]
 
 #: Registrar-level bounded retry defaults for lock contention (on top of
 #: `core.events.append`'s own internal timeout/retry). A second, short-lived
@@ -959,6 +965,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     for record in sorted(report.records, key=lambda r: (str(r.root), r.slug)):
         print(f"{record.root}  {record.slug}  {record.state}  ({record.detail})")
+        if record.role_gate is not None:
+            gate = record.role_gate
+            if gate.state == "unknown":
+                print(f"    role gate: UNKNOWN — {gate.detail}")
+            else:
+                print(f"    role gate: {gate.detail}")
     return 0
 
 
@@ -1005,6 +1017,40 @@ def _cmd_project_check(args: argparse.Namespace) -> int:
         return 1
     print(project_id)
     return 0
+
+
+def _cmd_role_block_check(args: argparse.Namespace) -> int:
+    """Handle `fleet role-block check` (chunk 7a's fail-closed assertion, D7.6).
+
+    Reads `--prompt-file` (or stdin, for `-`) and runs it through the SAME
+    `check_role_block` function the `PreToolUse` adapter
+    (`pre_tool_use_role_gate.py`) calls (TC-87 asserts this) — exits 0 for
+    `ROLE`/`NON_ROLE` and 1 for anything else (`MISMATCH`, `UNMARKED`, or
+    `FAULT`). Unlike the hook's own fail-SOFT posture (NFR-9: a fault must
+    never turn into a denial), this is a manual, fail-CLOSED assertion tool
+    in the mould of `fleet project check` — a `FAULT` here (e.g. an
+    unreadable `roles/` directory) cannot certify compliance, so it exits
+    non-zero exactly like a genuine mismatch would.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` for `ROLE`/`NON_ROLE`; `1` otherwise.
+    """
+    if str(args.prompt_file) == "-":
+        prompt = sys.stdin.read()
+    else:
+        try:
+            prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            # `ValueError` covers `UnicodeDecodeError` on a non-UTF-8 file.
+            print(f"fleet role-block check: could not read --prompt-file: {exc}", file=sys.stderr)
+            return 1
+
+    result = fleet_role_block.check_role_block(prompt, args.roles_dir)
+    print(result.verdict.value)
+    return 0 if result.verdict in (fleet_role_block.Verdict.ROLE, fleet_role_block.Verdict.NON_ROLE) else 1
 
 
 def _safe_build_adapter_for_observe(
@@ -1511,6 +1557,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_locate_subparser(subparsers)
     _add_doctor_subparser(subparsers)
     _add_project_subparsers(subparsers)
+    _add_role_block_subparsers(subparsers)
 
     return parser
 
@@ -1592,6 +1639,40 @@ def _add_project_subparsers(subparsers: argparse._SubParsersAction) -> None:
     )
     check_parser.add_argument("--slug", required=True, help="the superhuman project slug")
     check_parser.set_defaults(func=_cmd_project_check)
+
+
+def _add_role_block_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `role-block check` subcommand (chunk 7a, D7.6, FR-20).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    role_block_parser = subparsers.add_parser(
+        "role-block",
+        help="Chunk 7a's role-block predicate, exposed as a manual/CI-usable "
+        "verb (D7.6).",
+    )
+    role_block_subparsers = role_block_parser.add_subparsers(
+        dest="role_block_command", required=True
+    )
+
+    check_parser = role_block_subparsers.add_parser(
+        "check",
+        help="Fail-closed assertion: exits 0 for ROLE/NON_ROLE, 1 otherwise "
+        "(MISMATCH/UNMARKED/FAULT). Prints one verdict line.",
+    )
+    check_parser.add_argument(
+        "--prompt-file",
+        required=True,
+        help="path to the prompt text to check, or '-' for stdin",
+    )
+    check_parser.add_argument(
+        "--roles-dir",
+        type=Path,
+        default=_SKILL_ROOT / "roles",
+        help="the directory holding roles/*.md (default: this skill's own roles/)",
+    )
+    check_parser.set_defaults(func=_cmd_role_block_check)
 
 
 def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:

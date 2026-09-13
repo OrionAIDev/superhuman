@@ -476,6 +476,12 @@ reviewer role) — PM calls `python -m scripts.fleet.cli observe dispatch --harn
 block. Research or read-only fan-outs PM makes for its own reading (e.g. an `Explore` dispatch) do
 not register — they are not sessions with their own deliverable in any meaningful sense.
 
+**Role-first, always (chunk 7a).** A dispatch that is not a role dispatch opens with the exact
+line `superhuman-dispatch: non-role` instead of a role file's content; per-dispatch overrides (e.g.
+a tier change) go in the task brief, never inside the role block. Send role dispatches in their own
+message — a message mixing a role dispatch with a non-role dispatch of the same `subagent_type` is
+not attributable to either one (D7.8), so PM never combines the two in one batch of calls.
+
 This step is purely observational: it never blocks the dispatch or any surrounding gate, a failure
 (fleet disabled, an unavailable manifest write, or any other fault) is logged and PM's own
 progression continues unaffected, and the dispatch itself proceeds whether or not the observation
