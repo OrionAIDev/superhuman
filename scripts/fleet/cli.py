@@ -369,8 +369,27 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
                 "--harness subagent requires --local-id (the PM-minted dispatch id) "
                 "— there is no fabricated fallback for a dispatch's identity"
             )
-        return SubagentAdapter(args.workspace, args.slug, local_id=args.local_id)
-    return PortableAdapter(args.workspace, args.slug, local_id=args.local_id)
+        return SubagentAdapter(
+            args.workspace,
+            args.slug,
+            local_id=args.local_id,
+            # Chunk 7 fix: this was computed onto `args` by every
+            # --hook-payload consumer (`_cmd_observe_dispatch`'s own
+            # docstring/comment) but silently dropped here — only
+            # ClaudeAdapter received it above. `SubagentStart`'s production
+            # hook always dispatches `--harness subagent` (see
+            # templates/hooks/claude-code/subagent-start), so this was the
+            # live path the defect was measured on, not a theoretical gap.
+            git_facts_root=args.git_facts_root,
+        )
+    return PortableAdapter(
+        args.workspace,
+        args.slug,
+        local_id=args.local_id,
+        # Same fix, same rationale, for this CLI's own default harness
+        # (`--harness` defaults to "portable" — see `_add_harness_arguments`).
+        git_facts_root=args.git_facts_root,
+    )
 
 
 def _cmd_register(args: argparse.Namespace) -> int:
@@ -1722,8 +1741,9 @@ def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help=(
-            "--harness claude only: directory git_facts() actually queries "
-            "for branch/commit state, when it must differ from --workspace "
+            "--harness claude/portable/subagent (chunk 7 fix: all three, not "
+            "just claude): directory git_facts() actually queries for "
+            "branch/commit state, when it must differ from --workspace "
             "(chunk-6 branch-attribution defect). Not meant to be typed by a "
             "human -- a --hook-payload consumer sets this programmatically "
             "on `args` before adapter construction, threading through "
@@ -1734,8 +1754,13 @@ def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
             "visible default=None rather than a getattr fallback nothing "
             "signals the existence of. Any new payload-consuming verb MUST "
             "set this explicitly or it silently inherits the stale-"
-            "workspace default -- see test_git_facts_root_wiring.py, which "
-            "fails red for exactly that omission."
+            "workspace default; and `_build_adapter` MUST forward it to "
+            "whichever adapter class `--harness` selects, not only "
+            "ClaudeAdapter (the chunk-7 defect this comment now documents) "
+            "-- see test_every_hook_payload_verb_threads_git_facts_root and "
+            "test_every_hook_payload_verb_and_harness_builds_an_adapter_"
+            "that_uses_git_facts_root in tests/fleet/test_observe_session.py, "
+            "which fail red for either omission."
         ),
     )
 
@@ -1963,6 +1988,19 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
     )
     emit_parser.add_argument("--local-id", default=None, help="--harness portable or subagent only (required for subagent)")
     emit_parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "see the identical flag on `register` (_build_adapter needs "
+            "every one of its callers' parsers to register this, chunk 7 "
+            "fix — `emit` has no --hook-payload of its own, so this stays "
+            "at its default here; registered anyway so `_build_adapter` "
+            "never sees a Namespace missing the attribute regardless of "
+            "which subcommand built it)."
+        ),
+    )
+    emit_parser.add_argument(
         "--fleet-dir",
         type=Path,
         default=None,
@@ -2076,6 +2114,19 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--session-relay-script", type=Path, default=None, help="--harness claude only"
     )
     self_register_parser.add_argument("--local-id", default=None, help="--harness portable or subagent only (required for subagent)")
+    self_register_parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "see the identical flag on `register` (_build_adapter needs "
+            "every one of its callers' parsers to register this, chunk 7 "
+            "fix — `self-register` has no --hook-payload of its own, so "
+            "this stays at its default here; registered anyway so "
+            "`_build_adapter` never sees a Namespace missing the attribute "
+            "regardless of which subcommand built it)."
+        ),
+    )
     self_register_parser.add_argument(
         "--fleet-dir",
         type=Path,

@@ -540,6 +540,31 @@ class TestFleetDoctorViaObserveSession:
 # --------------------------------------------------------------------------- #
 
 
+@pytest.fixture
+def enabled_project_with_worktree(
+    enabled_project: tuple[Path, str],
+) -> tuple[Path, str, Path]:
+    """`enabled_project`, plus a linked worktree on its OWN distinct branch.
+
+    Stands in for a session running inside `.claude/worktrees/<slug>` while
+    `docs/superhuman/<slug>/SUPERHUMAN.md` (and the profile pointing at it)
+    live only in the main checkout -- the chunk-6/chunk-7 branch-attribution
+    scenario. `workspace` (the main checkout `locate_project` resolves to,
+    via the H0' main-worktree sidestep) and this worktree (the session's own
+    working tree, what `git_facts_root` must resolve to) are on DIFFERENT
+    branches on purpose, so a test can tell whether an adapter actually
+    consulted `git_facts_root` or silently fell back to `workspace` --
+    querying either root alone would report a real, plausible-looking
+    branch, so only a genuine two-branch fixture like this one can catch the
+    chunk-7 defect (`_build_adapter` computing `git_facts_root` correctly
+    but only forwarding it to `ClaudeAdapter`).
+    """
+    workspace, slug = enabled_project
+    worktree = workspace.parent / "linked-worktree"
+    _run_git(workspace, "worktree", "add", str(worktree), "-b", "the-worktree-own-branch")
+    return workspace, slug, worktree
+
+
 def _observe_subcommands_accepting_hook_payload() -> list[str]:
     """Every `observe <verb>` that registers a `--hook-payload` argument.
 
@@ -606,6 +631,14 @@ def test_every_hook_payload_verb_threads_git_facts_root(
     `_observe_subcommands_accepting_hook_payload()`, so chunk 7's own verb
     (once it exists) is exercised here with no further edit to this file --
     it either threads `git_facts_root` correctly or this goes red.
+
+    This checks only the `argparse.Namespace` attribute -- it is watching
+    ONE layer, not the layer that actually matters end to end. See
+    `test_every_hook_payload_verb_and_harness_builds_an_adapter_that_uses_git_facts_root`
+    below for the adapter-level regression this one cannot catch (chunk 7's
+    real defect: `args.git_facts_root` was computed correctly here, then
+    silently dropped by `cli._build_adapter` for every harness but
+    `ClaudeAdapter`).
     """
     workspace, slug = enabled_project
     payload = json.dumps({"session_id": f"{verb}-thread-check", "cwd": str(workspace)})
@@ -631,4 +664,170 @@ def test_every_hook_payload_verb_threads_git_facts_root(
     assert Path(args.git_facts_root) == workspace, (
         "git_facts_root must be the location that actually resolved this "
         "session (the session's OWN working tree), not merely non-None"
+    )
+
+
+@pytest.mark.parametrize("harness", ["portable", "subagent"])
+@pytest.mark.parametrize("verb", _observe_subcommands_accepting_hook_payload())
+def test_every_hook_payload_verb_and_harness_builds_an_adapter_that_uses_git_facts_root(
+    verb: str, harness: str, enabled_project_with_worktree: tuple[Path, str, Path]
+) -> None:
+    """Chunk 7 fix, watching the layer that actually matters.
+
+    `test_every_hook_payload_verb_threads_git_facts_root` above only proves
+    `args.git_facts_root` (a `Namespace` attribute) gets set -- it passed
+    even while this exact defect was live, because `cli._build_adapter`
+    computed the value correctly and then silently forwarded it to
+    `ClaudeAdapter` only, dropping it for `--harness subagent` (the harness
+    `SubagentStart`'s production hook always dispatches with -- see
+    `templates/hooks/claude-code/subagent-start`) and `--harness portable`
+    (this CLI's own default). This test builds the SAME adapter
+    `_build_adapter` builds for the real CLI call and checks ITS
+    `git_facts()` output, so a future re-drop of this wiring (a new harness
+    branch in `_build_adapter` that forgets `git_facts_root=`) fails here
+    even if the `Namespace`-level test above stays green.
+
+    Uses `enabled_project_with_worktree`, not the plain `enabled_project`
+    fixture above -- `workspace` and the session's own working tree
+    (`--hook-payload`'s `cwd`) must be on genuinely DIFFERENT branches, or
+    `git_facts_root` and `workspace` would coincidentally agree and the
+    assertion below could not distinguish "used git_facts_root" from "fell
+    back to workspace".
+    """
+    workspace, slug, worktree = enabled_project_with_worktree
+    payload = json.dumps(
+        {
+            "session_id": f"{verb}-{harness}-thread-check",
+            "cwd": str(worktree),
+            # `dispatch` needs `agent_id` to resolve a `dispatch_id` at all
+            # (`_cmd_observe_dispatch` returns early, before ever building an
+            # adapter, when it is absent) -- harmless extra key for
+            # `session-start`, which never reads it.
+            "agent_id": f"{verb}-{harness}-thread-check",
+        }
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(["observe", verb, "--hook-payload", "-", "--harness", harness])
+
+    import sys as _sys
+
+    original_stdin = _sys.stdin
+    _sys.stdin = _fake_stdin(payload)
+    try:
+        args.func(args)
+    finally:
+        _sys.stdin = original_stdin
+
+    assert Path(args.git_facts_root) == worktree, (
+        "sanity check on the Namespace attribute before checking the "
+        "adapter built from it"
+    )
+
+    adapter = fleet_cli._build_adapter(args)
+    facts = adapter.git_facts()
+    assert facts.branch == "the-worktree-own-branch", (
+        f"observe {verb} --harness {harness}: the adapter _build_adapter "
+        "constructs from these args must report git facts from "
+        "git_facts_root (the worktree -- the session's OWN working tree), "
+        "not workspace (the outward-hopped main checkout) -- got "
+        f"branch={facts.branch!r}, expected the worktree's own branch. This "
+        "is the exact chunk-7 defect: git_facts_root computed but dropped "
+        "on the floor before reaching the adapter."
+    )
+
+
+def test_subagent_start_hook_dispatch_from_linked_worktree_records_worktree_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chunk 7 behavioural regression -- the PM's real live-proof scenario.
+
+    A real `SubagentStart` hook run from a session in a linked worktree wrote
+    a dispatch row with `"branch": "main"` -- the MAIN checkout's branch --
+    instead of the worktree's own branch. This test reproduces that exact
+    shape end to end through the REAL CLI entry point (`fleet_cli.main`,
+    i.e. `python -m scripts.fleet.cli observe dispatch --hook-payload -
+    --harness subagent`, the invocation
+    `templates/hooks/claude-code/subagent-start` always makes) rather than
+    calling any internal function directly, and asserts on the actual
+    `branch` field written to `events.jsonl` -- not on an adapter or a
+    `Namespace` attribute, both already covered above.
+
+    `CLAUDE_PROJECT_DIR` is deliberately absent from the environment: the
+    hook script (not exercised here -- only the Python entry point is)
+    passes it through as `--anchor` when set, but this test's `cwd` ->
+    `locate_project` resolution must stand on its own via the payload's
+    `cwd` alone, matching a harness invocation with no such variable set.
+    """
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+    main_repo = tmp_path / "main-repo"
+    main_repo.mkdir()
+    _run_git(main_repo, "init", "-q", "-b", "main")
+    _run_git(main_repo, "config", "user.email", "test@example.invalid")
+    _run_git(main_repo, "config", "user.name", "Test")
+    (main_repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _run_git(main_repo, "add", "README.md")
+    _run_git(main_repo, "commit", "-q", "-m", "initial")
+
+    slug = "worktree-behavioural-project"
+    project_dir = main_repo / "docs" / "superhuman" / slug
+    project_dir.mkdir(parents=True)
+    (project_dir / "SUPERHUMAN.md").write_text(
+        f"**Slug:** {slug}\n**Project-id:** proj-behavioural\n", encoding="utf-8"
+    )
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "fleet:\n  enabled: true\n  observe_deadline_seconds: 5.0\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+    worktree = tmp_path / "linked-worktree"
+    _run_git(main_repo, "worktree", "add", str(worktree), "-b", "feature-x")
+
+    payload = json.dumps(
+        {
+            "session_id": "behavioural-session-1",
+            "cwd": str(worktree),
+            "hook_event_name": "SubagentStart",
+            "agent_id": "behavioural-dispatch-1",
+            "agent_type": "developer",
+            "prompt_id": "prompt-1",
+        }
+    )
+
+    import sys as _sys
+
+    original_stdin = _sys.stdin
+    _sys.stdin = _fake_stdin(payload)
+    try:
+        exit_code = fleet_cli.main(
+            ["observe", "dispatch", "--hook-payload", "-", "--harness", "subagent"]
+        )
+    finally:
+        _sys.stdin = original_stdin
+
+    assert exit_code == 0
+
+    log_path = project_dir / "fleet" / "events.jsonl"
+    assert log_path.exists(), (
+        "expected the real `observe dispatch` entry point to write a "
+        f"session_registered event to {log_path}"
+    )
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    registered = [e for e in events if e.get("type") == "session_registered"]
+    assert len(registered) == 1, (
+        f"expected exactly one session_registered event, got {registered!r}"
+    )
+    assert registered[0]["payload"]["branch"] == "feature-x", (
+        "the written row's branch must be the WORKTREE's own branch "
+        "('feature-x'), never the main checkout's ('main') -- got "
+        f"{registered[0]['payload']['branch']!r}. This is the production "
+        "defect: a SubagentStart hook run from a session in a linked "
+        "worktree recorded the main checkout's currently-checked-out "
+        "branch as if it were this dispatch's own."
     )

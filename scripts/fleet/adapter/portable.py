@@ -128,7 +128,9 @@ class PortableAdapter(SessionAdapter):
     """git+fs+env-only `SessionAdapter` — the degradation and conformance path.
 
     Attributes:
-        workspace: the working tree this adapter reports on.
+        workspace: the working tree this adapter reports on. NOT necessarily
+            where this process's own git facts should be read from (see
+            `git_facts_root`).
         slug: the owning superhuman project's slug (used to namespace node ids).
     """
 
@@ -139,6 +141,7 @@ class PortableAdapter(SessionAdapter):
         *,
         local_id: str | None = None,
         git_timeout: float | None = None,
+        git_facts_root: Path | str | None = None,
     ) -> None:
         """Initialize a PortableAdapter.
 
@@ -153,11 +156,30 @@ class PortableAdapter(SessionAdapter):
                 `git_facts()` (additive passthrough, fleet-wiring Chunk 1).
                 `None` (the default, unchanged for every existing caller)
                 uses `collect_git_facts`'s own default (30.0s).
+            git_facts_root: the directory `git_facts()` actually queries for
+                branch/commit/dirty state. Defaults to `workspace` when
+                omitted -- byte-identical to every caller before this
+                parameter existed. Mirrors `ClaudeAdapter`'s/`SubagentAdapter`'s
+                identically-named parameter: a `--hook-payload` consumer
+                (`cli._cmd_observe_dispatch`/`_cmd_observe_session_start`)
+                resolves the session's own working tree (possibly a linked
+                worktree) BEFORE `locate.locate_project` hops outward to
+                find the project's `SUPERHUMAN.md`, and that outward-hopped
+                `workspace` can be a different repository's worth of git
+                state -- reporting `workspace`'s branch there answers a
+                different question (chunk-6's measured defect, reproduced
+                for this adapter at chunk 7: `cli._build_adapter` computed
+                `args.git_facts_root` correctly but only forwarded it to
+                `ClaudeAdapter`, silently dropping it for `--harness
+                portable`, this adapter's CLI default).
         """
         self.workspace = Path(workspace)
         self.slug = slug
         self._local_id = local_id if local_id is not None else str(os.getpid())
         self._git_timeout = git_timeout
+        self._git_facts_root = (
+            Path(git_facts_root) if git_facts_root is not None else self.workspace
+        )
 
     def current_session(self) -> SessionInfo:
         """Return this process's own identity, enriched with real git facts.
@@ -191,16 +213,21 @@ class PortableAdapter(SessionAdapter):
         return [self.current_session()]
 
     def git_facts(self) -> GitFacts:
-        """Return real git plumbing facts for `self.workspace`.
+        """Return real git plumbing facts for `self._git_facts_root`.
 
         Returns:
-            GitFacts: as `collect_git_facts(self.workspace)`, honoring this
-            adapter's `git_timeout` override if one was given at
-            construction.
+            GitFacts: as `collect_git_facts(self._git_facts_root)`.
+            `self._git_facts_root` defaults to `self.workspace` when no
+            override was given at construction, so this is byte-identical to
+            querying `self.workspace` directly for every caller that
+            predates `git_facts_root` — see the constructor's
+            `git_facts_root` parameter for why the two differ for a
+            `--hook-payload` consumer. Honors this adapter's `git_timeout`
+            override if one was given at construction.
         """
         if self._git_timeout is None:
-            return collect_git_facts(self.workspace)
-        return collect_git_facts(self.workspace, git_timeout=self._git_timeout)
+            return collect_git_facts(self._git_facts_root)
+        return collect_git_facts(self._git_facts_root, git_timeout=self._git_timeout)
 
     def emit_prompt(self, text: str, handoff_id: str) -> str:
         """Append the literal handoff-id marker line to `text`.
