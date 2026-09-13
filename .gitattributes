@@ -21,7 +21,7 @@ scripts/autonomous-iter.sh text eol=lf
 # trailing backslash would escape that carriage return rather than
 # continue the line.
 templates/hooks/claude-code/session-start text eol=lf
-templates/hooks/PreToolUse text eol=lf
+templates/hooks/claude-code/subagent-start text eol=lf
 
 # Reference scripts the docs invoke directly (`./find-polluter.sh`,
 # `./render-graphs.js`, `scripts/start-server.sh`). Same reasoning as above:

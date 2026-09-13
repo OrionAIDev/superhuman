@@ -2,9 +2,8 @@
 the deterministic hook wrappers themselves (Chunks 6 and 7).
 
 Chunk 6 (`SessionStart`, TC-35..TC-41 below, plus two `--anchor` regression
-tests required by the chunk-6 PM ruling on ARCHITECTURE.md Addendum §A) is
-implemented. Chunk 7 (`SubagentStart`, TC-42..TC-53) remains a TDD scaffold
-with `pytest.mark.skip` stubs for that chunk's Developer.
+tests required by the chunk-6 PM ruling on ARCHITECTURE.md Addendum §A) and
+Chunk 7 (`SubagentStart`, TC-42..TC-53) are both implemented.
 
 **FR-18 is the load-bearing requirement of this whole file for
 `subagent-start`: exit code 2 on `SubagentStart` BLOCKS THE SUBAGENT.**
@@ -25,6 +24,7 @@ actually fires each of those four matchers the way the probe fired
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -233,23 +233,24 @@ class TestSessionStartHookValueDefinition:
 
 class TestSessionStartHookContent:
     """TC-36: FR-8/FR-16 — the shipped hook templates carry no leftover
-    placeholder and no `$(pwd)` call."""
+    placeholder and no `$(pwd)` call, across the WHOLE `templates/hooks/**`
+    tree."""
 
     def test_no_replace_with_or_pwd_in_hook_templates(self, skill_root: Path) -> None:
-        """Content test over `templates/hooks/claude-code/**` — the file
-        set THIS chunk creates/owns — for zero occurrences of
-        `REPLACE_WITH_` (FR-8) and zero occurrences of the literal string
-        `$(pwd)` (FR-16, the Phase 1.1 defect this chunk fixes).
+        """Content test over the WHOLE `templates/hooks/**` tree — named
+        literally by TEST.md's TC-36/PLAN.md's FR-8 acceptance criterion —
+        for zero occurrences of `REPLACE_WITH_` (FR-8) and zero occurrences
+        of the literal string `$(pwd)` (FR-16, the Phase 1.1 defect this
+        project fixes).
 
-        Scoped to `claude-code/` rather than the whole `templates/hooks/**`
-        tree named literally by TEST.md's TC-36/PLAN.md's FR-8 acceptance
-        criterion: `templates/hooks/PreToolUse` still carries its own
-        `REPLACE_WITH_YOUR_PROJECT_SLUG` placeholder and is explicitly
-        Chunk 7's file (`SubagentStart` hook rewrite), out of scope for
-        this chunk's Developer. The full-tree assertion only becomes true
-        once Chunk 7 lands; flagged as a chunk-6 concern in the status
-        report rather than silently resolved by touching PreToolUse."""
-        hooks_dir = skill_root / "templates" / "hooks" / "claude-code"
+        Chunk 6 scoped this scan to `templates/hooks/claude-code/**` only,
+        because `templates/hooks/PreToolUse` still carried both tokens and
+        was explicitly Chunk 7's file to delete (PLAN.md's chunk-7 PM
+        ruling on TC-36's narrowing). Chunk 7 deletes that file, so the
+        full-tree assertion is widened here to what TEST.md always named,
+        and the chunk-6 narrowing note is removed rather than carried
+        forward as a stale caveat."""
+        hooks_dir = skill_root / "templates" / "hooks"
         checked = 0
         for path in hooks_dir.rglob("*"):
             if not path.is_file():
@@ -258,10 +259,12 @@ class TestSessionStartHookContent:
             text = path.read_text(encoding="utf-8", errors="replace")
             assert "REPLACE_WITH_" not in text, f"{path} still carries a REPLACE_WITH_ placeholder"
             assert "$(pwd)" not in text, f"{path} still calls $(pwd)"
-        assert checked > 0, "no files found under templates/hooks/claude-code/ to scan"
-        # templates/hooks/SessionStart (the file this chunk supersedes) must
-        # be gone entirely, not merely cleaned up in place.
+        assert checked > 0, "no files found under templates/hooks/ to scan"
+        # templates/hooks/SessionStart and templates/hooks/PreToolUse (the
+        # files chunks 6 and 7 supersede) must be gone entirely, not merely
+        # cleaned up in place.
         assert not (skill_root / "templates" / "hooks" / "SessionStart").exists()
+        assert not (skill_root / "templates" / "hooks" / "PreToolUse").exists()
 
 
 @pytest.mark.skipif(
@@ -694,91 +697,406 @@ class TestSessionStartAnchorRegression:
         assert '"local_id":"anchor-fallback-session"' in log
 
 
+# --- Chunk 7: SubagentStart hook — shared helpers -----------------------------------
+
+_SUBAGENT_HOOK_SCRIPT_NAME = "subagent-start"
+_SUBAGENT_HOOK_CMD_NAME = "subagent-start.cmd"
+
+
+def _subagent_hook_script(skill_root: Path) -> Path:
+    return skill_root / "templates" / "hooks" / "claude-code" / _SUBAGENT_HOOK_SCRIPT_NAME
+
+
+def _subagent_hook_cmd(skill_root: Path) -> Path:
+    return skill_root / "templates" / "hooks" / "claude-code" / _SUBAGENT_HOOK_CMD_NAME
+
+
+def _subagent_payload(
+    *,
+    session_id: str,
+    cwd: Path | str,
+    agent_id: str = "test-agent-id",
+    agent_type: str = "developer",
+    transcript_path: Path | str | None = None,
+) -> dict:
+    """Build a synthetic `SubagentStart` payload — the 8-field shape measured
+    in CHUNK-1-FINDINGS.md (`session_id`, `cwd`, `transcript_path`,
+    `scratchpad_dir`, `hook_event_name`, `agent_id`, `agent_type`,
+    `prompt_id`); this helper populates the fields this chunk's hook/filter
+    actually consume."""
+    payload: dict = {
+        "session_id": session_id,
+        "cwd": str(cwd),
+        "hook_event_name": "SubagentStart",
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+    }
+    if transcript_path is not None:
+        payload["transcript_path"] = str(transcript_path)
+    return payload
+
+
+def _write_transcript(
+    path: Path,
+    *,
+    message_id: str = "msg_test_dispatch",
+    subagent_type: str = "developer",
+    prompt: str,
+    tool_name: str = "Agent",
+) -> None:
+    """Write a synthetic, minimal Claude-Code-shaped transcript JSONL with
+    ONE dispatching assistant-message record — the shape confirmed by
+    reading a real transcript on this machine (chunk 7 dispatch brief):
+    the tool_use's `name` is `"Agent"`, and its `input` carries
+    `subagent_type`/`prompt`, inside a `message` with `role: "assistant"`
+    and an `id` (real transcripts split one message across several JSONL
+    records sharing that `id`; one record suffices for these tests since
+    the filter only needs the last dispatching message's candidates)."""
+    record = {
+        "type": "assistant",
+        "message": {
+            "id": message_id,
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_test",
+                    "name": tool_name,
+                    "input": {
+                        "description": "test dispatch",
+                        "subagent_type": subagent_type,
+                        "prompt": prompt,
+                    },
+                }
+            ],
+        },
+    }
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+
+def _run_subagent_hook_script(
+    *,
+    skill_root: Path,
+    stdin_text: str,
+    cwd: Path,
+    profile_path: Path | None = None,
+    extra_env: dict | None = None,
+    unset_claude_project_dir: bool = True,
+    timeout: float = 15.0,
+) -> subprocess.CompletedProcess:
+    """Invoke `templates/hooks/claude-code/subagent-start` as a real subprocess.
+
+    Args:
+        skill_root: the superhuman skill checkout.
+        stdin_text: the raw text piped to the hook's stdin — deliberately a
+            raw string rather than a payload dict, so fault-injection tests
+            (corrupted/non-JSON/empty stdin) can pass arbitrary bytes.
+        cwd: the subprocess's OWN OS working directory.
+        profile_path: `SUPERHUMAN_PROFILE` override so fleet is enabled;
+            omit for fault tests where the payload is never expected to
+            reach a fleet write at all.
+        extra_env: additional/overriding environment variables (e.g. a
+            `PATH` override for the missing-interpreter fault).
+        unset_claude_project_dir: pop `CLAUDE_PROJECT_DIR` first, matching
+            `_run_hook_script`'s identical rationale.
+        timeout: bounded wait.
+
+    Returns:
+        subprocess.CompletedProcess: with `text=True` stdout/stderr.
+    """
+    env = os.environ.copy()
+    if unset_claude_project_dir:
+        env.pop("CLAUDE_PROJECT_DIR", None)
+    if profile_path is not None:
+        env["SUPERHUMAN_PROFILE"] = str(profile_path)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [_BASH, str(_subagent_hook_script(skill_root))],
+        input=stdin_text,
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
 # --- Chunk 7: SubagentStart hook — the fault-injection matrix -----------------------
 
 
+@pytest.mark.skipif(
+    _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+)
 class TestSubagentHookFaultInjectionMatrix:
     """FR-18's fault matrix. Every test's PRIMARY assertion is exit code 0
     — that is the correctness bar, because exit 2 on `SubagentStart` blocks
     the subagent outright.
     """
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-42, fault #1")
     def test_exits_0_on_corrupted_truncated_json_payload(
-        self, tmp_path: Path
+        self, skill_root: Path, tmp_path: Path
     ) -> None:
-        """Simulation: pipe a syntactically-broken JSON string to stdin,
-        e.g. `{"session_id": "abc", "cwd": "/x` (unterminated). Assert exit
-        code 0 and no traceback on stdout."""
+        """TC-42, fault #1: a syntactically-broken JSON string on stdin,
+        e.g. `{"session_id": "abc", "cwd": "/x` (unterminated)."""
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text='{"session_id": "abc", "cwd": "/x',
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-43, fault #2")
-    def test_exits_0_on_non_json_stdin(self, tmp_path: Path) -> None:
-        """Simulation: pipe arbitrary non-JSON bytes (including a raw NUL
-        and a raw 0xFF byte) to stdin. Assert exit code 0."""
+    def test_exits_0_on_non_json_stdin(self, skill_root: Path, tmp_path: Path) -> None:
+        """TC-43, fault #2: arbitrary non-JSON bytes (including a raw NUL
+        and a raw 0xFF byte) on stdin."""
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text="not json at all\x00\xff",
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-44, fault #3")
-    def test_exits_0_on_empty_stdin(self, tmp_path: Path) -> None:
-        """Simulation: close stdin immediately / pipe zero bytes. Assert
-        exit code 0."""
+    def test_exits_0_on_empty_stdin(self, skill_root: Path, tmp_path: Path) -> None:
+        """TC-44, fault #3: stdin closed immediately / zero bytes."""
+        result = _run_subagent_hook_script(
+            skill_root=skill_root, stdin_text="", cwd=tmp_path
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-45, fault #4")
-    def test_exits_0_when_interpreter_missing(self, tmp_path: Path) -> None:
-        """Simulation: invoke the hook with a `PATH` environment override
-        (`subprocess.run(..., env={...})`) pointing at a directory
-        containing no `python`/`python3` executable, simulating a
-        moved/uninstalled interpreter. Assert exit code 0 — the shell
-        wrapper's own `trap ... EXIT` must catch this, not just the Python
-        layer."""
+    def test_exits_0_when_interpreter_missing(self, skill_root: Path, tmp_path: Path) -> None:
+        """TC-45, fault #4: `PATH` names a directory with no `python`/
+        `python3` executable, simulating a moved/uninstalled interpreter.
+        The shell wrapper's own `trap ... EXIT` must catch this, not just
+        the Python layer — there IS no Python layer on this path."""
+        empty_path_dir = tmp_path / "empty-path"
+        empty_path_dir.mkdir()
+        payload = _subagent_payload(session_id="tc45-session", cwd=tmp_path)
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=tmp_path,
+            extra_env={"PATH": str(empty_path_dir)},
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-46, fault #5")
-    def test_exits_0_on_unreadable_transcript_path(self, tmp_path: Path) -> None:
-        """Simulation: payload's `transcript_path` names a file that does
-        not exist (and, where the platform allows it, one with permissions
-        revoked). The hook must not read it unconditionally without a
-        guard. Assert exit code 0."""
+    def test_exits_0_on_unreadable_transcript_path(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """TC-46, fault #5: `transcript_path` names a file that does not
+        exist. The hook (via the D5 filter) must not read it unconditionally
+        without a guard, and must still write no row and exit 0."""
+        workspace, slug, profile = enabled_project
+        missing_transcript = workspace / "does-not-exist.jsonl"
+        payload = _subagent_payload(
+            session_id="tc46-session",
+            cwd=workspace,
+            transcript_path=missing_transcript,
+        )
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert _events_log(workspace, slug) == "", (
+            "an unreadable transcript_path must never register a row -- the "
+            "D5 filter's zero-candidates case means 'no row', not a guess"
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-47, fault #6")
-    def test_exits_0_when_workspace_no_longer_exists(self, tmp_path: Path) -> None:
-        """Simulation: create a directory, then `shutil.rmtree` it
-        immediately before invoking the hook with a payload `cwd` naming
-        the now-deleted path. Assert exit code 0."""
+    def test_exits_0_when_workspace_no_longer_exists(
+        self, skill_root: Path, tmp_path: Path
+    ) -> None:
+        """TC-47, fault #6: the payload `cwd` names a directory deleted
+        between payload construction and hook invocation."""
+        deleted_workspace = tmp_path / "deleted-workspace"
+        deleted_workspace.mkdir()
+        shutil.rmtree(deleted_workspace)
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-48, fault #7")
+        payload = _subagent_payload(session_id="tc47-session", cwd=deleted_workspace)
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=tmp_path,  # the subprocess's OWN cwd must exist; the payload's need not
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
     def test_survives_a_hung_subprocess_under_the_harness_timeout_backstop(
-        self, tmp_path: Path
+        self, skill_root: Path, tmp_path: Path
     ) -> None:
-        """Simulation: replace the invoked `python` with a stub script that
-        sleeps indefinitely; invoke the hook under a TEST-LEVEL bounded
-        wait shorter than the sleep, and assert the process is terminated
-        cleanly (no orphan child) once the bounded wait's timeout fires.
+        """TC-48, fault #7: the invoked `python` is replaced with a stub
+        that sleeps indefinitely; this test's own bounded wait is shorter
+        than the sleep, and it asserts the process TREE the hook wrapper
+        spawned can be cleanly killed with nothing left running.
 
-        DOCUMENTED LIMITATION (state this in the implementation's
-        docstring too): the hook's own `trap ... EXIT` cannot preempt a
-        genuine hang — it only guarantees exit 0 on paths that DO return.
-        The actual mitigation for a true hang is the harness's own
-        per-hook `"timeout"` setting, written by the Chunk 8 installer as
-        a backstop (NFR-2). This test proves the wrapper does not DEFEAT
-        that backstop (e.g. by disabling signal delivery, backgrounding an
-        untracked child, or swallowing `SIGTERM`) — it does not claim the
-        hook self-terminates a hang.
+        DOCUMENTED LIMITATION (also true of the shipped hook itself): the
+        wrapper's own `trap ... EXIT` cannot preempt a genuine hang — it
+        only guarantees exit 0 on paths that DO return. The actual
+        mitigation for a true hang is the harness's own per-hook
+        `"timeout"` setting, written by the Chunk 8 installer as a backstop
+        (NFR-2). This test proves the wrapper does not DEFEAT that backstop
+        (e.g. by disabling signal delivery, backgrounding an untracked
+        child, or swallowing `SIGTERM`) — it does not claim the hook
+        self-terminates a hang.
         """
+        stub_dir = tmp_path / "fake-python-bin"
+        stub_dir.mkdir()
+        marker_file = tmp_path / "stub.pid"
+        stub_path = stub_dir / "python3"
+        stub_path.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "-c" ]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            f'echo $$ > "{marker_file.as_posix()}"\n'
+            "sleep 300\n",
+            encoding="utf-8",
+        )
+        stub_path.chmod(0o755)
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-49, fault #8")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        payload = _subagent_payload(session_id="tc48-session", cwd=workspace)
+
+        env = os.environ.copy()
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["PATH"] = str(stub_dir) + os.pathsep + env.get("PATH", "")
+
+        proc = subprocess.Popen(
+            [_BASH, str(_subagent_hook_script(skill_root))],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(workspace),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(payload))
+            proc.stdin.close()
+
+            with pytest.raises(subprocess.TimeoutExpired):
+                proc.wait(timeout=3.0)
+
+            # Give the stub a moment to have written its own pid -- it runs
+            # concurrently with the bounded wait above.
+            deadline = time.time() + 5.0
+            stub_pid = None
+            while time.time() < deadline:
+                if marker_file.exists():
+                    stub_pid = marker_file.read_text(encoding="utf-8").strip()
+                    if stub_pid:
+                        break
+                time.sleep(0.1)
+
+            # The harness-level backstop, simulated: kill the whole process
+            # TREE the hook wrapper spawned, not just the top bash process
+            # -- proving the wrapper did not detach the hung python from
+            # that tree (no `disown`/`setsid`/backgrounding that would
+            # defeat a real per-hook "timeout" backstop, Chunk 8/NFR-2).
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            else:
+                import signal as _signal
+
+                os.killpg(proc.pid, _signal.SIGKILL)
+            proc.wait(timeout=10)
+
+            if stub_pid:
+                if sys.platform == "win32":
+                    check = subprocess.run(
+                        ["tasklist", "/FI", f"PID eq {stub_pid}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    survived = stub_pid in check.stdout
+                else:
+                    survived = os.path.exists(f"/proc/{stub_pid}")
+                assert not survived, (
+                    f"stub python process {stub_pid} survived the process-tree kill -- "
+                    "the hook wrapper detached it from the tree the harness backstop "
+                    "would have killed, defeating the timeout backstop"
+                )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
     def test_exits_0_on_simulated_disk_full(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, enabled_project: tuple[Path, str, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Simulation: at the PYTHON layer (mirroring the existing
+        """TC-49, fault #8: at the PYTHON layer (mirroring the existing
         `test_journal_write_failure_falls_back_to_exactly_one_stderr_line`
         idiom in `tests/fleet/test_observe.py`), monkeypatch the write call
         to raise `OSError(errno.ENOSPC, "No space left on device")`. A true
         OS-level full-disk simulation is out of scope for a portable
-        suite; this is documented here as the practical equivalent, since
-        `observe.py`'s broad catch treats any `OSError` identically
-        regardless of `errno`. Assert exit code 0."""
+        suite; this is the practical equivalent, since `observe.py`'s
+        broad catch treats any `OSError` identically regardless of `errno`.
+
+        This one test in the matrix exercises the CLI layer directly
+        (`observe dispatch`'s own `args.func(args) == 0`) rather than the
+        real shell subprocess, since the fault must be injected into THIS
+        process's own `Path.mkdir`, which a subprocess cannot see.
+        """
+        workspace, slug, profile = enabled_project
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        def _raise_enospc(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(Path, "mkdir", _raise_enospc)
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "dispatch",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--dispatch-id",
+                "tc49-dispatch",
+                "--harness",
+                "subagent",
+                "--local-id",
+                "tc49-dispatch",
+            ]
+        )
+        assert args.func(args) == 0
 
 
+@pytest.mark.skipif(
+    _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+)
 class TestSubagentHookNeverPrintsATraceback:
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-53")
+    """TC-53: across every fault in TC-42..TC-49, stdout never carries a
+    Python traceback."""
+
     @pytest.mark.parametrize(
         "fault",
         [
@@ -788,42 +1106,215 @@ class TestSubagentHookNeverPrintsATraceback:
             "missing_interpreter",
             "unreadable_transcript",
             "deleted_workspace",
-            "disk_full",
         ],
     )
     def test_stdout_never_carries_a_python_traceback(
-        self, fault: str, tmp_path: Path
+        self, fault: str, skill_root: Path, tmp_path: Path
     ) -> None:
-        """Across every fault above, stdout is either empty or the one
-        sanctioned diagnostic line — never a Python traceback, which would
-        itself be a symptom the trap failed to catch cleanly, independent
-        of whatever the exit code turned out to be."""
+        """Across every SUBPROCESS-level fault above (`disk_full` is
+        covered separately below, at the CLI-function layer TC-49 itself
+        runs at), stdout is either empty or the one sanctioned diagnostic
+        line — never a Python traceback, which would itself be a symptom
+        the trap failed to catch cleanly, independent of the exit code."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        extra_env: dict | None = None
+
+        if fault == "corrupted_json":
+            stdin_text = '{"session_id": "abc", "cwd": "/x'
+        elif fault == "non_json":
+            stdin_text = "not json at all\x00\xff"
+        elif fault == "empty_stdin":
+            stdin_text = ""
+        elif fault == "missing_interpreter":
+            empty_path_dir = tmp_path / "empty-path"
+            empty_path_dir.mkdir()
+            extra_env = {"PATH": str(empty_path_dir)}
+            stdin_text = json.dumps(_subagent_payload(session_id=fault, cwd=workspace))
+        elif fault == "unreadable_transcript":
+            stdin_text = json.dumps(
+                _subagent_payload(
+                    session_id=fault,
+                    cwd=workspace,
+                    transcript_path=workspace / "does-not-exist.jsonl",
+                )
+            )
+        else:  # "deleted_workspace"
+            deleted = tmp_path / "deleted"
+            deleted.mkdir()
+            shutil.rmtree(deleted)
+            stdin_text = json.dumps(_subagent_payload(session_id=fault, cwd=deleted))
+
+        result = _run_subagent_hook_script(
+            skill_root=skill_root, stdin_text=stdin_text, cwd=workspace, extra_env=extra_env
+        )
+        assert result.returncode == 0
+        assert "Traceback (most recent call last)" not in result.stdout, (
+            f"fault={fault}: a Python traceback leaked onto stdout:\n{result.stdout}"
+        )
+
+    def test_stdout_never_carries_a_python_traceback_disk_full(
+        self,
+        enabled_project: tuple[Path, str, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The `disk_full` fault's counterpart to the parametrized test
+        above. TC-49 exercises this fault at the CLI-function layer
+        (`_cmd_observe_dispatch`), never spawning a subprocess whose stdout
+        the parametrized test could capture — so this asserts the same
+        "no traceback" property directly against `capsys`, the layer TC-49
+        itself runs at."""
+        workspace, slug, profile = enabled_project
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        def _raise_enospc(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(Path, "mkdir", _raise_enospc)
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "observe",
+                "dispatch",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--dispatch-id",
+                "tc53-disk-full-dispatch",
+                "--harness",
+                "subagent",
+                "--local-id",
+                "tc53-disk-full-dispatch",
+            ]
+        )
+        assert args.func(args) == 0
+        captured = capsys.readouterr()
+        assert "Traceback (most recent call last)" not in captured.out
 
 
 class TestDecisionCGranularity:
     """D5: the SubagentStart hook applies Decision C's exact predicate —
     'a dispatch registers iff its prompt leads with a `roles/*.md`
-    block' — read from `transcript_path`, per Chunk 1's probe finding.
+    block' — read from `transcript_path`, per Chunk 1's probe finding and
+    chunk 7's PM rulings (delta-report-002).
     """
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-50")
-    def test_subagent_hook_registers_a_role_dispatch(self, tmp_path: Path) -> None:
-        """A synthetic payload whose `transcript_path` content leads with a
-        `roles/*.md` block: the hook registers a dispatch row."""
+    _ROLE_BLOCK_PROMPT = (
+        "---\n"
+        "name: developer\n"
+        "tier: standard\n"
+        "declared-references:\n"
+        "  - references/test-driven-development/SKILL.md\n"
+        "---\n"
+        "\n"
+        "# Developer role\n"
+        "\n"
+        "You are the Developer for this superhuman project...\n"
+    )
+    _PROSE_BRIEF_PROMPT = (
+        "You are the Developer for **chunk 7** of the superhuman project "
+        "`fleet-deterministic-seams`. Implement the SubagentStart hook...\n"
+    )
+    _ROLES_MENTIONED_MIDBODY_PROMPT = (
+        "You are a general-purpose research agent dispatched to investigate "
+        "how superhuman's role system works. Its role prompts live under "
+        "roles/*.md (e.g. roles/developer.md) and are dispatched by the PM. "
+        "Summarize how role tiers are declared.\n"
+    )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-51")
+    @pytest.mark.skipif(
+        _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+    )
+    def test_subagent_hook_registers_a_role_dispatch(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """TC-50: a synthetic payload whose `transcript_path` content leads
+        with a `roles/*.md` block: the hook registers a dispatch row."""
+        workspace, slug, profile = enabled_project
+        transcript = workspace / "transcript.jsonl"
+        _write_transcript(transcript, prompt=self._ROLE_BLOCK_PROMPT)
+        payload = _subagent_payload(
+            session_id="tc50-session", cwd=workspace, transcript_path=transcript
+        )
+
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        log = _events_log(workspace, slug)
+        assert '"type":"session_registered"' in log
+        assert '"origination":"spawned"' in log
+        assert '"harness":"subagent"' in log
+
+    @pytest.mark.skipif(
+        _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+    )
     def test_subagent_hook_does_not_register_a_research_fanout(
-        self, tmp_path: Path
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
     ) -> None:
-        """Same payload shape, but the dispatch prompt does NOT lead with a
-        `roles/*.md` block (a general-purpose research fan-out). No row is
-        written."""
+        """TC-51: same payload shape, but the dispatch prompt does NOT lead
+        with a `roles/*.md` block (a general-purpose research fan-out). No
+        row is written."""
+        workspace, slug, profile = enabled_project
+        transcript = workspace / "transcript.jsonl"
+        _write_transcript(transcript, prompt=self._PROSE_BRIEF_PROMPT)
+        payload = _subagent_payload(
+            session_id="tc51-session", cwd=workspace, transcript_path=transcript
+        )
 
-    @pytest.mark.skip(reason="TDD scaffold - Chunk 7, TC-52")
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert _events_log(workspace, slug) == ""
+
+    @pytest.mark.skipif(
+        _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+    )
     def test_decision_c_predicate_edge_case_roles_mentioned_but_not_leading(
-        self, tmp_path: Path
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
     ) -> None:
-        """A prompt that MENTIONS `roles/` mid-body (e.g. discussing the
-        role system) but does not LEAD with it. Must not register — this
-        is the precision case separating Decision C's exact predicate from
-        a loose substring match."""
+        """TC-52: a prompt that MENTIONS `roles/` mid-body (e.g. discussing
+        the role system) but does not LEAD with it. Must not register —
+        this is the precision case separating Decision C's exact predicate
+        from a loose substring match."""
+        workspace, slug, profile = enabled_project
+        transcript = workspace / "transcript.jsonl"
+        _write_transcript(
+            transcript,
+            subagent_type="general-purpose",
+            prompt=self._ROLES_MENTIONED_MIDBODY_PROMPT,
+        )
+        payload = _subagent_payload(
+            session_id="tc52-session",
+            cwd=workspace,
+            agent_type="general-purpose",
+            transcript_path=transcript,
+        )
+
+        result = _run_subagent_hook_script(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert _events_log(workspace, slug) == ""

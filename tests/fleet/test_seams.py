@@ -151,20 +151,22 @@ class TestHandoffEmissionSeamContent:
 #:
 #: `templates/hooks/SessionStart` (Chunk 3's `observe launch` wrapper) was
 #: superseded at Chunk 6 by `templates/hooks/claude-code/session-start`
-#: (`observe session-start --hook-payload -`, FR-15/FR-16) and deleted;
-#: updated here rather than left to bit-rot against a file that no longer
-#: exists. `templates/hooks/PreToolUse` is unchanged (Chunk 7's file).
+#: (`observe session-start --hook-payload -`, FR-15/FR-16) and deleted.
+#: `templates/hooks/PreToolUse` was likewise superseded at Chunk 7 by
+#: `templates/hooks/claude-code/subagent-start` (`observe dispatch
+#: --hook-payload -`, FR-15/FR-18) and deleted; updated here rather than
+#: left to bit-rot against a file that no longer exists.
 _HOOK_TEMPLATES: dict[str, str] = {
     "templates/hooks/claude-code/session-start": "-m scripts.fleet.cli observe session-start",
-    "templates/hooks/PreToolUse": "-m scripts.fleet.cli observe dispatch",
+    "templates/hooks/claude-code/subagent-start": "-m scripts.fleet.cli observe dispatch",
 }
 
 
 class TestHookTemplateSeamContent:
-    """TC-14: templates/hooks/{claude-code/session-start,PreToolUse} exist,
+    """TC-14: templates/hooks/claude-code/{session-start,subagent-start}
 
-    are clean, and invoke the same CLI verb group the portable prose floor
-    invokes.
+    exist, are clean, and invoke the same CLI verb group the portable prose
+    floor invokes.
     """
 
     @pytest.mark.parametrize("relative_path", sorted(_HOOK_TEMPLATES))
@@ -186,16 +188,19 @@ class TestHookTemplateSeamContent:
             f"{relative_path}: does not invoke the literal '{expected_verb}' entry point"
         )
 
-    def test_pretooluse_names_harness_subagent(self) -> None:
-        """Phase 3.3 preflight FIX 3: PreToolUse must not silently default to
-        `--harness portable` — a dispatch unit is represented by
-        `--harness subagent`, per DESIGN's Decision C, or every registration
-        this template produces is mislabeled.
+    def test_subagent_start_names_harness_subagent(self) -> None:
+        """Phase 3.3 preflight FIX 3, retargeted at Chunk 7 from the deleted
+        `templates/hooks/PreToolUse` to its replacement: the hook must not
+        silently default to `--harness portable` — a dispatch unit is
+        represented by `--harness subagent`, per DESIGN's Decision C, or
+        every registration this template produces is mislabeled.
         """
-        text = (_REPO_ROOT / "templates/hooks/PreToolUse").read_text(encoding="utf-8")
+        text = (_REPO_ROOT / "templates/hooks/claude-code/subagent-start").read_text(
+            encoding="utf-8"
+        )
         assert "--harness subagent" in text, (
-            "templates/hooks/PreToolUse does not name '--harness subagent' — "
-            "it will silently default to --harness portable"
+            "templates/hooks/claude-code/subagent-start does not name "
+            "'--harness subagent' — it will silently default to --harness portable"
         )
 
 

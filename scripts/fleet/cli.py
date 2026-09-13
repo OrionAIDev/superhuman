@@ -1051,12 +1051,30 @@ def _safe_build_adapter_for_observe(
 
 
 def _cmd_observe_dispatch(args: argparse.Namespace) -> int:
-    """Handle `fleet observe dispatch` (fleet-wiring Chunk 1, W-FR-1).
+    """Handle `fleet observe dispatch` (fleet-wiring Chunk 1, W-FR-1; chunk 7
+    adds `--hook-payload`/`--anchor`, FR-7/FR-17).
 
-    Fail-soft wrapper over `observe.observe_dispatch` — see `observe.py`'s
-    module docstring for the fail-soft/fail-closed boundary this crosses.
-    Prints nothing on the normal path (DESIGN's Loudness tiers: `observe`
-    subcommands other than `handoff-emit`/`status` carry no stdout payload).
+    `--hook-payload <file|->` (D2b, mirroring `_cmd_observe_session_start`)
+    is mutually exclusive in effect with `--workspace`/`--slug`/
+    `--dispatch-id`: when given, `--workspace`/`--slug` are derived from the
+    payload's `cwd` via `locate.locate_project`, and the payload's `agent_id`
+    (CHUNK-1-FINDINGS.md finding 1 — the per-dispatch identifier) is used as
+    both `--dispatch-id` and `--local-id` unless the caller already supplied
+    one explicitly. A malformed/absent payload or a locator refusal both
+    mean "nothing to do here": exit 0, having written nothing, exactly like
+    every other `observe` outcome.
+
+    `--anchor <dir>` behaves identically to `_cmd_observe_session_start`'s
+    (Chunk 6, ARCHITECTURE.md Addendum §A): tried BEFORE the payload's `cwd`
+    when given and non-empty. `templates/hooks/claude-code/subagent-start`
+    passes `$CLAUDE_PROJECT_DIR` here. When `--anchor` is absent (the
+    default), behavior is byte-identical to before this option existed.
+
+    Whichever of `--anchor`/payload `cwd` actually resolved the project is
+    threaded through as `args.git_facts_root` (chunk 6 G6 addendum, carried
+    to this verb per PLAN.md chunk 7's PM ruling 5) — see
+    `_cmd_observe_session_start`'s identical comment for why this must never
+    be silently left at the `workspace` default.
 
     Args:
         args: parsed CLI arguments.
@@ -1065,14 +1083,56 @@ def _cmd_observe_dispatch(args: argparse.Namespace) -> int:
         int: always `0` — `observe.py` never raises and never signals
         failure through the exit code (Decision A).
     """
+    workspace = args.workspace
+    slug = args.slug
+    dispatch_id = args.dispatch_id
+
+    if args.hook_payload is not None:
+        payload = fleet_hook_payload.read_hook_payload(args.hook_payload)
+        if payload is None:
+            return 0
+        location = None
+        resolved_from = None
+        if getattr(args, "anchor", None):
+            location = locate_project(args.anchor)
+            if location is not None:
+                resolved_from = args.anchor
+        if location is None:
+            location = locate_project(payload.cwd)
+            if location is not None:
+                resolved_from = payload.cwd
+        if location is None:
+            return 0
+        workspace = location.workspace
+        slug = location.slug
+        # `resolved_from` is the session's OWN working tree, before D1's
+        # outward hop to `workspace` -- see `_cmd_observe_session_start`'s
+        # identical comment for the chunk-6 branch-attribution defect this
+        # threading avoids reintroducing here.
+        args.git_facts_root = resolved_from
+        if dispatch_id is None:
+            dispatch_id = payload.agent_id
+        if args.local_id is None:
+            args.local_id = payload.agent_id
+
+    if workspace is None or slug is None or dispatch_id is None:
+        print(
+            "fleet observe dispatch: --workspace/--slug/--dispatch-id are required "
+            "unless --hook-payload resolves them",
+            file=sys.stderr,
+        )
+        return 0
+    args.workspace = workspace
+    args.slug = slug
+
     adapter = _safe_build_adapter_for_observe(args, event="dispatch")
     if adapter is None:
         return 0
     fleet_observe.observe_dispatch(
         adapter,
-        workspace=args.workspace,
-        slug=args.slug,
-        dispatch_id=args.dispatch_id,
+        workspace=workspace,
+        slug=slug,
+        dispatch_id=dispatch_id,
         writer_role=args.writer_role,
     )
     return 0
@@ -1604,10 +1664,32 @@ def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
     dispatch_parser = observe_subparsers.add_parser(
         "dispatch", help="Observe a spawned role dispatch (W-FR-1). Always exits 0."
     )
-    dispatch_parser.add_argument("--workspace", required=True, type=Path)
-    dispatch_parser.add_argument("--slug", required=True, help="the superhuman project slug")
     dispatch_parser.add_argument(
-        "--dispatch-id", required=True, help="the PM-minted id identifying the dispatch unit"
+        "--workspace", type=Path, default=None, help="required unless --hook-payload resolves it"
+    )
+    dispatch_parser.add_argument(
+        "--slug", default=None, help="the superhuman project slug (see --workspace)"
+    )
+    dispatch_parser.add_argument(
+        "--dispatch-id",
+        default=None,
+        help="the PM-minted id identifying the dispatch unit; required unless "
+        "--hook-payload resolves it from the payload's agent_id (chunk 7, FR-7)",
+    )
+    dispatch_parser.add_argument(
+        "--hook-payload",
+        default=None,
+        help="read a harness hook JSON payload from this file, or '-' for stdin (D2b); "
+        "derives --workspace/--slug via the locator from the payload's cwd, and uses the "
+        "payload's agent_id as --dispatch-id/--local-id (chunk 7, FR-7/FR-17)",
+    )
+    dispatch_parser.add_argument(
+        "--anchor",
+        default=None,
+        help="with --hook-payload: try locating the project from THIS directory first, "
+        "falling back to the payload's cwd only if it does not resolve (ARCHITECTURE.md "
+        "Addendum §A) — a harness-supplied starting point (e.g. $CLAUDE_PROJECT_DIR), "
+        "never a repo-authored one; omitting this flag leaves behavior unchanged",
     )
     dispatch_parser.add_argument(
         "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"

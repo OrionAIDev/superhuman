@@ -556,24 +556,25 @@ def test_at_least_one_hook_payload_verb_exists() -> None:
     protection would be void without a single visible failure -- that alone
     would justify a `!= []` check.
 
-    But this asserts EXACT equality on purpose, not `>= 1` or `!= []`. The
-    moment a second hook-payload verb is registered (chunk 7), this line goes
-    red, which FORCES whoever added it to come here, read this docstring, and
-    consciously extend the list -- at which point
-    `test_every_hook_payload_verb_threads_git_facts_root` immediately starts
-    exercising that new verb too, and either it threads `git_facts_root`
-    correctly or THAT goes red next.
+    But this asserts EXACT equality on purpose, not `>= 1` or `!= []`. Chunk 7
+    added `dispatch` (`SubagentStart`'s `observe dispatch --hook-payload -`,
+    per PLAN.md chunk 7 PM ruling 5) as the second hook-payload verb,
+    deliberately, updating this list by hand rather than letting it drift --
+    at which point `test_every_hook_payload_verb_threads_git_facts_root`
+    immediately started exercising `dispatch` too, and it threads
+    `git_facts_root` correctly (see `_cmd_observe_dispatch`) or this pin's
+    whole point would be defeated.
 
-    DO NOT weaken this to `>= 1` to make a "spurious" chunk-7 failure go away.
-    That relaxation is exactly the failure mode this whole file exists to
-    prevent: it would look like an unrelated brittle test breaking on
-    unrelated chunk-7 work, the obvious fix would be to loosen it, and
-    loosening it is precisely what lets chunk 7 silently reintroduce the
-    branch-attribution defect this pin was built to catch. If you are here
-    because this failed: good, that is the point -- go add the verb to the
-    list, then go make the new verb set `git_facts_root`.
+    DO NOT weaken this to `>= 1` to make a "spurious" future-chunk failure go
+    away. That relaxation is exactly the failure mode this whole file exists
+    to prevent: it would look like an unrelated brittle test breaking on
+    unrelated work, the obvious fix would be to loosen it, and loosening it is
+    precisely what lets a future verb silently reintroduce the branch-
+    attribution defect this pin was built to catch. If you are here because
+    this failed: good, that is the point -- go add the new verb to the list,
+    then go make it set `git_facts_root`.
     """
-    assert _observe_subcommands_accepting_hook_payload() == ["session-start"]
+    assert _observe_subcommands_accepting_hook_payload() == ["dispatch", "session-start"]
 
 
 @pytest.mark.parametrize("verb", _observe_subcommands_accepting_hook_payload())
