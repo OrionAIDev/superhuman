@@ -12,24 +12,33 @@ orchestrating-model session is explicitly out of scope for this suite — see
 `docs/superhuman/fleet-wiring/TEST.md`'s ruling and `README.md`'s existing
 "full subagent-dispatch smoke is manual-only" precedent for W-FR-1).
 
-What *is* mechanically checkable is the specification a resuming project
-reads: `phases/*.md`, `roles/pm.md`, and `SKILL.md`. If none of their
-pre-existing lines changed (`TestAdditiveDiffInvarianceFullScope`, TC-24 at
-its full enumerated scope) and no phase's `gates:` front-matter list gained,
-lost, or reordered an entry (`TestGatesFrontMatterInvariance`, TC-25), then
-the sequence of gates a resuming project encounters is provably identical
+What *is* mechanically checkable is the gate declaration a resuming project
+reads: every phase recipe's `gates:` front matter, keyed by the recipe that
+declares it. `TestGatesFrontMatterInvariance` (TC-25) asserts that map is
+identical between the merge-base with `main` and HEAD, so the gates a
+resuming project encounters, and the phases that carry them, are unchanged
 for *every* run — a stronger claim than a single live resume would prove,
 because a live resume only proves the claim held for one run on one day.
+`TestGateMapDifferences` proves that comparison fails on each way the gate
+sequence can change, so a green TC-25 is evidence rather than a check that
+could never have failed.
 
-Together these two test classes are the resume regression's automatable
-half named in PLAN.md Chunk 7 Step 1. The live-execution residual is MV-2
-in TEST.md (`docs/fleet-observation.md`'s manual-smoke log records it) —
-not automated here, and not invented as a fake unit test.
+**TC-24 was retired here.** It froze every pre-existing line of four prose
+files (`roles/pm.md`, `phases/3-implementation.md`, `phases/4-acceptance.md`,
+`SKILL.md`). That was fleet-wiring's scope fence, not a gate-order check: it
+covered two of the nine phase recipes that declare gates, so renaming or
+deleting any other one passed both it and the old per-file TC-25, while
+every later correction to those four files needed a regex exemption to
+merge. The gate-map comparison below closes the rename/delete gap directly.
+
+TC-25 is the resume regression's automatable half named in PLAN.md Chunk 7
+Step 1. The live-execution residual is MV-2 in TEST.md
+(`docs/fleet-observation.md`'s manual-smoke log records it) — not automated
+here, and not invented as a fake unit test.
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -38,29 +47,14 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: TC-24's full enumerated scope (rescoped by PM 2026-08-16, user-approved —
-#: see TEST.md). This is every prose file fleet-wiring is permitted to
-#: alter under the additive-edit rule; a file absent from this list is a
-#: file this project must not touch. `test_seams.py::TestAdditiveDiffInvariant`
-#: separately checks the two files TC-10 specifically owns (`roles/pm.md`,
-#: `phases/3-implementation.md`) as part of that seam's own content proof;
-#: this class re-asserts the same invariant over the complete list so the
-#: full W-NFR-4 rule-1 scope has one canonical, exhaustive check.
-_TC24_FULL_SCOPE = (
-    "roles/pm.md",
-    "phases/3-implementation.md",
-    "phases/4-acceptance.md",
-    "SKILL.md",
-)
-
 
 def _merge_base_with_main() -> str | None:
     """Return the merge-base commit of `HEAD` and `origin/main`, or `None`.
 
-    Symbolic on purpose, matching `test_seams.py`'s precedent: this project
-    has already lived through one history rewrite that silently orphaned a
-    pinned SHA. Returns `None` (never raises) if git or the ref is
-    unavailable, so callers can skip cleanly instead of failing.
+    Symbolic on purpose: this project has already lived through one history
+    rewrite that silently orphaned a pinned SHA. Returns `None` (never raises)
+    if git or the ref is unavailable, so callers can skip cleanly instead of
+    failing.
 
     **Mid-merge correction:** a pre-commit hook runs before the merge commit
     exists, so `HEAD` is still the pre-merge tip and `git merge-base HEAD
@@ -101,84 +95,12 @@ def _merge_base_with_main() -> str | None:
     return sha or None
 
 
-#: W-NFR-4 rule 1 forbids changing a line that already existed in these
-#: orchestration files, so that a resumed pre-existing project fires identical
-#: gates in identical order. One narrow class of change cannot satisfy that and
-#: still be correct: a line naming the fleet CLI as a bare `fleet <verb>`
-#: command. No such command has ever been installable — the repo ships no
-#: packaging, so nothing puts a `fleet` executable on `PATH`, and
-#: `scripts/fleet/cli.py`'s package-relative imports rule out running it as a
-#: loose script. Re-spelling those lines to the module form
-#: (`python -m scripts.fleet.cli <verb>`) necessarily removes them.
-#:
-#: The exemption is deliberately as small as the defect: it matches ONLY a
-#: line naming a bare-`fleet` subcommand, so any other removal in these files
-#: still fails. It also expires on its own — once no line spells a command
-#: that way, it matches nothing. The behavioural guarantee it protects is
-#: unaffected: these are non-gating observational call-outs, and the
-#: gate-sequence check (`TestGateFrontmatterUnchanged`) is independent.
-_LEGACY_BARE_FLEET_INVOCATION_RE = re.compile(
-    r"`fleet (?:observe|status|handoff|register|query|gen-view|done)\b"
-)
-
-#: The second, equally narrow exemption: the G1 instruction that told the PM to
-#: write a repo-local git identity into every project. That line is the defect
-#: itself — a repo-local identity overrides any conditional identity routing in
-#: the operator's global config — so no additive edit can correct it while it
-#: survives. It matches ONLY that sentence and expires the same way once main no
-#: longer carries it. Gate order is untouched: G1 still fires where it did, and a
-#: resumed project that has already passed G1 never re-reads the step.
-_LEGACY_REPO_LOCAL_IDENTITY_RE = re.compile(
-    r"set \*\*repo-local\*\* \(not global\) git identity"
-)
-
-
-def _disallowed_removed_lines(diff_stdout: str) -> list[str]:
-    """Return removed diff lines that W-NFR-4 rule 1 does not permit."""
-    return [
-        line
-        for line in diff_stdout.splitlines()
-        if line.startswith("-")
-        and not line.startswith("---")
-        and not _LEGACY_BARE_FLEET_INVOCATION_RE.search(line)
-        and not _LEGACY_REPO_LOCAL_IDENTITY_RE.search(line)
-    ]
-
-
-class TestAdditiveDiffInvarianceFullScope:
-    """TC-24: zero removed lines against the merge-base, across the complete
-    enumerated file list every one of this project's chunks was permitted
-    to touch — not just the two files TC-10's narrower check owns. The one
-    exemption is the bare-`fleet` re-spelling described above.
-    """
-
-    @pytest.mark.parametrize("relative_path", _TC24_FULL_SCOPE)
-    def test_diff_against_merge_base_has_zero_removed_lines(self, relative_path: str) -> None:
-        merge_base = _merge_base_with_main()
-        if merge_base is None:
-            pytest.skip("git or origin/main merge-base unavailable in this environment")
-
-        result = subprocess.run(
-            ["git", "diff", merge_base, "--", relative_path],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0:
-            pytest.skip(f"git diff against {merge_base} failed in this environment")
-
-        removed_lines = _disallowed_removed_lines(result.stdout)
-        assert removed_lines == [], (
-            f"{relative_path}: diff against merge-base {merge_base} removed lines "
-            "(W-NFR-4 rule 1 violation — an existing line changed or was removed):\n"
-            + "\n".join(removed_lines)
-        )
-
-
 def _frontmatter_gates(text: str) -> list[str]:
     """Extract the `gates:` list from a phase recipe's YAML frontmatter.
+
+    Line endings are normalised first: a CRLF checkout would otherwise fail
+    the `---\\n` test, parse every recipe as gate-less, and let two empty
+    maps compare equal.
 
     Args:
         text: full file contents.
@@ -187,57 +109,253 @@ def _frontmatter_gates(text: str) -> list[str]:
         The `gates` list exactly as declared (order preserved, `?` suffixes
         intact) — empty list if no frontmatter or no `gates` key.
     """
+    text = text.replace("\r\n", "\n")
     if not text.startswith("---\n"):
         return []
     end = text.find("\n---", 4)
     if end == -1:
         return []
     fm = yaml.safe_load(text[4:end]) or {}
-    return list(fm.get("gates") or [])
+    return [str(gate) for gate in fm.get("gates") or []]
+
+
+def _gate_map(recipes: dict[str, str]) -> dict[str, list[str]]:
+    """Map each phase recipe that declares gates to its gate list.
+
+    Recipes declaring no gates are left out on purpose. Adding, renaming, or
+    removing a gate-less recipe (e.g. `3.3-preflight-review.md`) changes no
+    gate a resuming project fires, so it must not register as a difference.
+
+    Args:
+        recipes: recipe path (`phases/<name>.md`) → full file contents.
+
+    Returns:
+        Recipe path → declared gate list, for every recipe whose list is
+        non-empty.
+    """
+    gate_map: dict[str, list[str]] = {}
+    for rel, text in recipes.items():
+        gates = _frontmatter_gates(text)
+        if gates:
+            gate_map[rel] = gates
+    return gate_map
+
+
+def _gate_map_differences(
+    base: dict[str, list[str]], head: dict[str, list[str]]
+) -> list[str]:
+    """Describe every way `head`'s gate map departs from `base`'s.
+
+    Compares the whole map rather than each HEAD file against its own past,
+    so a gate-bearing recipe that disappears (deleted, or renamed, which
+    renumbers where its gates fire) is reported. The old per-file loop only
+    visited files present at HEAD, which is the gap that let a phase rename
+    or deletion pass.
+
+    Args:
+        base: gate map at the merge-base.
+        head: gate map at HEAD.
+
+    Returns:
+        One human-readable line per recipe whose gates differ; empty when
+        the maps are identical.
+    """
+    differences: list[str] = []
+    for rel in sorted(base.keys() | head.keys()):
+        before, after = base.get(rel), head.get(rel)
+        if before == after:
+            continue
+        if after is None:
+            differences.append(
+                f"{rel}: declared {before!r} at the merge-base but no gates at HEAD "
+                "(recipe removed or renamed, or its gates dropped)"
+            )
+        elif before is None:
+            differences.append(
+                f"{rel}: declares {after!r} at HEAD but no gates at the merge-base "
+                "(recipe added or renamed, or gates added to it)"
+            )
+        else:
+            differences.append(f"{rel}: gates changed — merge-base={before!r} head={after!r}")
+    return differences
+
+
+def _recipes_at(commit: str) -> dict[str, str] | None:
+    """Read every `phases/*.md` recipe as it stood at `commit`.
+
+    Args:
+        commit: any commit-ish git can resolve.
+
+    Returns:
+        Recipe path → full file contents, or `None` if git could not list or
+        read the tree, so the caller can skip instead of comparing against a
+        partial map.
+    """
+    listing = subprocess.run(
+        ["git", "ls-tree", "--name-only", commit, "phases/"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if listing.returncode != 0:
+        return None
+
+    recipes: dict[str, str] = {}
+    for rel in listing.stdout.splitlines():
+        if not rel.endswith(".md"):
+            continue
+        show = subprocess.run(
+            ["git", "cat-file", "blob", f"{commit}:{rel}"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+        if show.returncode != 0:
+            return None
+        recipes[rel] = show.stdout
+    return recipes
 
 
 class TestGatesFrontMatterInvariance:
-    """TC-25: every phase recipe's `gates:` front-matter list is byte-identical
-    (same entries, same order) between the merge-base with `main` and HEAD.
+    """TC-25: the map of phase recipe → `gates:` list is identical between the
+    merge-base with `main` and HEAD.
 
-    Globs `phases/*.md` rather than hardcoding the file list, so a phase
-    recipe added or removed outside this project's scope does not silently
-    fall out of coverage.
+    Fails when a gate is added, dropped, reordered, or moved between phases,
+    and when a gate-bearing recipe is added, deleted, or renamed. Prose edits
+    and gate-less recipes are free to change. HEAD's recipes are globbed from
+    the working tree rather than hardcoded, so a new recipe cannot fall out of
+    coverage.
     """
 
-    def test_gates_lists_unchanged_across_every_phase_recipe(self) -> None:
+    def test_gate_map_unchanged_since_merge_base(self) -> None:
         merge_base = _merge_base_with_main()
         if merge_base is None:
             pytest.skip("git or origin/main merge-base unavailable in this environment")
 
-        phase_files = sorted((_REPO_ROOT / "phases").glob("*.md"))
-        assert phase_files, "no phase recipes found under phases/"
+        base_recipes = _recipes_at(merge_base)
+        if base_recipes is None:
+            pytest.skip(f"could not read phases/ at merge-base {merge_base}")
 
-        mismatches: list[str] = []
-        for phase_file in phase_files:
-            rel = f"phases/{phase_file.name}"
-            head_gates = _frontmatter_gates(phase_file.read_text(encoding="utf-8"))
+        head_recipes = {
+            f"phases/{path.name}": path.read_text(encoding="utf-8")
+            for path in sorted((_REPO_ROOT / "phases").glob("*.md"))
+        }
+        base_map = _gate_map(base_recipes)
+        head_map = _gate_map(head_recipes)
 
-            show = subprocess.run(
-                ["git", "show", f"{merge_base}:{rel}"],
-                cwd=_REPO_ROOT,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            if show.returncode != 0:
-                # Phase recipe did not exist at the merge-base (added since) —
-                # nothing to compare; not a W-NFR-4 rule-3 violation.
-                continue
-            base_gates = _frontmatter_gates(show.stdout)
+        # Two empty maps compare equal. If parsing ever breaks, this stops the
+        # comparison below from passing on nothing.
+        assert base_map, f"no phase recipe declares gates at merge-base {merge_base}"
+        assert head_map, "no phase recipe declares gates at HEAD"
 
-            if head_gates != base_gates:
-                mismatches.append(
-                    f"{rel}: gates changed — merge-base={base_gates!r} head={head_gates!r}"
-                )
-
-        assert not mismatches, (
-            "W-NFR-4 rule 3 violation — a phase's gates: front-matter list "
-            "gained, lost, or reordered an entry:\n  " + "\n  ".join(mismatches)
+        differences = _gate_map_differences(base_map, head_map)
+        assert not differences, (
+            "W-NFR-4 rule 3 violation — the gates a resumed project fires changed:\n  "
+            + "\n  ".join(differences)
         )
+
+
+#: A small gate map standing in for the real one, so each mutation below is
+#: legible on its own.
+_BASE_MAP: dict[str, list[str]] = {
+    "phases/0-kickoff.md": ["G0", "G1"],
+    "phases/1-requirements.md": ["G2"],
+    "phases/2.1-test-plan.md": ["G4"],
+    "phases/4-acceptance.md": ["G8"],
+}
+
+
+def _mutated(changes: dict[str, list[str] | None] | None = None) -> dict[str, list[str]]:
+    """Return a copy of `_BASE_MAP` with recipes replaced, added, or removed.
+
+    Args:
+        changes: recipe stem (`2.1-test-plan`) → new gate list, or `None`
+            to remove the recipe.
+
+    Returns:
+        The mutated gate map.
+    """
+    mutated = {rel: list(gates) for rel, gates in _BASE_MAP.items()}
+    for stem, gates in (changes or {}).items():
+        rel = f"phases/{stem}.md"
+        if gates is None:
+            mutated.pop(rel)
+        else:
+            mutated[rel] = gates
+    return mutated
+
+
+class TestGateMapDifferences:
+    """Proves TC-25's comparison fails on every way the gate sequence changes
+    and stays quiet on changes that leave it alone."""
+
+    def test_identical_maps_have_no_differences(self) -> None:
+        assert _gate_map_differences(_BASE_MAP, _mutated()) == []
+
+    @pytest.mark.parametrize(
+        ("head", "offending_recipe"),
+        [
+            pytest.param(
+                _mutated({"0-kickoff": ["G1", "G0"]}),
+                "phases/0-kickoff.md",
+                id="reorder-within-a-phase",
+            ),
+            pytest.param(
+                _mutated({"0-kickoff": ["G0"], "1-requirements": ["G1", "G2"]}),
+                "phases/1-requirements.md",
+                id="move-a-gate-between-phases",
+            ),
+            pytest.param(
+                _mutated({"2.1-test-plan": None, "5-test-plan": ["G4"]}),
+                "phases/2.1-test-plan.md",
+                id="rename-renumbers-a-gate-bearing-phase",
+            ),
+            pytest.param(
+                _mutated({"1-requirements": None}),
+                "phases/1-requirements.md",
+                id="delete-a-gate-bearing-phase",
+            ),
+            pytest.param(
+                _mutated({"3.5-extra-review": ["G5"]}),
+                "phases/3.5-extra-review.md",
+                id="add-a-gate-bearing-phase",
+            ),
+            pytest.param(
+                _mutated({"4-acceptance": ["G8", "G11"]}),
+                "phases/4-acceptance.md",
+                id="add-a-new-gate",
+            ),
+            pytest.param(
+                _mutated({"4-acceptance": ["G8?"]}),
+                "phases/4-acceptance.md",
+                id="make-a-gate-conditional",
+            ),
+        ],
+    )
+    def test_gate_sequence_change_is_reported(
+        self, head: dict[str, list[str]], offending_recipe: str
+    ) -> None:
+        differences = _gate_map_differences(_BASE_MAP, head)
+        assert differences, "a gate-sequence change produced no difference"
+        assert any(line.startswith(offending_recipe) for line in differences), differences
+
+    def test_gate_less_recipe_and_prose_changes_are_not_differences(self) -> None:
+        base = {
+            "phases/1-requirements.md": "---\nphase: 1\ngates: [G2]\n---\nDraft it.\n",
+            "phases/3.3-preflight-review.md": "---\nphase: 3.3\ngates: []\n---\nReview.\n",
+        }
+        head = {
+            "phases/1-requirements.md": "---\nphase: 1\ngates: [G2]\n---\nReworded.\n",
+            "phases/3.4-preflight-review.md": "---\nphase: 3.4\ngates: []\n---\nReview.\n",
+            "phases/3.5-new-check.md": "---\nphase: 3.5\ngates: []\n---\nNew.\n",
+        }
+        assert _gate_map_differences(_gate_map(base), _gate_map(head)) == []
+
+    def test_crlf_front_matter_still_yields_gates(self) -> None:
+        text = "---\r\nphase: 0\r\ngates: [G0, G1]\r\n---\r\nBody.\r\n"
+        assert _frontmatter_gates(text) == ["G0", "G1"]

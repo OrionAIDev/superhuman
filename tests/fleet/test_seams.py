@@ -10,16 +10,16 @@ subsection and asserts:
 - it states, in its own words, that the step never blocks the surrounding
   gate and that a failure is logged while execution proceeds;
 - it contains no operator token (a personal name, hostname, or org-internal
-  path/token);
-- the file's diff against the merge-base with `origin/main` contains zero
-  removed lines — the general additive-diff invariant (TC-24), applied here
-  specifically to the two files this chunk touches.
+  path/token).
+
+This module used to also assert zero removed lines in those two files (TC-24's
+additive-diff freeze). That check is retired; `test_resume_regression.py`
+explains why, and its gate-map comparison (TC-25) carries the guarantee.
 """
 
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -84,53 +84,6 @@ def _operator_tokens() -> list[str]:
     return resolve_tokens(locate_tokens_file(_REPO_ROOT))
 
 
-def _merge_base_with_main() -> str | None:
-    """Return the merge-base commit of `HEAD` and `origin/main`, or `None`.
-
-    Symbolic on purpose (per TEST.md's TC-10 guidance) rather than a pinned
-    hash: this project has already lived through one history rewrite that
-    silently orphaned a pinned SHA. Returns `None` (never raises) if git or
-    the ref is unavailable, so callers can skip cleanly instead of failing.
-
-    **Mid-merge correction:** a pre-commit hook runs before the merge commit
-    exists, so `HEAD` is still the pre-merge tip and `git merge-base HEAD
-    origin/main` resolves to the OLD (pre-merge) merge-base — which then
-    picks up `main`'s own independent commits (anything `main` itself
-    changed since branching) as if THIS branch had changed them, a false
-    positive discovered live merging `origin/main` into `fleet-wiring`. Once
-    the merge commit lands, `origin/main` becomes a direct parent and this
-    function's normal computation would return `origin/main`'s own tip — so
-    while `MERGE_HEAD` exists, this returns it directly rather than the
-    stale pre-merge value, matching what the post-commit answer will be.
-    """
-    merge_head = subprocess.run(
-        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
-        cwd=_REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if merge_head.returncode == 0 and merge_head.stdout.strip():
-        return merge_head.stdout.strip()
-
-    try:
-        result = subprocess.run(
-            ["git", "merge-base", "HEAD", "origin/main"],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    sha = result.stdout.strip()
-    return sha or None
-
-
 def _new_subsection_text(file_path: Path) -> str:
     """Extract the new `## Handoff prompt emission` / `## Chunk-boundary handoff emission`
     subsection's body text from `file_path` — from its heading line up to (not
@@ -185,79 +138,6 @@ class TestHandoffEmissionSeamContent:
         subsection = _new_subsection_text(_REPO_ROOT / relative_path)
         hits = find_tokens(subsection, _operator_tokens())
         assert not hits, f"{relative_path}: operator token(s) found: {hits!r}"
-
-
-#: W-NFR-4 rule 1 forbids changing a line that already existed in these
-#: orchestration files, so that a resumed pre-existing project fires identical
-#: gates in identical order. One narrow class of change cannot satisfy that and
-#: still be correct: a line naming the fleet CLI as a bare `fleet <verb>`
-#: command. No such command has ever been installable — the repo ships no
-#: packaging, so nothing puts a `fleet` executable on `PATH`, and
-#: `scripts/fleet/cli.py`'s package-relative imports rule out running it as a
-#: loose script. Re-spelling those lines to the module form
-#: (`python -m scripts.fleet.cli <verb>`) necessarily removes them.
-#:
-#: The exemption is deliberately as small as the defect: it matches ONLY a
-#: line naming a bare-`fleet` subcommand, so any other removal in these files
-#: still fails. It also expires on its own — once no line spells a command
-#: that way, it matches nothing. The behavioural guarantee it protects is
-#: unaffected: these are non-gating observational call-outs, and the
-#: gate-sequence check (`TestGateFrontmatterUnchanged`) is independent.
-_LEGACY_BARE_FLEET_INVOCATION_RE = re.compile(
-    r"`fleet (?:observe|status|handoff|register|query|gen-view|done)\b"
-)
-
-#: The second, equally narrow exemption: the G1 instruction that told the PM to
-#: write a repo-local git identity into every project. That line is the defect
-#: itself — a repo-local identity overrides any conditional identity routing in
-#: the operator's global config — so no additive edit can correct it while it
-#: survives. It matches ONLY that sentence and expires the same way once main no
-#: longer carries it. Gate order is untouched: G1 still fires where it did, and a
-#: resumed project that has already passed G1 never re-reads the step.
-_LEGACY_REPO_LOCAL_IDENTITY_RE = re.compile(
-    r"set \*\*repo-local\*\* \(not global\) git identity"
-)
-
-
-def _disallowed_removed_lines(diff_stdout: str) -> list[str]:
-    """Return removed diff lines that W-NFR-4 rule 1 does not permit."""
-    return [
-        line
-        for line in diff_stdout.splitlines()
-        if line.startswith("-")
-        and not line.startswith("---")
-        and not _LEGACY_BARE_FLEET_INVOCATION_RE.search(line)
-        and not _LEGACY_REPO_LOCAL_IDENTITY_RE.search(line)
-    ]
-
-
-class TestAdditiveDiffInvariant:
-    """TC-10's application of TC-24: the edited files' diffs contain zero removed
-    lines, save the narrow bare-`fleet` re-spelling exemption above.
-    """
-
-    @pytest.mark.parametrize("relative_path", _EDITED_FILES)
-    def test_diff_against_merge_base_has_zero_removed_lines(self, relative_path: str) -> None:
-        merge_base = _merge_base_with_main()
-        if merge_base is None:
-            pytest.skip("git or origin/main merge-base unavailable in this environment")
-
-        result = subprocess.run(
-            ["git", "diff", merge_base, "--", relative_path],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0:
-            pytest.skip(f"git diff against {merge_base} failed in this environment")
-
-        removed_lines = _disallowed_removed_lines(result.stdout)
-        assert removed_lines == [], (
-            f"{relative_path}: diff against merge-base {merge_base} removed lines:\n"
-            + "\n".join(removed_lines)
-        )
 
 
 # --- TC-14: hook templates contain no operator tokens and call the shipped
