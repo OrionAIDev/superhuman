@@ -38,6 +38,21 @@ import pytest
 
 from scripts.fleet.cli import build_parser
 
+
+def _fake_stdin(text: str) -> io.StringIO:
+    """A monkeypatch-ready fake `sys.stdin` carrying `text` on both its
+    text (`.read()`) and buffer (`.buffer.read()`) surfaces.
+
+    `read_hook_payload`'s `"-"` branch reads `sys.stdin.buffer` (raw
+    bytes, then decodes as UTF-8 itself — chunk 7a fix); a plain
+    `io.StringIO` has no `.buffer`, so every fake stdin in this module
+    needs one.
+    """
+    fake = io.StringIO(text)
+    fake.buffer = io.BytesIO(text.encode("utf-8"))  # type: ignore[attr-defined]
+    return fake
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers (Chunk 6) — mirrors test_observe_session.py's
 # `git_repo`/`enabled_project` precedent so a hook-script subprocess test and
@@ -580,7 +595,7 @@ class TestSessionStartAnchorRegression:
         workspace, slug, profile = enabled_project
         monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
         payload = json.dumps({"session_id": "no-anchor-session", "cwd": str(workspace)})
-        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(payload))
 
         parser = build_parser()
         args = parser.parse_args(
@@ -628,7 +643,7 @@ class TestSessionStartAnchorRegression:
         payload = json.dumps(
             {"session_id": "anchor-preferred-session", "cwd": str(workspace_b)}
         )
-        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(payload))
 
         parser = build_parser()
         args = parser.parse_args(
@@ -673,7 +688,7 @@ class TestSessionStartAnchorRegression:
         payload = json.dumps(
             {"session_id": "anchor-fallback-session", "cwd": str(workspace)}
         )
-        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(payload))
 
         parser = build_parser()
         args = parser.parse_args(
@@ -1316,5 +1331,132 @@ class TestDecisionCGranularity:
 
         assert result.returncode == 0, (
             f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert _events_log(workspace, slug) == ""
+
+
+# --- Chunk 7a fix: hooks must decode stdin as UTF-8 -----------------------------------
+
+
+def _run_hook_script_raw_bytes(
+    *,
+    skill_root: Path,
+    stdin_bytes: bytes,
+    cwd: Path,
+    profile_path: Path | None = None,
+    extra_env: dict | None = None,
+    timeout: float = 15.0,
+) -> subprocess.CompletedProcess:
+    """Invoke `templates/hooks/claude-code/session-start` with RAW BYTES on
+    stdin — no `text=True`, no `encoding=`, and `PYTHONIOENCODING`/
+    `PYTHONUTF8` stripped from the child environment — so the test exercises
+    exactly what a real harness does: write UTF-8 bytes and nothing else.
+    `_run_hook_script` above cannot do this (it always passes `text=True,
+    encoding="utf-8"`, which pre-decodes/re-encodes symmetrically on this
+    process's own side and hides the defect this chunk fixes).
+    """
+    env = os.environ.copy()
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    env.pop("PYTHONIOENCODING", None)
+    env.pop("PYTHONUTF8", None)
+    if profile_path is not None:
+        env["SUPERHUMAN_PROFILE"] = str(profile_path)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [_BASH, str(_hook_script(skill_root))],
+        input=stdin_bytes,
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+@pytest.mark.skipif(
+    _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+)
+class TestHookPayloadUTF8StdinDecoding:
+    """Regression for the defect fixed in this chunk (chunk 7a fix): the
+    harness writes the hook payload as UTF-8 bytes, but
+    `scripts/fleet/hook_payload.py`'s `read_hook_payload` used to read
+    stdin with `sys.stdin.read()`, which decodes using the process's
+    locale-preferred encoding — cp1252 on this Windows runner, not UTF-8.
+    Any non-ASCII byte anywhere in the payload (not just a role-file em
+    dash — a `cwd` containing a non-ASCII path segment, for instance) was
+    silently mangled, so the locator failed and the hook wrote no row at
+    all, with no error surfaced anywhere (NFR-9's fail-soft posture makes
+    this doubly silent). These tests feed RAW UTF-8 BYTES (see
+    `_run_hook_script_raw_bytes`) through the REAL `session-start` hook —
+    `read_hook_payload`'s own call site — using only synthetic content
+    (never the captured live payload's text; NFR-8/publication guard).
+    """
+
+    def test_non_ascii_session_id_survives_the_utf8_round_trip(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """A `session_id` containing non-ASCII characters (an em dash and
+        a character with no cp1252 representation) must land in the row
+        UNCHANGED — proving `read_hook_payload` decodes stdin as UTF-8.
+
+        This deliberately keeps the WORKSPACE path itself plain ASCII
+        (unlike a non-ASCII `cwd`, which this module's own docstring notes
+        as "latent") — `locate_project` (`scripts/fleet/locate.py`) reads
+        `git rev-parse`'s stdout via `subprocess.run(text=True)` with no
+        explicit `encoding=` either, the SAME defect class, but in a
+        different file outside this chunk's three assigned sites. Until
+        that is fixed too, a non-ASCII path segment in `cwd` fails to
+        resolve for an independent reason and would confound this
+        specific regression — reported to the PM as a new finding rather
+        than fixed here (matching this chunk's own treatment of
+        `scripts/superhuman_profile.py:2149`)."""
+        workspace, slug, profile = enabled_project
+        session_id = "utf8-sess-—-→"  # em dash, rightwards arrow
+        payload = {
+            "session_id": session_id,
+            "cwd": str(workspace),
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+        }
+        # `ensure_ascii=False` matches a real harness (e.g. Node's
+        # `JSON.stringify`), which emits non-ASCII characters as literal
+        # UTF-8 bytes, never `\uXXXX` escapes — `json.dumps`'s own default
+        # (`ensure_ascii=True`) would sidestep the byte-level defect
+        # entirely by pre-escaping every non-ASCII character to plain
+        # ASCII, which is exactly why `_run_hook_script`'s existing calls
+        # never caught this.
+        stdin_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        result = _run_hook_script_raw_bytes(
+            skill_root=skill_root, stdin_bytes=stdin_bytes, cwd=workspace, profile_path=profile
+        )
+
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
+        )
+        log = _events_log(workspace, slug)
+        assert '"type":"session_registered"' in log, (
+            f"no row landed -- log={log!r}"
+        )
+        assert json.dumps(session_id) in log or session_id in log, (
+            f"session_id was mangled in transit -- expected {session_id!r} to survive "
+            f"verbatim; log={log!r}"
+        )
+
+    def test_invalid_utf8_stdin_writes_no_row_and_exits_0(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """Bytes that are not valid UTF-8 at all (a lone `0xFF`/`0xFE`
+        pair) must degrade to "no payload" — same as malformed JSON —
+        never a decode exception reaching the harness."""
+        workspace, slug, profile = enabled_project
+        result = _run_hook_script_raw_bytes(
+            skill_root=skill_root,
+            stdin_bytes=b"\xff\xfe{\"session_id\": \"x\"",
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
         )
         assert _events_log(workspace, slug) == ""

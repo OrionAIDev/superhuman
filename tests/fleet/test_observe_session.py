@@ -25,6 +25,21 @@ from scripts.fleet.adapter.portable import PortableAdapter
 from scripts.fleet.cli import build_parser
 from scripts.fleet.handoff import extract_handoff_id
 
+
+def _fake_stdin(text: str) -> io.StringIO:
+    """A monkeypatch-ready fake `sys.stdin` carrying `text` on both its
+    text (`.read()`) and buffer (`.buffer.read()`) surfaces.
+
+    `read_hook_payload`'s `"-"` branch reads `sys.stdin.buffer` (raw
+    bytes, then decodes as UTF-8 itself — chunk 7a fix); a plain
+    `io.StringIO` has no `.buffer`, so every fake stdin in this module
+    needs one.
+    """
+    fake = io.StringIO(text)
+    fake.buffer = io.BytesIO(text.encode("utf-8"))  # type: ignore[attr-defined]
+    return fake
+
+
 # --- Fixtures, mirroring test_observe.py's precedent ------------------------------
 
 
@@ -353,7 +368,7 @@ class TestHookPayloadWiring:
                 "source": "startup",
             }
         )
-        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(payload))
 
         parser = build_parser()
         args = parser.parse_args(
@@ -373,7 +388,7 @@ class TestHookPayloadWiring:
         """An unresolvable `cwd` (not inside any git repository) means
         nothing to do -- exit 0, nothing written, no traceback."""
         payload = json.dumps({"session_id": "hook-session-2", "cwd": str(tmp_path)})
-        monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(payload))
 
         parser = build_parser()
         args = parser.parse_args(["observe", "session-start", "--hook-payload", "-"])
@@ -385,7 +400,7 @@ class TestHookPayloadWiring:
     def test_malformed_hook_payload_exits_0_silently(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+        monkeypatch.setattr("sys.stdin", _fake_stdin("not json"))
 
         parser = build_parser()
         args = parser.parse_args(["observe", "session-start", "--hook-payload", "-"])
@@ -601,7 +616,7 @@ def test_every_hook_payload_verb_threads_git_facts_root(
     import sys as _sys
 
     original_stdin = _sys.stdin
-    _sys.stdin = io.StringIO(payload)
+    _sys.stdin = _fake_stdin(payload)
     try:
         args.func(args)
     finally:

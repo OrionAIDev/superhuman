@@ -111,11 +111,21 @@ def read_hook_payload(source: Path | str) -> HookPayload | None:
     """
     try:
         if str(source) == "-":
-            raw = sys.stdin.read()
+            # Read raw bytes and decode as UTF-8 explicitly rather than
+            # `sys.stdin.read()` (a text-mode read decodes with the
+            # process's locale-preferred encoding -- on Windows, the
+            # console/ANSI code page, e.g. cp1252 -- while the harness
+            # always writes UTF-8 bytes, per JSON's own encoding rule,
+            # RFC 8259 §8.1 <https://www.rfc-editor.org/rfc/rfc8259#section-8.1>).
+            # A locale mismatch otherwise mangles any non-ASCII byte in the
+            # payload (e.g. a non-ASCII `cwd`) without raising -- silently
+            # wrong data is worse than the `None` this now falls back to.
+            raw = sys.stdin.buffer.read().decode("utf-8")
         else:
             raw = Path(source).read_text(encoding="utf-8")
     except (OSError, ValueError):
-        # `ValueError` covers `UnicodeDecodeError` on a non-UTF-8 file.
+        # `ValueError` covers `UnicodeDecodeError` on a non-UTF-8 file or
+        # non-UTF-8 stdin bytes.
         return None
 
     if not raw.strip():

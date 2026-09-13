@@ -523,12 +523,88 @@ class TestRoleBlockCheckCli:
     ) -> None:
         import io
 
-        monkeypatch.setattr("sys.stdin", io.StringIO(NON_ROLE_LINE))
+        # The CLI reads `sys.stdin.buffer` (raw bytes, then decodes as
+        # UTF-8 itself — see the chunk 7a-fix module docstring); a plain
+        # `io.StringIO` has no `.buffer`, so the fake stdin needs one.
+        fake_stdin = io.StringIO(NON_ROLE_LINE)
+        fake_stdin.buffer = io.BytesIO(NON_ROLE_LINE.encode("utf-8"))
+        monkeypatch.setattr("sys.stdin", fake_stdin)
         exit_code, out = self._run(
             ["role-block", "check", "--prompt-file", "-", "--roles-dir", str(roles_dir)]
         )
         assert exit_code == 0
         assert out.strip() == "NON_ROLE"
+
+
+class TestRoleBlockCheckCliUTF8StdinDecoding:
+    """Regression for the defect fixed in this chunk (chunk 7a fix):
+    `_cmd_role_block_check`'s `--prompt-file -` branch used to read stdin
+    with `sys.stdin.read()`, which decodes using the process's
+    locale-preferred encoding — cp1252 on this Windows runner, not UTF-8,
+    even though a verbatim role dispatch piped in from a real harness
+    arrives as UTF-8 bytes. `TestRoleBlockCheckCli.test_stdin_dash_reads_
+    from_stdin` above tests the in-process, monkeypatched-`sys.stdin`
+    path — it cannot exercise the actual OS-level decode this fix changes,
+    because a real interpreter's `sys.stdin.encoding` is only meaningful
+    for a REAL pipe. These tests run the CLI as a genuine subprocess,
+    feeding RAW UTF-8 BYTES: no `text=True`, no `encoding=`, and
+    `PYTHONIOENCODING`/`PYTHONUTF8` stripped from the child environment.
+    """
+
+    def _run_cli_raw_bytes(
+        self, *, skill_root: Path, argv: list[str], stdin_bytes: bytes
+    ) -> "subprocess.CompletedProcess[bytes]":
+        import os
+        import subprocess
+        import sys
+
+        env = os.environ.copy()
+        env.pop("PYTHONIOENCODING", None)
+        env.pop("PYTHONUTF8", None)
+        return subprocess.run(
+            [sys.executable, "-m", "scripts.fleet.cli", *argv],
+            input=stdin_bytes,
+            cwd=str(skill_root),
+            env=env,
+            capture_output=True,
+            timeout=15,
+        )
+
+    def test_verbatim_utf8_role_prompt_exits_0(
+        self, roles_dir: Path, skill_root: Path
+    ) -> None:
+        # A synthetic role file carrying an em dash — the shipped
+        # `_DEVELOPER_ROLE_CONTENT` fixture has none, so this test builds
+        # its own to exercise the actual defect (a byte cp1252 cannot
+        # round-trip).
+        content = _DEVELOPER_ROLE_CONTENT.rstrip("\n") + " — end of role.\n"
+        (roles_dir / "developer.md").write_text(content, encoding="utf-8")
+        result = self._run_cli_raw_bytes(
+            skill_root=skill_root,
+            argv=["role-block", "check", "--prompt-file", "-", "--roles-dir", str(roles_dir)],
+            stdin_bytes=content.encode("utf-8"),
+        )
+        assert result.returncode == 0, (
+            f"exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
+        )
+        assert result.stdout.strip() == b"ROLE"
+
+    def test_invalid_utf8_stdin_exits_1_with_fault_verdict(
+        self, roles_dir: Path, skill_root: Path
+    ) -> None:
+        """Bytes that are not valid UTF-8 at all must exit 1 with exactly
+        one verdict line (`FAULT`) — this is a fail-CLOSED assertion tool
+        (unlike the hook's fail-soft posture): a fault cannot certify
+        compliance."""
+        result = self._run_cli_raw_bytes(
+            skill_root=skill_root,
+            argv=["role-block", "check", "--prompt-file", "-", "--roles-dir", str(roles_dir)],
+            stdin_bytes=b"\xff\xfe not valid utf-8",
+        )
+        assert result.returncode == 1, (
+            f"exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
+        )
+        assert result.stdout.strip() == b"FAULT"
 
 
 class TestD4NoHarnessVocabularyInScripts:

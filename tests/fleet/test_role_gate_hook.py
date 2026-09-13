@@ -791,3 +791,184 @@ class TestRoleGateLatency:
             f"role gate locator-path (NON_ROLE) latency: p95={p95:.3f}s max={maximum:.3f}s "
             f"samples={samples!r}"
         )
+
+
+# --- Chunk 7a fix: the gate must decode stdin as UTF-8 --------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-native interpreter invocation")
+class TestRoleGateUTF8StdinDecoding:
+    """Regression for the defect fixed in this chunk (chunk 7a fix):
+    `pre_tool_use_role_gate.py` used to read stdin with `sys.stdin.read()`,
+    which decodes using the process's locale-preferred encoding — cp1252 on
+    this Windows runner, not UTF-8, even though the harness always writes
+    UTF-8 bytes (JSON's own encoding rule, RFC 8259 §8.1). Every shipped
+    role file contains an em dash, so as shipped this denied EVERY
+    correctly-formed verbatim role dispatch.
+
+    These tests invoke the Python adapter directly (mirrors
+    `TestRoleGateAdapterFaultsDirect`'s precedent — a controlled
+    `--roles-dir`), feeding RAW UTF-8 BYTES: no `text=True`, no `encoding=`,
+    and `PYTHONIOENCODING`/`PYTHONUTF8` stripped from the child
+    environment, so the parent process never pre-encodes/re-encodes
+    symmetrically the way `_run_role_gate_hook`'s existing `text=True,
+    encoding="utf-8"` calls do (which is exactly why they never caught
+    this). All role content here is SYNTHETIC — never the captured live
+    payload's text (NFR-8/publication guard).
+    """
+
+    #: A synthetic role file containing both an em dash (`—`, not
+    #: representable in cp1252 as itself — cp1252 maps the single byte
+    #: 0x97 to it, so its correct UTF-8 encoding `E2 80 94` mis-decodes as
+    #: cp1252 into three wrong characters) and a character with NO cp1252
+    #: representation at all (`→`, U+2192), so a cp1252 decode cannot even
+    #: round-trip it as a substitute byte.
+    _ROLE_CONTENT = (
+        "---\n"
+        "name: developer\n"
+        "tier: standard\n"
+        "---\n"
+        "\n"
+        "# Developer role\n"
+        "\n"
+        "You are the Developer — you own the chunk end-to-end: code, tests,\n"
+        "commit → push. Nothing here is real project content.\n"
+    )
+
+    def _roles_dir(self, tmp_path: Path) -> Path:
+        directory = tmp_path / "roles"
+        directory.mkdir()
+        (directory / "developer.md").write_text(self._ROLE_CONTENT, encoding="utf-8")
+        return directory
+
+    def _payload_bytes(self, *, prompt: str, cwd: Path, session_id: str) -> bytes:
+        payload = {
+            "session_id": session_id,
+            "cwd": str(cwd),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_utf8_regression",
+            "tool_input": {"subagent_type": "developer", "prompt": prompt},
+        }
+        # `ensure_ascii=False`: a real harness (e.g. Node's `JSON.stringify`)
+        # emits non-ASCII characters as literal UTF-8 bytes, never `\uXXXX`
+        # escapes. `json.dumps`'s own `ensure_ascii=True` default would
+        # sidestep the byte-level defect entirely.
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    def _run_adapter_raw_bytes(
+        self,
+        *,
+        skill_root: Path,
+        payload_bytes: bytes,
+        roles_dir: Path,
+        cwd: Path,
+        profile_path: Path | None = None,
+    ) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env.pop("PYTHONIOENCODING", None)
+        env.pop("PYTHONUTF8", None)
+        if profile_path is not None:
+            env["SUPERHUMAN_PROFILE"] = str(profile_path)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(_adapter_script(skill_root)),
+                "--hook-payload",
+                "-",
+                "--roles-dir",
+                str(roles_dir),
+            ],
+            input=payload_bytes,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            timeout=15,
+        )
+
+    def test_verbatim_utf8_role_dispatch_is_allowed(
+        self, skill_root: Path, git_repo: Path, tmp_path: Path
+    ) -> None:
+        """The ROLE case: dispatched verbatim, over raw UTF-8 bytes, must
+        give empty stdout (allowed) — NOT a deny. Run against the unfixed
+        code, this goes red (a MISMATCH deny), proving the defect; see this
+        chunk's Developer report for the captured red output.
+
+        Deliberately IN SCOPE (a real git repo + project, like
+        `test_edited_utf8_role_dispatch_is_denied` below) — a MISMATCH
+        verdict only denies once scope resolves (D7.4), so an
+        out-of-scope `cwd` would give empty stdout regardless of verdict
+        and could not distinguish ROLE from a corrupted MISMATCH being
+        silently swallowed by scope failure instead of by the fix."""
+        roles_dir = self._roles_dir(tmp_path)
+        slug = "utf8-role-project"
+        profile = tmp_path / "profile.yaml"
+        _write_profile(profile)
+        _write_project(git_repo, slug)
+
+        payload_bytes = self._payload_bytes(
+            prompt=self._ROLE_CONTENT, cwd=git_repo, session_id="utf8-role-session"
+        )
+        result = self._run_adapter_raw_bytes(
+            skill_root=skill_root,
+            payload_bytes=payload_bytes,
+            roles_dir=roles_dir,
+            cwd=git_repo,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
+        )
+        assert result.stdout == b"", (
+            f"a verbatim role dispatch was denied over raw UTF-8 bytes: {result.stdout!r}"
+        )
+        # Belt-and-braces: confirm this really was ROLE (never logged),
+        # not an accidental out-of-scope short-circuit hiding a MISMATCH.
+        assert _role_gate_log_text(git_repo, slug) == ""
+
+    def test_edited_utf8_role_dispatch_is_denied(
+        self, skill_root: Path, git_repo: Path, tmp_path: Path
+    ) -> None:
+        """The MISMATCH case, for contrast: a genuinely edited copy of the
+        SAME UTF-8 content must still deny — proving the fix does not make
+        the comparison vacuously permissive."""
+        roles_dir = self._roles_dir(tmp_path)
+        slug = "utf8-mismatch-project"
+        profile = tmp_path / "profile.yaml"
+        _write_profile(profile)
+        _write_project(git_repo, slug)
+
+        edited = self._ROLE_CONTENT.replace("tier: standard", "tier: cheap", 1)
+        payload_bytes = self._payload_bytes(
+            prompt=edited, cwd=git_repo, session_id="utf8-mismatch-session"
+        )
+        result = self._run_adapter_raw_bytes(
+            skill_root=skill_root,
+            payload_bytes=payload_bytes,
+            roles_dir=roles_dir,
+            cwd=git_repo,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        log = _role_gate_log_text(git_repo, slug)
+        assert '"verdict": "MISMATCH"' in log
+
+    def test_invalid_utf8_bytes_are_a_fault_not_a_deny(
+        self, skill_root: Path, tmp_path: Path
+    ) -> None:
+        """Bytes that are not valid UTF-8 at all must degrade to FAULT —
+        empty stdout, exit 0 (NFR-9: never deny on this gate's own fault)."""
+        roles_dir = self._roles_dir(tmp_path)
+        result = self._run_adapter_raw_bytes(
+            skill_root=skill_root,
+            payload_bytes=b"\xff\xfe{\"session_id\": \"x\"",
+            roles_dir=roles_dir,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, (
+            f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
+        )
+        assert result.stdout == b""

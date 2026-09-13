@@ -1039,7 +1039,25 @@ def _cmd_role_block_check(args: argparse.Namespace) -> int:
         int: `0` for `ROLE`/`NON_ROLE`; `1` otherwise.
     """
     if str(args.prompt_file) == "-":
-        prompt = sys.stdin.read()
+        try:
+            # Read raw bytes and decode as UTF-8 explicitly -- a verbatim
+            # role dispatch piped in from a real harness arrives as UTF-8
+            # bytes (RFC 8259 §8.1
+            # <https://www.rfc-editor.org/rfc/rfc8259#section-8.1>), but
+            # `sys.stdin.read()` decodes with the process's
+            # locale-preferred encoding, which on Windows is the
+            # console/ANSI code page (e.g. cp1252), not UTF-8 -- corrupting
+            # every role file's em dash and falsely reporting MISMATCH.
+            prompt = sys.stdin.buffer.read().decode("utf-8")
+        except UnicodeDecodeError:
+            # Unlike the hook's fail-SOFT posture (NFR-9), this is a
+            # manual/CI fail-CLOSED assertion tool (see the docstring
+            # above): a fault cannot certify compliance, so it prints the
+            # `FAULT` verdict -- one line, matching the normal path's own
+            # `print(result.verdict.value)` -- and exits 1, exactly like a
+            # genuine MISMATCH/UNMARKED would.
+            print(fleet_role_block.Verdict.FAULT.value)
+            return 1
     else:
         try:
             prompt = Path(args.prompt_file).read_text(encoding="utf-8")

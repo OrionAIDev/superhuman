@@ -23,6 +23,20 @@ from scripts.fleet.hook_payload import HookPayload, read_hook_payload
 _FIXTURES_DIR = Path(__file__).parent / "fixtures" / "payloads"
 
 
+def _fake_stdin(text: str) -> io.StringIO:
+    """A monkeypatch-ready fake `sys.stdin` carrying `text` on both its
+    text (`.read()`) and buffer (`.buffer.read()`) surfaces.
+
+    `read_hook_payload`'s `"-"` branch reads `sys.stdin.buffer` (raw
+    bytes, then decodes as UTF-8 itself — see the chunk 7a-fix module
+    docstring); a plain `io.StringIO` has no `.buffer`, so every fake
+    stdin in this module needs one.
+    """
+    fake = io.StringIO(text)
+    fake.buffer = io.BytesIO(text.encode("utf-8"))  # type: ignore[attr-defined]
+    return fake
+
+
 class TestHappyPath:
     def test_reads_session_start_payload_from_stdin(
         self, monkeypatch: pytest.MonkeyPatch
@@ -40,7 +54,7 @@ class TestHappyPath:
                 "source": "startup",
             }
         )
-        monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(raw))
 
         payload = read_hook_payload("-")
 
@@ -70,7 +84,7 @@ class TestHappyPath:
                 "prompt_id": "prompt-1",
             }
         )
-        monkeypatch.setattr("sys.stdin", io.StringIO(raw))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(raw))
 
         payload = read_hook_payload("-")
 
@@ -117,19 +131,19 @@ class TestMalformedPayloadNeverRaises:
     def test_truncated_json_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A syntactically-broken JSON string (missing closing brace/quote)
         returns `None`, does not raise."""
-        monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id": "abc", "cwd": "/x'))
+        monkeypatch.setattr("sys.stdin", _fake_stdin('{"session_id": "abc", "cwd": "/x'))
 
         assert read_hook_payload("-") is None
 
     def test_non_json_stdin_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Arbitrary non-JSON bytes on stdin return `None`, does not raise."""
-        monkeypatch.setattr("sys.stdin", io.StringIO("not json at all"))
+        monkeypatch.setattr("sys.stdin", _fake_stdin("not json at all"))
 
         assert read_hook_payload("-") is None
 
     def test_empty_stdin_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Zero bytes on stdin return `None`, does not raise."""
-        monkeypatch.setattr("sys.stdin", io.StringIO(""))
+        monkeypatch.setattr("sys.stdin", _fake_stdin(""))
 
         assert read_hook_payload("-") is None
 
@@ -140,7 +154,7 @@ class TestMalformedPayloadNeverRaises:
         of the documented fields is handled gracefully — `None`, since
         `session_id`/`cwd` are the two fields every downstream caller
         requires and neither is present."""
-        monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+        monkeypatch.setattr("sys.stdin", _fake_stdin("{}"))
 
         assert read_hook_payload("-") is None
 
@@ -153,6 +167,6 @@ class TestMalformedPayloadNeverRaises:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A well-formed JSON array (not an object) returns `None`."""
-        monkeypatch.setattr("sys.stdin", io.StringIO("[1, 2, 3]"))
+        monkeypatch.setattr("sys.stdin", _fake_stdin("[1, 2, 3]"))
 
         assert read_hook_payload("-") is None

@@ -378,7 +378,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
         if str(args.hook_payload) == "-":
-            raw_payload = sys.stdin.read()
+            # Read raw bytes and decode as UTF-8 explicitly -- the harness
+            # writes the hook payload as UTF-8 bytes (JSON's own encoding
+            # rule, RFC 8259 §8.1
+            # <https://www.rfc-editor.org/rfc/rfc8259#section-8.1>), but
+            # `sys.stdin.read()` decodes with the process's
+            # locale-preferred encoding, which on Windows is the
+            # console/ANSI code page (e.g. cp1252), not UTF-8. A role file
+            # containing any non-ASCII byte (every role file has an em
+            # dash) would then never compare equal, denying every
+            # correctly-formed dispatch. A decode failure here is caught by
+            # this function's own broad `except Exception` below, same as
+            # any other fault (NFR-9: never deny on this gate's own fault).
+            raw_payload = sys.stdin.buffer.read().decode("utf-8")
         else:
             raw_payload = Path(args.hook_payload).read_text(encoding="utf-8")
         run(raw_payload=raw_payload, roles_dir=args.roles_dir, anchor=args.anchor)
