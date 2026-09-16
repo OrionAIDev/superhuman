@@ -280,10 +280,22 @@ class ClaudeAdapter(SessionAdapter):
                 [sys.executable, str(self._session_relay_script), str(tmp_path), "--json"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=_SCRIPT_TIMEOUT_SECONDS,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            # `encoding="utf-8"` is explicit (chunk 9, roadmap#217 decoding-
+            # locale class): `session_scan.py --json` prints JSON, which is
+            # UTF-8 by its own encoding rule (RFC 8259 SS8.1), but
+            # `subprocess.run(..., text=True)` with no `encoding=` decodes
+            # with the process's locale-preferred encoding -- cp1252 on
+            # Windows, not UTF-8 -- silently mangling a non-ASCII session
+            # `cwd`/title instead of raising. `errors="strict"` (the
+            # default) plus this added `UnicodeDecodeError` catch route
+            # that mangling into the SAME "use what was supplied" fallback
+            # this `except` already had, per this method's own docstring
+            # ("every failure mode degrades ... never a raised exception").
             return list(self._sessions)
         finally:
             if tmp_path is not None:

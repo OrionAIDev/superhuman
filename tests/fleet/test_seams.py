@@ -312,26 +312,30 @@ class TestSpawnedDispatchSeamContent:
         assert "roles/pm.md" in subsection
 
 
-# --- TC-15: `SKILL.md`'s launch-flip first-action step names the command,
-# and states — in its own words — that it is idempotent and inert-when-off
-# (W-FR-4, W-FR-7, Chunk 3/7). The behavioral half (fleet disabled -> zero
-# writes; no matching row -> journaled no-op, no exception) is covered in
-# `tests/fleet/test_observe.py::TestDisabledWorkspace::
-# test_launch_produces_zero_writes_when_disabled` and
-# `TestFuzzyLaunchFlip::test_launch_not_found_is_journaled` — this class adds
-# the missing content-level half: does SKILL.md's prose actually say so. ----
+# --- TC-15: `SKILL.md`'s session-start-floor first-action step names the
+# command, and states — in its own words — that it is idempotent and
+# registers regardless of whether a handoff is pending (W-FR-4, W-FR-7,
+# Chunk 3/7/9). Renamed and widened at chunk 9 (FR-15/PM ruling R7): the
+# floor now calls `observe session-start` on EVERY invocation (previously
+# `observe launch`, only when a `FLEET-HANDOFF-ID:` line was present), so
+# the old "inert when there is no handoff id" guarantee no longer holds —
+# it is REPLACED by "still registers, attempts no flip", pinned below. The
+# behavioral half (fleet disabled -> zero writes; no matching row ->
+# journaled no-op, no exception) is covered in
+# `tests/fleet/test_observe_session.py` — this class adds the missing
+# content-level half: does SKILL.md's prose actually say so. ----
 
-_SKILL_MD_LAUNCH_COMMAND_RE = re.compile(
-    r"python -m scripts\.fleet\.cli observe launch\b"
+_SKILL_MD_SESSION_START_COMMAND_RE = re.compile(
+    r"python -m scripts\.fleet\.cli observe session-start\b"
 )
 _IDEMPOTENT_MARKERS = ("idempotent",)
-_INERT_WHEN_OFF_MARKERS = ("inert",)
+_REGISTERS_REGARDLESS_MARKERS = ("still registers",)
 
 
-def _skill_md_launch_step_text() -> str:
-    """Extract SKILL.md's `## Fleet observation — launch flip` subsection body."""
+def _skill_md_session_start_step_text() -> str:
+    """Extract SKILL.md's `## Fleet observation — session-start floor` subsection body."""
     return _new_subsection_text_by_heading(
-        _REPO_ROOT / "SKILL.md", "fleet observation", "launch"
+        _REPO_ROOT / "SKILL.md", "fleet observation", "floor"
     )
 
 
@@ -341,47 +345,51 @@ def _new_subsection_text_by_heading(file_path: Path, *substrings: str) -> str:
     return "\n".join(lines[start:end])
 
 
-class TestSkillMdLaunchStepSeamContent:
+class TestSkillMdSessionStartStepSeamContent:
     """TC-15: the additive `SKILL.md` first-action step names the literal
-    command, states it is idempotent, states it is inert-when-off, is
-    non-gating, and contains no operator token.
+    command, states it is idempotent, states it registers regardless of
+    whether a handoff is pending, is non-gating, and contains no operator
+    token.
     """
 
     def test_subsection_names_the_literal_command(self) -> None:
-        subsection = _skill_md_launch_step_text()
-        assert _SKILL_MD_LAUNCH_COMMAND_RE.search(subsection), (
-            "SKILL.md launch-flip subsection does not name the literal "
-            "'python -m scripts.fleet.cli observe launch' command"
+        subsection = _skill_md_session_start_step_text()
+        assert _SKILL_MD_SESSION_START_COMMAND_RE.search(subsection), (
+            "SKILL.md session-start-floor subsection does not name the literal "
+            "'python -m scripts.fleet.cli observe session-start' command"
         )
 
     def test_subsection_states_idempotent(self) -> None:
-        subsection = _skill_md_launch_step_text().lower()
+        subsection = _skill_md_session_start_step_text().lower()
         assert any(marker in subsection for marker in _IDEMPOTENT_MARKERS), (
-            "SKILL.md launch-flip subsection never states the step is idempotent"
+            "SKILL.md session-start-floor subsection never states the step is idempotent"
         )
 
-    def test_subsection_states_inert_when_off(self) -> None:
-        subsection = _skill_md_launch_step_text().lower()
-        assert any(marker in subsection for marker in _INERT_WHEN_OFF_MARKERS), (
-            "SKILL.md launch-flip subsection never states the step is inert when off"
+    def test_subsection_states_registers_regardless_of_handoff_line(self) -> None:
+        subsection = _skill_md_session_start_step_text().lower()
+        assert any(marker in subsection for marker in _REGISTERS_REGARDLESS_MARKERS), (
+            "SKILL.md session-start-floor subsection never states the step still "
+            "registers the session when there is no FLEET-HANDOFF-ID: line"
         )
 
     def test_subsection_states_non_blocking_and_failure_logged_and_proceeds(self) -> None:
-        subsection = _skill_md_launch_step_text().lower()
+        subsection = _skill_md_session_start_step_text().lower()
         assert any(marker in subsection for marker in _NON_BLOCKING_MARKERS), (
-            "SKILL.md launch-flip subsection never states it is non-blocking"
+            "SKILL.md session-start-floor subsection never states it is non-blocking"
         )
         assert any(marker in subsection for marker in _LOGGED_AND_PROCEEDS_MARKERS), (
-            "SKILL.md launch-flip subsection never states a failure is logged"
+            "SKILL.md session-start-floor subsection never states a failure is logged"
         )
         assert any(marker in subsection for marker in _PROCEEDS_MARKERS), (
-            "SKILL.md launch-flip subsection never states execution proceeds"
+            "SKILL.md session-start-floor subsection never states execution proceeds"
         )
 
     def test_subsection_contains_no_operator_token(self) -> None:
-        subsection = _skill_md_launch_step_text()
+        subsection = _skill_md_session_start_step_text()
         hits = find_tokens(subsection, _operator_tokens())
-        assert not hits, f"SKILL.md launch-flip subsection: operator token(s) found: {hits!r}"
+        assert not hits, (
+            f"SKILL.md session-start-floor subsection: operator token(s) found: {hits!r}"
+        )
 
 
 # --- TC-28: `docs/fleet-observation.md` covers the required topics

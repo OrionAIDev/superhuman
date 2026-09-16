@@ -795,12 +795,26 @@ class TestCoverageEdges:
         assert "not inside a git repository" in reason
 
     def test_locate_refuses_with_a_reason_when_h0_prime_is_ambiguous(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The worktree's own branch matches none of the main worktree's
         several candidates, and cwd/profile don't narrow either — H0'
         finds candidates but no rung is unique, so the walk stops there
-        (never falls through to H1)."""
+        (never falls through to H1).
+
+        PM ruling R9 (chunk 9): this test was reproduced flaking under
+        deliberate concurrent subprocess load (24 background `git`
+        workers for 40-60s; see the chunk 9 status report for exact
+        counts), consistent with `_GIT_TIMEOUT_SECONDS` (0.25s, NFR-2)
+        racing this test's several `git rev-parse`/`worktree add` calls
+        under load. Widened via `_resolved_git_timeout`'s test-only env
+        var, re-read per call rather than a module constant bound once
+        at import time — see that function's own docstring for why a
+        plain `monkeypatch.setattr(locate_module, "_GIT_TIMEOUT_SECONDS",
+        ...)` would NOT have worked. The production default (0.25,
+        unset) is untouched.
+        """
+        monkeypatch.setenv("SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS", "5.0")
         main = tmp_path / "main"
         _init_repo(main, branch="main")
         _write_record(main, "alpha")
@@ -869,3 +883,44 @@ class TestCoverageEdges:
         assert result is None
         assert "H1" not in reason
         assert "resolved via" not in reason
+
+
+# --- Chunk 9 (roadmap#217 routed-in): the decoding-locale defect class,
+# fixed for hook stdin at 5894617, confirmed here in `_run_git`'s own
+# `subprocess.run(text=True)` with no explicit `encoding=`. On Windows that
+# decodes git's (always UTF-8) stdout with the process's locale-preferred
+# encoding (cp1252), silently mangling a non-ASCII path segment rather than
+# raising -- so a project under such a path was unresolvable with no error
+# anywhere. ---------------------------------------------------------------
+
+
+class TestNonAsciiPathDecoding:
+    """`locate_project` must resolve a project whose git working tree lives
+    under a directory name containing non-ASCII characters. Uses real git
+    subprocesses throughout (never mocked), matching this module's own
+    fixture convention (see the module docstring)."""
+
+    def test_locate_resolves_a_project_under_a_non_ascii_directory_name(
+        self, tmp_path: Path
+    ) -> None:
+        # PLAN.md chunk 9's own example: an e-acute plus a rightwards
+        # arrow. In UTF-8 these are the bytes C3 A9 (e-acute) and E2 86 92
+        # (the arrow); every one of those five bytes has a DEFINED cp1252
+        # mapping, so decoding them as cp1252 does not raise -- it
+        # silently produces a different, wrong string instead, which is
+        # exactly the failure mode this test pins (a raised
+        # `UnicodeDecodeError` would be comparatively easy to notice).
+        repo = tmp_path / "proj-\u00e9\u2192"
+        _init_repo(repo)
+        _write_record(repo, "solo-project")
+
+        result = locate_project(repo)
+
+        assert result is not None, (
+            "locate_project could not resolve a project under a non-ASCII "
+            "directory name -- see this module's own class docstring for "
+            "the byte-level cause (a cp1252 stdout decode silently "
+            "mangling the path)"
+        )
+        assert result.workspace == repo
+        assert result.slug == "solo-project"

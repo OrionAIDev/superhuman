@@ -176,10 +176,21 @@ def check_git_version() -> GitVersionCheck:
             ["git", "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=_GIT_VERSION_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        # `encoding="utf-8"` is explicit (chunk 9, roadmap#217 decoding-
+        # locale class), for consistency with every other git-subprocess
+        # call site fixed this chunk, even though `git --version`'s own
+        # output (a version number plus platform tag) is always plain
+        # ASCII in practice, so this specific site was never observed to
+        # actually mangle anything -- ASCII bytes decode identically under
+        # cp1252 and UTF-8. `errors="strict"` (the default) plus the
+        # added `UnicodeDecodeError` catch route a decode failure into
+        # this function's EXISTING fail-soft `ok=False` outcome rather
+        # than raising.
         return GitVersionCheck(raw=None, version=None, ok=False)
     if proc.returncode != 0:
         return GitVersionCheck(raw=None, version=None, ok=False)

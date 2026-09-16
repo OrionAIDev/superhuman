@@ -772,6 +772,21 @@ class TestDoctorCliRoleGateSection:
     ) -> None:
         from scripts.fleet.cli import build_parser
 
+        # PM ruling R9 (chunk 9): this test was reproduced flaking under
+        # deliberate concurrent subprocess load (24 background `git`
+        # workers for 40-60s; see the chunk 9 status report for exact
+        # counts), consistent with `locate.py`'s own `_GIT_TIMEOUT_SECONDS`
+        # (0.25s, NFR-2) racing under load during `doctor --scan`'s
+        # `locate_project` call. `FleetConfig.git_timeout_seconds` (the
+        # profile-driven knob) is NOT what is being widened here -- it is
+        # a dead field: no adapter construction site in this codebase
+        # currently threads it into `git_timeout=` (flagged separately in
+        # the status report, out of this chunk's scope to wire up). The
+        # REAL, load-bearing knob is `locate.py`'s own module constant, so
+        # this widens it via its test-only env-var escape hatch instead;
+        # the production DEFAULT (0.25, unset) is untouched.
+        monkeypatch.setenv("SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS", "5.0")
+
         repo = tmp_path / "repo"
         self._init_repo(repo)
         slug = "doctor-demo"

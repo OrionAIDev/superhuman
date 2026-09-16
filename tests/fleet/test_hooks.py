@@ -1428,7 +1428,23 @@ class TestHookPayloadUTF8StdinDecoding:
         stdin_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         result = _run_hook_script_raw_bytes(
-            skill_root=skill_root, stdin_bytes=stdin_bytes, cwd=workspace, profile_path=profile
+            skill_root=skill_root,
+            stdin_bytes=stdin_bytes,
+            cwd=workspace,
+            profile_path=profile,
+            # PM ruling R9 (chunk 9): this test was reproduced flaking
+            # under deliberate concurrent subprocess load (24 background
+            # `git` workers for 40-60s; see the chunk 9 status report for
+            # exact counts) with the SAME "no row landed, log=''" symptom
+            # this test itself would otherwise show for the wrong reason
+            # -- `locate.py`'s own `_GIT_TIMEOUT_SECONDS` (0.25s, NFR-2)
+            # racing `locate_project`'s `git rev-parse` calls inside this
+            # REAL CHILD PROCESS. A parent-process `monkeypatch` cannot
+            # reach a subprocess's module state at all, so this widens
+            # `_resolved_git_timeout`'s test-only env var IN THE CHILD's
+            # OWN environment instead; the production default (0.25,
+            # unset) is untouched.
+            extra_env={"SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS": "5.0"},
         )
 
         assert result.returncode == 0, (

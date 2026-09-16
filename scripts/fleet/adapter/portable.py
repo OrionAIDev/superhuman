@@ -54,19 +54,32 @@ def run_git(cwd: Path, args: list[str], *, timeout: float = _GIT_TIMEOUT_SECONDS
 
     Returns:
         str | None: stripped stdout on success; None if git exited non-zero,
-        timed out, or is unavailable at all (no exception is raised — a
-        missing/failing git degrades this adapter's facts, it never crashes
-        registration, per NFR-3).
+        timed out, is unavailable, or its output could not be decoded (no
+        exception is raised — a missing/failing git degrades this
+        adapter's facts, it never crashes registration, per NFR-3).
+
+        `encoding="utf-8"` is explicit (chunk 9, roadmap#217 decoding-
+        locale class — the same defect fixed for hook stdin at 5894617,
+        here on git's own stdout): git's plumbing output is UTF-8
+        regardless of platform, but `subprocess.run(..., text=True)` with
+        no `encoding=` decodes using the process's locale-preferred
+        encoding — cp1252 on Windows, not UTF-8 — silently mangling a
+        non-ASCII branch/path byte instead of raising. `errors="strict"`
+        (the default) plus the added `UnicodeDecodeError` catch below
+        route that mangling into this function's EXISTING fail-soft
+        `None` outcome, matching this module's own "degrade, never
+        crash" posture, rather than returning silently-wrong text.
     """
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     if proc.returncode != 0:
         return None

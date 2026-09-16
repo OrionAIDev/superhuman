@@ -75,6 +75,7 @@ guess (see DESIGN.md D1-R1's "under-reaching is safe; over-reaching is not").
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -99,8 +100,50 @@ MAX_OUTWARD_HOPS = 1
 #: `config.py`'s `_DEFAULT_GIT_TIMEOUT_SECONDS` precedent — the observation
 #: façade's overall wall-clock budget has no room for a hung git process,
 #: and root discovery may issue up to four calls (H0, H0', H1, L3's branch
-#: call) in the worst case.
+#: call) in the worst case. This literal is the production default and is
+#: NEVER changed by `SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS` below.
 _GIT_TIMEOUT_SECONDS = 0.25
+
+#: Env var name for `_resolved_git_timeout`'s test-only escape hatch.
+_GIT_TIMEOUT_OVERRIDE_ENV_VAR = "SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS"
+
+
+def _resolved_git_timeout() -> float:
+    """Resolve `_run_git`'s default timeout, re-read on every call (chunk 9,
+    PM ruling R9).
+
+    This is a test-only escape hatch, never wired to any CLI flag or
+    profile key: reading `git_timeout_seconds` from a profile here would
+    let an operator's config widen this deliberately-tight production
+    bound, which R9 explicitly forbids. `SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS`
+    is unset in every real invocation, so the DEFAULT this returns is
+    byte-identical (0.25) to before this hatch existed — it exists only
+    so a test can widen `_run_git`'s effective budget for itself alone,
+    exactly mirroring the additive `git_timeout` constructor parameter
+    `adapter/portable.py` and `adapter/claude.py` already expose for the
+    same reason.
+
+    Read **per call**, not once at import/def time: a module-level
+    constant's value is frozen into `_run_git`'s own default parameter
+    the moment this module is imported, so `monkeypatch.setenv` in an
+    in-process test (this module is typically already imported by the
+    time any test runs) would have no effect on it. A subprocess-driven
+    test (this env var passed via that subprocess's own environment)
+    reads it fresh on import regardless, but re-reading here keeps both
+    call shapes identical rather than relying on that coincidence.
+
+    Returns:
+        float: the override value if `SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS`
+        is set and parses as a float; `_GIT_TIMEOUT_SECONDS` (0.25)
+        otherwise.
+    """
+    override = os.environ.get(_GIT_TIMEOUT_OVERRIDE_ENV_VAR)
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            return _GIT_TIMEOUT_SECONDS
+    return _GIT_TIMEOUT_SECONDS
 
 #: Matches a `**Slug:** <value>` front-matter line, the same bold-key-colon
 #: convention `project.py`'s `_SLUG_RE` uses (not imported — this module
@@ -147,32 +190,52 @@ class _Candidate:
     directory: Path
 
 
-def _run_git(cwd: Path, args: list[str], *, timeout: float = _GIT_TIMEOUT_SECONDS) -> str | None:
+def _run_git(cwd: Path, args: list[str], *, timeout: float | None = None) -> str | None:
     """Run one git plumbing command, returning stripped stdout or `None`.
 
-    Never raises: a missing `git` executable, non-zero exit, or timeout all
-    return `None` — root discovery treats "not a repository" (or any other
-    git failure) as an ordinary refusal (CHUNK-1-FINDINGS #4), never an
-    exception. Mirrors `adapter/portable.py`'s `run_git` (deliberately not
-    imported — see the module docstring's isolation rationale).
+    Never raises: a missing `git` executable, non-zero exit, timeout, or a
+    decoding failure all return `None` — root discovery treats "not a
+    repository" (or any other git failure) as an ordinary refusal
+    (CHUNK-1-FINDINGS #4), never an exception. Mirrors `adapter/portable.py`'s
+    `run_git` (deliberately not imported — see the module docstring's
+    isolation rationale).
+
+    `encoding="utf-8"` is explicit (chunk 9, roadmap#217 decoding-locale
+    class): git's plumbing output is UTF-8 regardless of platform, but
+    `subprocess.run(..., text=True)` with no `encoding=` decodes using the
+    process's locale-preferred encoding — cp1252 on this Windows runner,
+    not UTF-8 — which silently mangles a non-ASCII byte in a path (the same
+    defect fixed for hook stdin at 5894617, here on git's stdout instead).
+    `errors="strict"` (the default) is chosen deliberately over
+    `"replace"`/`"surrogateescape"`: this module already has a fail-soft
+    `None` outcome for every other failure mode, so a decode error joins
+    that same outcome via the added `UnicodeDecodeError` catch below rather
+    than being smoothed into silently-wrong text — "no candidate" is a safe
+    refusal here (FR-2), a wrong path is not.
 
     Args:
         cwd: directory to run the command in.
         args: git arguments, excluding the `git` executable itself.
-        timeout: seconds to allow the subprocess before killing it.
+        timeout: seconds to allow the subprocess before killing it;
+            `None` (the default for every real caller) resolves to
+            `_resolved_git_timeout()`, re-read per call rather than bound
+            once at import time (see its own docstring, chunk 9/R9).
 
     Returns:
         str | None: stripped stdout on success; `None` on any failure.
     """
+    if timeout is None:
+        timeout = _resolved_git_timeout()
     try:
         proc = subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     if proc.returncode != 0:
         return None

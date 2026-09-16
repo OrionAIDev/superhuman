@@ -46,19 +46,19 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
 **Spirit of the rule:** Superhuman exists because LLMs (yes, including the one reading this) rationalize skipping discipline for "simple" tasks. The framework adds ~30 seconds of user interaction per gate; that's the price of consistency and the SUPERHUMAN.md audit trail. Always worth it.
 </HARD-GATE>
 
-## Fleet observation — launch flip (non-gating)
+## Fleet observation — session-start floor (non-gating)
 
-If the invoking prompt carries a `FLEET-HANDOFF-ID:` line (fleet-wiring Chunk 3, Decision E — a
-prior session's `handoff-emit` embeds this line, along with its own self-register instruction,
-next to the id), attempt `python -m scripts.fleet.cli observe launch --workspace <project-root> --slug <slug>
---handoff-id <the id from that line>` as your first action, before Phase 0's HARD-GATE step 1.
-This is purely observational, exactly like `## Handoff prompt emission` below: it never blocks or
-gates any phase, it is idempotent (a repeat call on an already-launched row is a no-op, not an
-error), and it is inert when there is no `FLEET-HANDOFF-ID:` line to find — a normal `superhuman`
-invocation with no pending handoff attempts nothing and produces no output. Any failure (fleet
-disabled, an unavailable manifest write, a fuzzy match too ambiguous to guess, or any other fault)
-is logged and kickoff proceeds unaffected — this step never determines whether Phase 0 or a resume
-proceeds.
+As your first action on every superhuman invocation, before Phase 0's HARD-GATE step 1, attempt
+`python -m scripts.fleet.cli observe session-start --workspace <project-root> --slug <slug>`,
+adding `--handoff-id <the id from that line>` when the invoking prompt carries a
+`FLEET-HANDOFF-ID:` line (fleet-wiring Chunk 3, Decision E — a prior session's `handoff-emit`
+embeds this line, along with its own self-register instruction, next to the id). This is purely
+observational, exactly like `## Handoff prompt emission` below: it never blocks or gates any
+phase, it is idempotent (a repeat call on an already-registered session is a no-op, not an
+error), and with no `FLEET-HANDOFF-ID:` line to find it still registers the session — it simply
+attempts no id-anchored launch flip, rather than attempting nothing at all. Any failure (fleet
+disabled, an unavailable manifest write, or any other fault) is logged and kickoff proceeds
+unaffected — this step never determines whether Phase 0 or a resume proceeds.
 
 Run it from the superhuman **skill root** — the checkout holding this `SKILL.md`. There is no bare
 `fleet` executable to find: superhuman is a skill loaded by path, not an installed Python

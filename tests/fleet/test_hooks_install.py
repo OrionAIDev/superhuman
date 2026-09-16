@@ -64,6 +64,45 @@ _EDIT_WRITE_GUARD_SCRIPT = (
 )
 
 
+def _settings_shape_summary(path: Path) -> str:
+    """Describe `path`'s settings.json SHAPE for a tripwire failure message
+    (chunk 9, routed-in from the chunk-8 review) -- top-level key names and,
+    within `"hooks"`, its event names (`PreToolUse`/`SessionStart`/...) --
+    never full command strings, so a failure message can never leak an
+    operator path/token even incidentally.
+
+    This exists to distinguish the tripwire's two possible causes at a
+    glance: "this module wrote to the real file" (the thing it exists to
+    catch) usually changes `"hooks"`'s own shape, while "another process
+    edited the file during this run" (observed live, chunk 8 review --
+    another session added a top-level `Stop` hook) usually changes the
+    TOP-LEVEL key set instead. Never used to weaken the assertion itself,
+    which stays a strict hash comparison.
+
+    Args:
+        path: the settings.json to describe.
+
+    Returns:
+        str: a short description, or a fixed string when the file is
+        absent or unreadable (never raises).
+    """
+    if not path.is_file():
+        return "<absent>"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "<unreadable/invalid JSON>"
+    if not isinstance(data, dict):
+        return f"<top-level JSON is a {type(data).__name__}, not an object>"
+    top_level_keys = sorted(data.keys())
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        hook_events = sorted(hooks.keys())
+    else:
+        hook_events = []
+    return f"top-level keys={top_level_keys!r}, hook events={hook_events!r}"
+
+
 def _hash_real_settings() -> str | None:
     """Return the SHA-256 hex digest of the real settings.json, or None if
     it does not exist.
@@ -77,6 +116,7 @@ def _hash_real_settings() -> str | None:
 
 
 _recorded_real_hash: str | None = None
+_recorded_real_shape: str = "<not yet recorded>"
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -90,18 +130,33 @@ def _real_settings_untouched():  # type: ignore[no-untyped-def]
     across_this_module` (TC-59) can re-assert it explicitly, independent
     of this fixture's own teardown assertion.
 
+    The failure message (chunk 9, routed-in from the chunk-8 review) names
+    WHICH top-level keys / hook events differ between the recorded and
+    current shape -- see `_settings_shape_summary`. This cannot tell "this
+    module wrote to the file" apart from "another process on this laptop
+    edited it mid-run" on its own (both are still a hash mismatch, and the
+    assertion below stays exactly as strict either way), but a human
+    reading the message can now usually tell which happened at a glance,
+    rather than the two causes being indistinguishable text as before.
+
     Yields:
         None.
     """
-    global _recorded_real_hash
+    global _recorded_real_hash, _recorded_real_shape
     before = _hash_real_settings()
     _recorded_real_hash = before
+    _recorded_real_shape = _settings_shape_summary(_REAL_SETTINGS_PATH)
     yield
     after = _hash_real_settings()
     assert after == before, (
         "tests/fleet/test_hooks_install.py touched the REAL "
         f"{_REAL_SETTINGS_PATH} -- every test in this module must operate "
-        "on the temp_settings_json fixture's path only."
+        "on the temp_settings_json fixture's path only. THIS ASSERTION "
+        "CANNOT DISTINGUISH that from another process on this laptop "
+        "editing the real file during this run (observed live, chunk 8 "
+        "review) -- compare the shapes below to tell which happened: "
+        f"recorded shape was [{_recorded_real_shape}]; current shape is "
+        f"[{_settings_shape_summary(_REAL_SETTINGS_PATH)}]."
     )
 
 
@@ -385,13 +440,25 @@ class TestEnforcementLayer3ExplicitAssertion:
     def test_real_settings_json_hash_unchanged_across_this_module(self) -> None:
         """TC-59: re-hash the real settings.json (or re-confirm its
         absence) and compare against the value the module-scoped
-        `_real_settings_untouched` fixture recorded at collection time."""
+        `_real_settings_untouched` fixture recorded at collection time.
+
+        The failure message (chunk 9, routed-in from the chunk-8 review)
+        names WHICH top-level keys / hook events differ -- the assertion
+        itself stays exactly as strict a hash comparison as before; only
+        the message widens, so a human reading it can usually tell "this
+        module wrote to the file" apart from "another process on this
+        laptop edited it mid-run" (both are still a hash mismatch, and
+        this alone cannot distinguish them programmatically either -- see
+        this test's docstring and the fixture's own)."""
         current = _hash_real_settings()
         assert current == _recorded_real_hash, (
             f"the REAL {_REAL_SETTINGS_PATH} changed during this test "
             f"module: was {_recorded_real_hash!r}, now {current!r}. Every "
             "test in test_hooks_install.py must operate on the "
-            "temp_settings_json fixture's path only."
+            "temp_settings_json fixture's path only. Cannot distinguish "
+            "that from another process editing the real file mid-run -- "
+            f"recorded shape was [{_recorded_real_shape}]; current shape "
+            f"is [{_settings_shape_summary(_REAL_SETTINGS_PATH)}]."
         )
 
 

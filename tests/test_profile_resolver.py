@@ -742,3 +742,85 @@ def test_golden_mirror_compares_when_both_sides_are_present() -> None:
     """The ordinary maintainer case still runs the comparison."""
     claiming = f"# mirrored by tests/fixtures/golden/{GOLDEN_CURRENT.name}\n"
     assert golden_mirror_state(True, claiming, True) == "compare"
+
+
+# --------------------------------------------------------------------------- #
+# Chunk 9 (roadmap#217 routed-in): find_profile's ceiling from a linked
+# worktree
+# --------------------------------------------------------------------------- #
+
+
+def _git_for_worktree_test(args: list[str], cwd: Path) -> None:
+    """Run one git command for the fixture below, with a pinned identity
+    (mirrors this module's `test_builtin_blocks_unattended_at_a_stable_tag`
+    precedent) so the test does not depend on the running machine's global
+    git config."""
+    import os as _os
+
+    env = {
+        **_os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, env=env)
+
+
+def test_find_profile_ceiling_escapes_a_linked_worktree_to_the_main_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chunk 9, roadmap#217 routed-in defect: `find_profile`'s upward-walk
+    ceiling used to be `git rev-parse --show-toplevel`, which from a
+    linked worktree returns the WORKTREE's own root, never the main
+    checkout's. This project's own real layout nests a linked worktree
+    under its main checkout (`<main>/.claude/worktrees/<name>`), so a
+    project-local `.superhuman/profile.yaml` living only in the main
+    checkout was invisible to a walk started from the worktree: the walk
+    stopped at the worktree's own root on its very first iteration and
+    never reached the main checkout, even though the main checkout is a
+    real filesystem ancestor of the worktree directory. Fixed by resolving
+    the ceiling via `--git-common-dir`'s parent (the main checkout's
+    working tree, from ANY of its worktrees) instead of `--show-toplevel`
+    (each worktree's own) — the same shape as the locator's own D1-R1 fix,
+    `hooks_install.py::_default_skill_root`, and
+    `tests/repo_artifacts.py::main_checkout_root`.
+    """
+    monkeypatch.delenv("SUPERHUMAN_PROFILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git_for_worktree_test(["init", "-q", "-b", "main"], main)
+    (main / "README.md").write_text("hello\n", encoding="utf-8")
+    _git_for_worktree_test(["add", "README.md"], main)
+    _git_for_worktree_test(["commit", "-q", "-m", "initial"], main)
+
+    profile_dir = main / ".superhuman"
+    profile_dir.mkdir()
+    profile = profile_dir / "profile.yaml"
+    profile.write_text("version: 1\nladder: []\n", encoding="utf-8")
+
+    worktree_root = main / ".claude" / "worktrees" / "child"
+    worktree_root.parent.mkdir(parents=True)
+    _git_for_worktree_test(
+        ["worktree", "add", "-q", "-b", "child-branch", str(worktree_root)], main
+    )
+
+    # Precondition: the worktree genuinely has no copy of its own anywhere
+    # in its own tree -- `.superhuman/` is never created inside it, so a
+    # correct resolution can only come from walking OUT to the main
+    # checkout, never from finding a nearer copy.
+    assert not (worktree_root / ".superhuman" / "profile.yaml").is_file()
+    # Precondition: home is not on the path between the worktree and the
+    # main checkout, so nothing here can be explained by tier-3 instead.
+    assert not (tmp_path / ".superhuman" / "profile.yaml").is_file()
+
+    resolved = sp.find_profile(worktree_root)
+
+    assert resolved == profile, (
+        f"find_profile from a linked worktree resolved {resolved!r}, "
+        f"expected the main checkout's own {profile!r} — see this test's "
+        "docstring for the --show-toplevel-vs---git-common-dir cause"
+    )
