@@ -1,0 +1,605 @@
+"""Idempotently installs/removes superhuman's own hook entries in a Claude
+Code `settings.json` (PLAN.md Chunk 8, DESIGN.md component table line 515,
+FR-9, A3).
+
+**Harness-specific by design (D4's one deliberate exception).** Every other
+module under `scripts/fleet/` names no harness. This one must: `settings.json`
+IS Claude Code's own configuration file, and D4's boundary rule (restated at
+`SUPERHUMAN.md` "Decisions locked") draws the line at exactly this module plus
+the installer's own `--harness claude-code` flag.
+
+**Ownership rule (R5, chunk-8 PM ruling, 2026-09-16).** A hook entry is
+superhuman-owned iff its `command` string resolves to one of the three
+wrapper basenames under a `templates/hooks/claude-code/` path -- WHATEVER
+root it points at. That is what lets `install()` REPLACE a stale,
+worktree-rooted hand install (see the 2026-09-09 hand registration recorded
+in SUPERHUMAN.md) instead of adding a duplicate beside it, and it is why
+`uninstall()` removes a migrated entry too: it is ours, wherever it points.
+
+**Where registered commands point (R1).** Auto-resolution (no `--skill-root`)
+derives the root from THIS MODULE'S OWN file location via
+``git rev-parse --path-format=absolute --git-common-dir`` -- the identical
+resolution shape ``tests/repo_artifacts.py``'s ``main_checkout_root`` already
+uses for publication tokens (chunk 6a), so this repo gains no second pattern.
+That always lands on the MAIN checkout, never a linked worktree (a worktree's
+own git-common-dir is always the main checkout's), so a defensive check
+still runs and refuses (non-zero exit, naming the resolved root) on the
+degenerate case where it somehow does not. ``--skill-root`` is an explicit
+operator override: never refused, but the root it names is reported as
+worktree-pinned by `status()` when applicable.
+
+**Harness facts (R3), verified against the docs, not recalled from training
+data** -- https://code.claude.com/docs/en/hooks.md (checked 2026-09-16):
+`SessionStart` matchers are `startup`, `resume`, `clear`, `compact`, `fork`
+(all five documented; FR-19 registers all five). `SubagentStart` takes
+`"*"` (match-all). A matcher containing only letters, digits, `_`, `-`,
+spaces, `,` and `|` is exact alternation, not a regex, so `PreToolUse`
+matcher `"Agent|Task"` matches exactly those two tool names. `timeout` is in
+SECONDS and a `command` hook's default is 600 -- which is what makes the
+`"timeout": 10` this module writes on every entry a real backstop (NFR-2)
+rather than a formality.
+
+**Never edited in place.** Every write goes through a temp file in the same
+directory, then `os.replace()` (TC-98) -- a crash between the two leaves the
+real file exactly as it was, never observed half-written (see PLAN.md's
+Backup strategy section).
+
+**Tests never touch the real file.** `settings_path` is an explicit
+parameter on every public function; the default is for real operator use
+only (FR-9). `tests/fleet/test_hooks_install.py` enforces this three ways
+of its own (a static self-check, a fixture, and a module-scoped tripwire) --
+see that module's docstring.
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import re
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final
+
+#: Real-operator default (FR-9). No test in `test_hooks_install.py` may rely
+#: on this -- every call there passes `settings_path=` explicitly.
+DEFAULT_SETTINGS_PATH: Final[Path] = Path.home() / ".claude" / "settings.json"
+
+#: The three wrapper basenames this installer manages, all under
+#: `templates/hooks/claude-code/` (R2: the extensionless bash wrapper, never
+#: the `.cmd` shim -- the shim stays shipped only as a non-executable-bit
+#: fallback).
+_SESSION_START_BASENAME: Final[str] = "session-start"
+_SUBAGENT_START_BASENAME: Final[str] = "subagent-start"
+_PRE_TOOL_USE_BASENAME: Final[str] = "pre-tool-use-role-gate"
+
+#: FR-19: the full documented `SessionStart` matcher set (R3).
+_SESSION_START_MATCHERS: Final[tuple[str, ...]] = ("startup", "resume", "clear", "compact", "fork")
+_SUBAGENT_START_MATCHER: Final[str] = "*"
+_PRE_TOOL_USE_MATCHER: Final[str] = "Agent|Task"
+
+#: G4-locked backstop (SUPERHUMAN.md "Decisions locked", TC-60).
+_TIMEOUT_SECONDS: Final[int] = 10
+
+#: R5's ownership test: a command resolves to one of the three basenames
+#: under a `templates/hooks/claude-code/` path segment, whatever root
+#: precedes it. Matched after normalising `\` to `/` so a Windows-style
+#: command string still matches.
+_OWNED_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
+    r"/templates/hooks/claude-code/(session-start|subagent-start|pre-tool-use-role-gate)$"
+)
+
+
+class HooksInstallError(Exception):
+    """Base class for every error this module raises."""
+
+
+class SkillRootRefusedError(HooksInstallError):
+    """The resolved skill root is inside a linked git worktree.
+
+    Attributes:
+        root: the refused root.
+    """
+
+    def __init__(self, root: Path) -> None:
+        """Initialize with the refused root, building the operator-facing message.
+
+        Args:
+            root: the resolved root that was refused.
+        """
+        super().__init__(
+            f"refusing to install: resolved skill root {root} is a linked git "
+            "worktree, not the main checkout (roadmap#217 -- a worktree can be "
+            "reaped, silently breaking a machine-wide hook). Pass an explicit "
+            "--skill-root to override deliberately."
+        )
+        self.root = root
+
+
+@dataclass(frozen=True, slots=True)
+class InstallResult:
+    """Outcome of one `install()` call.
+
+    Attributes:
+        root: the skill-checkout root the written commands point at.
+        worktree_pinned: True when `root` is a linked worktree -- only
+            possible via an explicit `skill_root` override; auto-resolution
+            raises `SkillRootRefusedError` instead of ever returning this
+            as True.
+        changed: whether the file's content differs from before this call.
+        diff: a unified diff (old vs. new); empty when `changed` is False.
+    """
+
+    root: Path
+    worktree_pinned: bool
+    changed: bool
+    diff: str
+
+
+@dataclass(frozen=True, slots=True)
+class UninstallResult:
+    """Outcome of one `uninstall()` call.
+
+    Attributes:
+        changed: whether the file's content differs from before this call.
+        diff: a unified diff (old vs. new); empty when `changed` is False.
+    """
+
+    changed: bool
+    diff: str
+
+
+@dataclass(frozen=True, slots=True)
+class EntryStatus:
+    """Status of one expected hook entry.
+
+    Attributes:
+        hook_event: e.g. `"SessionStart"`.
+        matcher: the matcher string this entry is registered under.
+        basename: the wrapper basename expected for this entry.
+        present: whether a superhuman-owned command was found here.
+        command: the actual registered command string, or None.
+        command_path_exists: whether `command` names a path that exists on
+            disk (D7.8's silent-disable case) -- False when absent.
+        worktree_pinned: whether `command`'s root is a linked git worktree.
+    """
+
+    hook_event: str
+    matcher: str
+    basename: str
+    present: bool
+    command: str | None
+    command_path_exists: bool
+    worktree_pinned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InstallStatus:
+    """Aggregate status across every expected entry.
+
+    Attributes:
+        installed: True iff every expected entry is present.
+        entries: one `EntryStatus` per expected (hook_event, matcher, basename).
+    """
+
+    installed: bool
+    entries: tuple[EntryStatus, ...]
+
+
+def _expected_entries() -> tuple[tuple[str, str, str], ...]:
+    """Return every (hook_event, matcher, basename) this installer manages.
+
+    Returns:
+        A tuple of 7 triples: 5 `SessionStart` matchers (FR-19), 1
+        `SubagentStart` match-all, 1 `PreToolUse` `Agent|Task` (chunk 7a's
+        role gate, installed here per DESIGN.md D7.8).
+    """
+    entries = [("SessionStart", matcher, _SESSION_START_BASENAME) for matcher in _SESSION_START_MATCHERS]
+    entries.append(("SubagentStart", _SUBAGENT_START_MATCHER, _SUBAGENT_START_BASENAME))
+    entries.append(("PreToolUse", _PRE_TOOL_USE_MATCHER, _PRE_TOOL_USE_BASENAME))
+    return tuple(entries)
+
+
+def _owned_basename(command: str) -> str | None:
+    """Apply R5's ownership test to one command string.
+
+    Args:
+        command: a hook entry's `command` field.
+
+    Returns:
+        The matched wrapper basename, or None if `command` is not
+        superhuman-owned.
+    """
+    match = _OWNED_COMMAND_RE.search(command.replace("\\", "/"))
+    return match.group(1) if match else None
+
+
+def _command_for(root: Path, basename: str) -> str:
+    """Build the command string this installer writes for `basename`.
+
+    Args:
+        root: the resolved skill-checkout root.
+        basename: one of the three wrapper basenames.
+
+    Returns:
+        A forward-slash path string, matching the live hand-installed
+        entry's own format (`C:/Users/.../templates/hooks/claude-code/...`)
+        regardless of platform.
+    """
+    return f"{root.as_posix()}/templates/hooks/claude-code/{basename}"
+
+
+def _root_from_command(command: str) -> Path:
+    """Recover the root a superhuman-owned command was written against.
+
+    Args:
+        command: a command string that `_owned_basename` matched.
+
+    Returns:
+        The path preceding `/templates/hooks/claude-code/<basename>`.
+    """
+    normalized = command.replace("\\", "/")
+    marker = "/templates/hooks/claude-code/"
+    return Path(normalized[: normalized.rindex(marker)])
+
+
+def _is_linked_worktree(root: Path) -> bool:
+    """Structurally test whether `root` is a linked git worktree.
+
+    A linked worktree's own `.git` is a FILE holding a `gitdir:` pointer;
+    a main checkout's `.git` is a directory. This is the exact mechanism
+    git itself uses, so it needs no subprocess call and is directly
+    testable against a bare fixture directory.
+
+    Args:
+        root: a candidate working-tree root.
+
+    Returns:
+        True iff `root / ".git"` exists and is a regular file.
+    """
+    return (root / ".git").is_file()
+
+
+def _default_skill_root() -> Path:
+    """Resolve the main checkout root from this module's OWN location (R1).
+
+    Runs `git rev-parse --path-format=absolute --git-common-dir` with `-C`
+    set to this file's own directory -- never to `settings_path` or any
+    caller-supplied path, since the root registered commands point at must
+    be independent of which settings file happens to be getting edited.
+    stdout is decoded explicitly as UTF-8 (never `subprocess.run(...,
+    text=True)`, which decodes with the ambient code page and reproduces
+    the exact defect class fixed at 5894617 for hook stdin on Windows).
+
+    Returns:
+        The main checkout's working-tree root -- `--git-common-dir`'s
+        parent, which is the main checkout's own working tree whether this
+        module is running from the main checkout or a linked worktree
+        (mirrors `tests/repo_artifacts.py::main_checkout_root`'s reasoning).
+
+    Raises:
+        HooksInstallError: git is unavailable, this file is not inside a
+            git working tree, or the invocation fails or times out.
+    """
+    module_dir = Path(__file__).resolve().parent
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(module_dir), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HooksInstallError(
+            f"could not resolve the main checkout root via git from {module_dir}: {exc}"
+        ) from exc
+    common_dir_text = completed.stdout.decode("utf-8").strip()
+    if not common_dir_text:
+        raise HooksInstallError(f"`git rev-parse --git-common-dir` returned nothing for {module_dir}")
+    return Path(common_dir_text).parent
+
+
+def resolve_skill_root(skill_root: Path | None = None) -> tuple[Path, bool]:
+    """Resolve the root that registered commands should point at (R1).
+
+    Args:
+        skill_root: an explicit operator override. When given, used as-is
+            and never refused -- the caller has taken responsibility.
+
+    Returns:
+        A `(root, pinned)` pair: `root` is the resolved skill-checkout
+        root; `pinned` is True iff `skill_root` was explicitly supplied.
+
+    Raises:
+        SkillRootRefusedError: auto-resolution (`skill_root` is None)
+            landed inside a linked worktree.
+        HooksInstallError: git resolution failed outright.
+    """
+    if skill_root is not None:
+        return skill_root, True
+    root = _default_skill_root()
+    if _is_linked_worktree(root):
+        raise SkillRootRefusedError(root)
+    return root, False
+
+
+def _dump_settings(data: dict[str, Any]) -> str:
+    """Serialize `data` matching the real file's observed shape.
+
+    Args:
+        data: the full settings document.
+
+    Returns:
+        JSON text: 2-space indent, LF line endings, one trailing newline,
+        no BOM -- matching `~/.claude/settings.json` as measured on this
+        machine (2026-09-16).
+    """
+    return json.dumps(data, indent=2) + "\n"
+
+
+def _atomic_write(settings_path: Path, text: str) -> None:
+    """Write `text` to `settings_path` atomically (TC-98).
+
+    Writes to a temp file in the SAME directory, then `os.replace()` --
+    never edited in place, so a crash between the two leaves the real file
+    exactly as it was, never observed half-written. On any failure this
+    function can still observe, the temp file is removed rather than left
+    orphaned.
+
+    Args:
+        settings_path: the real destination path.
+        text: the full new file content.
+
+    Raises:
+        OSError: the write or replace failed; `settings_path` itself is
+            unmodified either way -- `os.replace` is atomic on both POSIX
+            and Windows for a same-volume rename.
+    """
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{settings_path.name}.", suffix=".tmp", dir=str(settings_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, settings_path)
+    except OSError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _remove_owned(hooks: dict[str, Any]) -> None:
+    """Strip every superhuman-owned entry from `hooks`, in place (R5).
+
+    A matcher group left with zero commands afterward is dropped entirely
+    (rather than kept as an empty `"hooks": []` group), and an event left
+    with zero groups is dropped too -- this is what makes `uninstall()`'s
+    exact-round-trip guarantee (TC-57) hold against a clean seed, and what
+    makes a migrated worktree-rooted entry (TC-95) disappear rather than
+    leave behind an empty group nothing else ever created.
+
+    Args:
+        hooks: the settings document's `"hooks"` sub-object.
+    """
+    for event in list(hooks.keys()):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            commands = group.get("hooks", [])
+            remaining = [command for command in commands if _owned_basename(command.get("command", "")) is None]
+            if remaining:
+                kept_groups.append({**group, "hooks": remaining})
+        if kept_groups:
+            hooks[event] = kept_groups
+        else:
+            hooks.pop(event, None)
+
+
+def _add_owned(hooks: dict[str, Any], root: Path) -> None:
+    """Add this installer's own entries to `hooks`, in place.
+
+    Assumes `_remove_owned` has already run against the same `hooks`
+    object, so no duplicate can result. Reuses an existing matcher group
+    when one already exists for the target event+matcher; creates a new
+    group (appended at the end of that event's list) otherwise -- this is
+    what creates the previously-absent `fork` `SessionStart` group and the
+    `Agent|Task` `PreToolUse` group (TC-92, TC-96).
+
+    Args:
+        hooks: the settings document's `"hooks"` sub-object.
+        root: the resolved skill-checkout root to point commands at.
+    """
+    for hook_event, matcher, basename in _expected_entries():
+        groups = hooks.setdefault(hook_event, [])
+        group = next((candidate for candidate in groups if candidate.get("matcher") == matcher), None)
+        entry = {
+            "type": "command",
+            "command": _command_for(root, basename),
+            "timeout": _TIMEOUT_SECONDS,
+        }
+        if group is None:
+            groups.append({"matcher": matcher, "hooks": [entry]})
+        else:
+            group.setdefault("hooks", []).append(entry)
+
+
+def _diff(before_text: str, after_text: str, settings_path: Path) -> str:
+    """Build a unified diff between the file's before/after text.
+
+    Args:
+        before_text: content before the change (may be empty).
+        after_text: content after the change.
+        settings_path: used only to label the diff's file headers.
+
+    Returns:
+        The unified diff text, or `""` when the two are identical.
+    """
+    if before_text == after_text:
+        return ""
+    return "".join(
+        difflib.unified_diff(
+            before_text.splitlines(keepends=True),
+            after_text.splitlines(keepends=True),
+            fromfile=str(settings_path),
+            tofile=str(settings_path),
+        )
+    )
+
+
+def install(
+    settings_path: Path = DEFAULT_SETTINGS_PATH,
+    *,
+    skill_root: Path | None = None,
+    dry_run: bool = False,
+) -> InstallResult:
+    """Idempotently register every superhuman hook entry (FR-9).
+
+    Replaces any pre-existing superhuman-owned entry (wherever it points)
+    rather than adding a duplicate beside it (R5) -- this is what migrates
+    the 2026-09-09 worktree-rooted hand install to the resolved root
+    (TC-95). Every foreign (non-superhuman) entry survives untouched
+    (TC-56). Idempotent: a second call with nothing changed writes nothing
+    and reports `changed=False` (TC-55).
+
+    Args:
+        settings_path: the settings file to modify. Defaults to the real
+            operator location; every test passes this explicitly.
+        skill_root: an explicit operator override for the root registered
+            commands point at. Omit to auto-resolve via git (R1).
+        dry_run: compute and return the diff without writing anything
+            (TC-97).
+
+    Returns:
+        The `InstallResult` describing what would be (or was) written.
+
+    Raises:
+        SkillRootRefusedError: auto-resolution landed inside a linked
+            worktree.
+        HooksInstallError: git resolution failed outright.
+        OSError: the write failed.
+    """
+    root, pinned = resolve_skill_root(skill_root)
+
+    before_text = settings_path.read_text(encoding="utf-8") if settings_path.is_file() else ""
+    data: dict[str, Any] = json.loads(before_text) if before_text else {}
+    hooks = data.setdefault("hooks", {})
+    _remove_owned(hooks)
+    _add_owned(hooks, root)
+    after_text = _dump_settings(data)
+
+    changed = after_text != before_text
+    diff = _diff(before_text, after_text, settings_path)
+    if changed and not dry_run:
+        _atomic_write(settings_path, after_text)
+
+    return InstallResult(root=root, worktree_pinned=pinned, changed=changed, diff=diff)
+
+
+def uninstall(settings_path: Path = DEFAULT_SETTINGS_PATH) -> UninstallResult:
+    """Remove every superhuman-owned hook entry (FR-9).
+
+    Restores the prior state exactly against a seed with no pre-existing
+    superhuman entry (TC-57). Against a seed carrying a migrated
+    (worktree-rooted) superhuman entry, that entry is removed too --
+    it is ours, wherever it points (R5).
+
+    Args:
+        settings_path: the settings file to modify. Defaults to the real
+            operator location; every test passes this explicitly.
+
+    Returns:
+        The `UninstallResult` describing what was written.
+
+    Raises:
+        OSError: the write failed.
+    """
+    if not settings_path.is_file():
+        return UninstallResult(changed=False, diff="")
+
+    before_text = settings_path.read_text(encoding="utf-8")
+    data: dict[str, Any] = json.loads(before_text) if before_text else {}
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        _remove_owned(hooks)
+        if not hooks:
+            data.pop("hooks", None)
+    after_text = _dump_settings(data)
+
+    changed = after_text != before_text
+    diff = _diff(before_text, after_text, settings_path)
+    if changed:
+        _atomic_write(settings_path, after_text)
+
+    return UninstallResult(changed=changed, diff=diff)
+
+
+def _find_owned_command(hooks: dict[str, Any], hook_event: str, matcher: str, basename: str) -> str | None:
+    """Find the registered command for one expected entry, if present.
+
+    Args:
+        hooks: the settings document's `"hooks"` sub-object.
+        hook_event: e.g. `"SessionStart"`.
+        matcher: the matcher string to look under.
+        basename: the wrapper basename expected there.
+
+    Returns:
+        The matching command string, or None.
+    """
+    for group in hooks.get(hook_event, []):
+        if group.get("matcher") != matcher:
+            continue
+        for command in group.get("hooks", []):
+            if _owned_basename(command.get("command", "")) == basename:
+                return command.get("command")
+    return None
+
+
+def status(settings_path: Path = DEFAULT_SETTINGS_PATH) -> InstallStatus:
+    """Report whether each expected hook entry is installed (FR-9).
+
+    Also checks that each registered command's path actually exists on
+    disk (D7.8's silent-disable case: "a mistyped path in settings.json
+    leaves the gate silently disabled") and whether its root is a linked
+    git worktree (`worktree_pinned`) -- derived from the command string
+    itself, so this is accurate even when called without the
+    `--skill-root` an earlier `install()` used.
+
+    Args:
+        settings_path: the settings file to inspect. Defaults to the real
+            operator location; every test passes this explicitly.
+
+    Returns:
+        The `InstallStatus`: `installed=True` iff every expected entry is
+        present.
+    """
+    data: dict[str, Any] = (
+        json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {}
+    )
+    hooks = data.get("hooks", {})
+
+    entries = []
+    for hook_event, matcher, basename in _expected_entries():
+        command = _find_owned_command(hooks, hook_event, matcher, basename)
+        present = command is not None
+        path_exists = present and Path(command).exists()
+        pinned = present and _is_linked_worktree(_root_from_command(command))
+        entries.append(
+            EntryStatus(
+                hook_event=hook_event,
+                matcher=matcher,
+                basename=basename,
+                present=present,
+                command=command,
+                command_path_exists=bool(path_exists),
+                worktree_pinned=bool(pinned),
+            )
+        )
+
+    return InstallStatus(installed=all(entry.present for entry in entries), entries=tuple(entries))

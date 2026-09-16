@@ -28,6 +28,7 @@ from uuid import uuid4
 from .. import superhuman_profile
 from . import doctor as fleet_doctor
 from . import hook_payload as fleet_hook_payload
+from . import hooks_install as fleet_hooks_install
 from . import observe as fleet_observe
 from . import project_id as fleet_project_id
 from . import role_block as fleet_role_block
@@ -1090,6 +1091,87 @@ def _cmd_role_block_check(args: argparse.Namespace) -> int:
     return 0 if result.verdict in (fleet_role_block.Verdict.ROLE, fleet_role_block.Verdict.NON_ROLE) else 1
 
 
+def _cmd_hooks_install(args: argparse.Namespace) -> int:
+    """Handle `fleet hooks install` (Chunk 8, FR-9, A3).
+
+    All logic lives in `hooks_install.install`; this only translates CLI
+    args to the module API and prints a result. `--harness` is required
+    with a single choice (D4: no auto-detection) since `hooks_install.py`
+    is the one module in `scripts/` DESIGN.md names as harness-specific.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success (including a no-op `--dry-run`); `1` if the
+        resolved skill root is a linked git worktree or git resolution
+        failed outright.
+    """
+    try:
+        result = fleet_hooks_install.install(
+            args.settings_path, skill_root=args.skill_root, dry_run=args.dry_run
+        )
+    except fleet_hooks_install.HooksInstallError as exc:
+        print(f"fleet hooks install: {exc}", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        if result.changed:
+            print(result.diff, end="")
+        else:
+            print("fleet hooks install --dry-run: already up to date; nothing to write")
+        return 0
+
+    print(f"installed (root: {result.root})" if result.changed else f"already installed (root: {result.root})")
+    if result.worktree_pinned:
+        print(
+            "WARNING: --skill-root points inside a linked git worktree "
+            "(worktree-pinned) -- this install breaks if that worktree is reaped",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_hooks_uninstall(args: argparse.Namespace) -> int:
+    """Handle `fleet hooks uninstall` (Chunk 8, FR-9).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` -- removing an already-absent entry is a no-op,
+        not an error.
+    """
+    result = fleet_hooks_install.uninstall(args.settings_path)
+    print("uninstalled" if result.changed else "already not installed")
+    return 0
+
+
+def _cmd_hooks_status(args: argparse.Namespace) -> int:
+    """Handle `fleet hooks status` (Chunk 8, FR-9).
+
+    Also reports D7.8's silent-disable case (a registered command whose
+    path no longer exists) and whether a registered command is
+    worktree-pinned.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` -- a status report has nothing to reject.
+    """
+    result = fleet_hooks_install.status(args.settings_path)
+    for entry in result.entries:
+        line = f"{entry.hook_event}/{entry.matcher}: {'installed' if entry.present else 'NOT installed'}"
+        if entry.present and not entry.command_path_exists:
+            line += " -- command path does NOT exist (silently disabled)"
+        if entry.present and entry.worktree_pinned:
+            line += " -- WORKTREE-PINNED"
+        print(line)
+    print("installed" if result.installed else "not installed")
+    return 0
+
+
 def _safe_build_adapter_for_observe(
     args: argparse.Namespace, *, event: str
 ) -> SessionAdapter | None:
@@ -1595,6 +1677,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_doctor_subparser(subparsers)
     _add_project_subparsers(subparsers)
     _add_role_block_subparsers(subparsers)
+    _add_hooks_subparsers(subparsers)
 
     return parser
 
@@ -1710,6 +1793,92 @@ def _add_role_block_subparsers(subparsers: argparse._SubParsersAction) -> None:
         help="the directory holding roles/*.md (default: this skill's own roles/)",
     )
     check_parser.set_defaults(func=_cmd_role_block_check)
+
+
+def _add_hooks_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `hooks install|uninstall|status` subcommands (Chunk 8, FR-9, A3).
+
+    All logic lives in `scripts/fleet/hooks_install.py`; this is thin verb
+    wiring only, per the PM's file-list ruling (PLAN.md Chunk 8).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    hooks_parser = subparsers.add_parser(
+        "hooks",
+        help="Idempotently register/remove/report superhuman's own harness hook "
+        "entries in a settings file (Chunk 8, FR-9, A3).",
+    )
+    hooks_subparsers = hooks_parser.add_subparsers(dest="hooks_command", required=True)
+
+    install_parser = hooks_subparsers.add_parser(
+        "install",
+        help="Register every superhuman hook entry, replacing any prior "
+        "superhuman-owned entry rather than duplicating it (R5).",
+    )
+    install_parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("claude-code",),
+        help="the target harness; no auto-detection (D4)",
+    )
+    install_parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=fleet_hooks_install.DEFAULT_SETTINGS_PATH,
+        help="the settings.json to modify (default: ~/.claude/settings.json)",
+    )
+    install_parser.add_argument(
+        "--skill-root",
+        type=Path,
+        default=None,
+        help="explicit operator override for the root registered commands point "
+        "at (default: auto-resolve the main checkout via git; refuses if that "
+        "resolves inside a linked worktree -- R1)",
+    )
+    install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the diff and write nothing",
+    )
+    install_parser.set_defaults(func=_cmd_hooks_install)
+
+    uninstall_parser = hooks_subparsers.add_parser(
+        "uninstall",
+        help="Remove every superhuman-owned hook entry, restoring the prior "
+        "state exactly.",
+    )
+    uninstall_parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("claude-code",),
+        help="the target harness; no auto-detection (D4)",
+    )
+    uninstall_parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=fleet_hooks_install.DEFAULT_SETTINGS_PATH,
+        help="the settings.json to modify (default: ~/.claude/settings.json)",
+    )
+    uninstall_parser.set_defaults(func=_cmd_hooks_uninstall)
+
+    status_parser = hooks_subparsers.add_parser(
+        "status",
+        help="Report whether each superhuman hook entry is installed.",
+    )
+    status_parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("claude-code",),
+        help="the target harness; no auto-detection (D4)",
+    )
+    status_parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=fleet_hooks_install.DEFAULT_SETTINGS_PATH,
+        help="the settings.json to inspect (default: ~/.claude/settings.json)",
+    )
+    status_parser.set_defaults(func=_cmd_hooks_status)
 
 
 def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
