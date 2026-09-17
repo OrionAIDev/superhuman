@@ -40,6 +40,15 @@ Artifacts land at `<your-project-root>/docs/superhuman/<slug>/`.
 
 The skill bundle lives at `~/.claude/skills/superhuman/`. To register the SessionStart hook with Claude Code (recommended for cache priming):
 
+> **Two different hooks ship in this repo — do not confuse them.** The one described in this
+> section, `hooks/session-start`, primes the prompt cache and is registered by hand as shown
+> below. Separately, the optional **fleet observation** feature ships its own hooks under
+> `templates/hooks/claude-code/`, and those are registered by a command rather than by hand:
+> `python -m scripts.fleet.cli hooks install --harness claude-code` (`--dry-run` shows the diff
+> first; `uninstall` reverses it; `status` reports what is registered). Fleet observation is
+> **disabled unless you opt in** with a profile, so if you have not, you can ignore it
+> entirely. See `docs/fleet-observation.md`.
+
 Edit your Claude Code `settings.json` (typically `~/.claude/settings.json` or per-project `.claude/settings.json`).
 
 > **Windows note:** the POSIX `~` does not expand inside Claude Code's `settings.json` reliably on Windows. Use the `.cmd` shim form shown below instead, OR substitute the full Windows path (e.g. `C:\\Users\\<you>\\.claude\\skills\\superhuman\\hooks\\session-start`).
