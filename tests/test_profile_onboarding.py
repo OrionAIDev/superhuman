@@ -844,6 +844,52 @@ def test_models_set_cli_answers_json_file_stdin(tmp_path: Path) -> None:
     assert profile.models["most_capable"]["primary"] == "vendor-a/big"
 
 
+def test_models_set_cli_answers_json_file_stdin_decodes_utf8_not_locale(
+    tmp_path: Path,
+) -> None:
+    """FIX B (round 3) follow-up, chunk 9 R8 site 2 (roadmap#217): the '-'
+    stdin path decodes with `sys.stdin.buffer.read().decode("utf-8")`, not
+    `sys.stdin.read()`'s locale-preferred codec -- see `cmd_models_set`'s
+    own docstring for the byte-level cause. The sibling test just above
+    (`test_models_set_cli_answers_json_file_stdin`) cannot catch a
+    regression here: it passes `text=True` on the PARENT's `input=`, which
+    encodes an ASCII-only payload with the parent's own locale codec --
+    the same codec the child would fall back to on a regression -- so an
+    ASCII-only payload round-trips regardless of which encoding either
+    side uses. This test avoids `text=True` entirely, encoding a non-ASCII
+    alias as raw UTF-8 bytes itself, so a wrong decode on the child's side
+    produces a different, wrong string instead of silently working.
+    `ensure_ascii=False` on the `json.dumps` below matters for the same
+    reason: the default `ensure_ascii=True` would emit the alias as the
+    ASCII-only escape `\\u00e9`, which survives ANY codec byte-for-byte --
+    a second, independent way this test could have passed for the wrong
+    reason. Deliberately uses only the e-acute, not also the rightwards
+    arrow the sibling non-ASCII tests pair it with elsewhere in this
+    project: `cmd_models_set` echoes the resolved alias back via a bare
+    `print()`, and this Windows console's own stdout is cp1252 -- U+2192
+    has no cp1252 mapping, so pairing it here would raise
+    `UnicodeEncodeError` in an unrelated code path (the CLI's own success
+    banner) rather than in the decode this test targets. That banner
+    encoding gap is real but out of scope for the two R8 sites this chunk
+    closes.
+    """
+    dest = tmp_path / "profile.yaml"
+    alias = "vendor-\u00e9/model"
+    answers_json = json.dumps({"most_capable": {"primary": alias}}, ensure_ascii=False)
+    result = subprocess.run(
+        [sys.executable, str(RESOLVER), "models", "set", "--profile", str(dest),
+         "--answers-json-file", "-", "--decline", "standard,cheap"],
+        input=answers_json.encode("utf-8"), capture_output=True, check=False,
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr.decode("utf-8", errors="replace")
+
+    profile = sp.load_profile(dest)
+    assert profile.models["most_capable"]["primary"] == alias, (
+        f"stdin decode produced {profile.models['most_capable']['primary']!r}, "
+        f"expected {alias!r} -- see this test's docstring for the byte-level cause"
+    )
+
+
 def test_models_set_cli_both_answers_sources_exits_nonzero(tmp_path: Path) -> None:
     """FIX B (round 3): --answers-json and --answers-json-file are mutually exclusive."""
     dest = tmp_path / "profile.yaml"

@@ -824,3 +824,48 @@ def test_find_profile_ceiling_escapes_a_linked_worktree_to_the_main_checkout(
         f"expected the main checkout's own {profile!r} — see this test's "
         "docstring for the --show-toplevel-vs---git-common-dir cause"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Chunk 9 R8 follow-up (roadmap#217): `_git`'s own decoding fix had no test
+# that could fail if it were reverted
+# --------------------------------------------------------------------------- #
+
+
+class TestGitNonAsciiPathDecoding:
+    """`_git`'s explicit ``encoding="utf-8"`` (chunk 9, roadmap#217) must
+    actually decode git's UTF-8 stdout as UTF-8, not fall through to the
+    process's locale-preferred encoding (cp1252 on this Windows runner) --
+    see this module's own `_git` docstring for the byte-level cause. Uses a
+    real git subprocess and a real non-ASCII directory name throughout,
+    never a mock, matching `tests/fleet/test_locate.py::
+    TestNonAsciiPathDecoding` and `tests/test_repo_artifacts.py::
+    test_main_checkout_root_resolves_from_a_non_ascii_worktree_path`.
+    """
+
+    def test_git_resolves_show_toplevel_under_a_non_ascii_directory_name(
+        self, tmp_path: Path
+    ) -> None:
+        # Same example the two sibling tests use: an e-acute plus a
+        # rightwards arrow. In UTF-8 these are the bytes C3 A9 (e-acute)
+        # and E2 86 92 (the arrow); every one of those five bytes has a
+        # DEFINED cp1252 mapping, so decoding them as cp1252 does not
+        # raise -- it silently produces a different, wrong string instead,
+        # which is exactly the failure mode this test pins (a raised
+        # `UnicodeDecodeError` would be comparatively easy to notice).
+        repo = tmp_path / "proj-\u00e9\u2192"
+        repo.mkdir()
+        _git_for_worktree_test(["init", "-q", "-b", "main"], repo)
+        (repo / "README.md").write_text("placeholder\n", encoding="utf-8")
+        _git_for_worktree_test(["add", "README.md"], repo)
+        _git_for_worktree_test(["commit", "-q", "-m", "initial"], repo)
+
+        resolved = sp._git(repo, "rev-parse", "--show-toplevel")
+
+        assert resolved is not None, "_git returned None for a valid repo"
+        assert Path(resolved) == repo, (
+            f"_git decoded git's stdout as {resolved!r}, expected the "
+            f"non-ASCII path {repo!r} -- see this test's docstring for the "
+            "byte-level cause (a cp1252 stdout decode silently mangling "
+            "the path)"
+        )
