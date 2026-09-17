@@ -2,9 +2,9 @@
 assertion — the D4 boundary ruling's enforcement.
 
 TDD scaffold at Phase 2.1; TC-63/TC-64 implemented at chunk 9 per `TEST.md`.
-TC-65 (D4 boundary documentation, `docs/fleet-observation.md`) stays a
-skipped scaffold here — chunk 9 runs as two dispatches, and the docs half
-that would make TC-65 true is the SECOND dispatch's job, not this one's.
+TC-65 (D4 boundary documentation, `docs/fleet-observation.md`) is
+implemented here too, as this project's second chunk-9 dispatch, now that
+the docs half of the chunk has landed.
 
 Not named in PLAN.md's Chunk 9 file list (which lists no new test file for
 this chunk — its acceptance criteria read as regressions/content
@@ -275,17 +275,193 @@ class TestIdenticalVerb:
 
 
 class TestBoundaryDocumentation:
-    @pytest.mark.skip(
-        reason="TC-65 is the docs half of chunk 9, a separate dispatch: "
-        "docs/fleet-observation.md is not yet updated to describe the "
-        "implemented state (D4/PLAN chunk 9 note)."
-    )
+    """TC-65 (D4 boundary documentation, `docs/fleet-observation.md`).
+
+    Guards against keyword-stuffing several ways: HTML comments are
+    stripped before any substance check runs, so a match hidden inside a
+    `<!-- -->` block does not count; the checks that matter most are
+    pinned to a NAMED subsection (via this module's own `_subsection`
+    helper) rather than a whole-file substring search, so a stray mention
+    outside its proper section does not satisfy it; several checks require
+    MULTIPLE co-occurring, specific technical terms rather than one word,
+    so a single keyword dropped anywhere cannot satisfy them; the stated-
+    limitations section is additionally required to hold at least nine
+    separately NUMBERED list items (not nine words scattered in prose) and
+    a minimum count of hedge words (`not`/`never`/`cannot`/`silently`),
+    which a marketing-shaped rewrite would not have; and the material this
+    rewrite must remove (deleted template paths, the old placeholder
+    procedure, the stale `$(pwd)` cwd source, the misleading
+    `git_timeout_seconds: 0.25` "default") is asserted ABSENT, not merely
+    that new material was added alongside it.
+    """
+
     def test_docs_fleet_observation_covers_the_boundary_and_limitations(
         self,
     ) -> None:
-        """`docs/fleet-observation.md` documents: the locator's
-        disambiguation ladder, `observe session-start`, `origination`
-        `"observed"`, hook install/uninstall, `fleet doctor`, the D4
-        portable/ceiling boundary rule, and every stated limitation
-        confirmed by Chunk 1 (same-turn parallel fan-out collapse, D5's
-        fallback if it was triggered instead of Option A)."""
+        doc_path = _REPO_ROOT / "docs" / "fleet-observation.md"
+        raw_text = doc_path.read_text(encoding="utf-8")
+        # Strip HTML comments so a match hidden inside one doesn't count.
+        text = re.sub(r"<!--.*?-->", "", raw_text, flags=re.DOTALL)
+        lowered = text.lower()
+
+        # --- stale/superseded material must be GONE, not merely -----------
+        # --- superseded by new material added alongside it ----------------
+        for gone in (
+            "templates/hooks/SessionStart",
+            "templates/hooks/PreToolUse",
+            "REPLACE_WITH_",
+            "$(pwd)",
+            "git_timeout_seconds: 0.25",
+        ):
+            assert gone not in text, (
+                f"docs/fleet-observation.md still contains {gone!r}, which "
+                "the chunk 6/7/8/9 rewrites made stale or false"
+            )
+
+        # --- observe session-start / origination:"observed" ---------------
+        assert "observe session-start" in lowered, (
+            "docs/fleet-observation.md never names the `observe session-start` "
+            "verb the SessionStart floor and ceiling both call"
+        )
+        assert '"origination": "observed"' in text, (
+            'docs/fleet-observation.md never documents the `"origination": '
+            '"observed"` tag a hook- or floor-written row carries'
+        )
+
+        # --- the project locator's disambiguation ladder -------------------
+        locator_section = _subsection(text, "locator").lower()
+        for needle in (
+            "h0",
+            "h1",
+            "git-common-dir",
+            "path.home()",
+            "cwd-containment",
+            "declared",
+            "branch",
+            "singleton",
+            "max_outward_hops",
+        ):
+            assert needle in locator_section, (
+                f"the locator section is missing {needle!r} -- the ladder must "
+                "be described concretely, not just referenced by name"
+            )
+        assert "outer" in locator_section and "nested" in locator_section, (
+            "the locator section must state that a nested project resolves "
+            "to the OUTER repository, not merely assert a ladder exists"
+        )
+
+        # --- the granularity rule's deterministic ceiling -------------------
+        granularity_section = _subsection(text, "granularity").lower()
+        assert "subagentstart" in granularity_section
+        assert "subagent-start" in granularity_section
+        assert "agent_type" in granularity_section, (
+            "the granularity section must explain WHY agent_type cannot "
+            "substitute for the predicate, not just name the predicate"
+        )
+
+        # --- the role-first enforcement gate (chunk 7a) --------------------
+        role_gate_section = _subsection(text, "role-first").lower()
+        for verdict in ("role", "non_role", "mismatch", "unmarked"):
+            assert verdict in role_gate_section, (
+                f"the role-first gate section never names the {verdict!r} verdict"
+            )
+        assert "role-gate.jsonl" in role_gate_section
+        assert "six fields" in role_gate_section or "6 fields" in role_gate_section
+        assert "prompt text" in role_gate_section, (
+            "the role-first gate section must state the decision log never "
+            "carries the prompt text itself (NFR-8), not just that it logs"
+        )
+
+        # --- installing the hook ceiling ------------------------------------
+        installer_section = _subsection(text, "install").lower()
+        for needle in (
+            "hooks install",
+            "hooks status",
+            "hooks uninstall",
+            "--harness claude-code",
+            "--settings-path",
+            "--skill-root",
+            "--dry-run",
+            "startup",
+            "resume",
+            "clear",
+            "compact",
+            "fork",
+            "agent|task",
+            "timeout",
+            "600",
+            "duplicate",
+            "worktree",
+        ):
+            assert needle in installer_section, (
+                f"the installer section is missing {needle!r}"
+            )
+        assert re.search(r"main (git )?checkout", installer_section), (
+            "the installer section must state registered commands resolve "
+            "to the MAIN checkout, not merely mention checkouts in passing"
+        )
+        assert "reap" in installer_section or "branch" in installer_section, (
+            "the installer section must give the REASON a worktree-pinned "
+            "hook is dangerous (branch switches, or reap-safety blindness), "
+            "not just assert that worktrees are avoided"
+        )
+
+        # --- the D4 boundary rule (five clauses) ---------------------------
+        d4_section = _subsection(text, "d4").lower()
+        for needle in (
+            "harness-agnostic",
+            "no auto-detection",
+            "never invoked automatically",
+            "identical verb",
+            "byte-identically",
+            "observe session-start",
+            "observe dispatch",
+        ):
+            assert needle in d4_section, f"the D4 boundary section is missing {needle!r}"
+
+        # --- fleet doctor + fleet observe status ---------------------------
+        doctor_section = _subsection(text, "doctor").lower()
+        for needle in (
+            "unresolvable",
+            "fleet_disabled",
+            "no_project_id",
+            "2.31",
+            "unknown",
+            "not configured",
+            "zero writes recorded",
+            "last write for this project succeeded",
+            "last write for this project failed",
+        ):
+            assert needle in doctor_section, f"the doctor/status section is missing {needle!r}"
+
+        # --- stated limitations: at least nine NUMBERED items, each with ---
+        # --- specific, co-occurring technical terms -------------------------
+        limitations_section = _subsection(text, "limitation")
+        limitations_lower = limitations_section.lower()
+        numbered_items = re.findall(r"^\d+\. \*\*", limitations_section, flags=re.MULTILINE)
+        assert len(numbered_items) >= 9, (
+            f"stated limitations must be at least 9 separately numbered items, "
+            f"found {len(numbered_items)}"
+        )
+        hedge_words = re.findall(r"\b(not|never|cannot|silently)\b", limitations_lower)
+        assert len(hedge_words) >= 9, (
+            "a limitations section reading like marketing would not repeat "
+            "hedge words this often -- found only "
+            f"{len(hedge_words)} of not/never/cannot/silently"
+        )
+        required_pairs = [
+            ("nested dispatches", "no row"),
+            ("workflow", "sendmessage"),
+            ("cannot resolve", "prose floor"),
+            ("subagent_type", "own message"),
+            ("non-role", "counted"),
+            ("session_id", "fixture"),
+            ("git_timeout_seconds", "malformed"),
+            ("latency", "windows"),
+            ("main checkout", "inert"),
+        ]
+        for first, second in required_pairs:
+            assert first in limitations_lower and second in limitations_lower, (
+                f"stated limitations never pairs {first!r} with {second!r} -- "
+                "a limitation must be substantiated, not just named"
+            )
