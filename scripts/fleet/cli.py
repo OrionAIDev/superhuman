@@ -334,43 +334,46 @@ def _default_fleet_dir(workspace: Path, slug: str) -> Path:
 
 def _resolved_git_timeout_override(workspace: Path | str) -> float | None:
     """Resolve the `git_timeout=` override `_build_adapter` should forward
-    to the adapter it constructs (chunk 9, PM ruling R10).
+    to the adapter it constructs (chunk 9, PM rulings R10 and R11).
 
-    `FleetConfig.git_timeout_seconds` (config.py:67) was declared,
+    `FleetConfig.git_timeout_seconds` (config.py) was declared,
     documented, and parsed but consumed by NOTHING -- no adapter
     construction site threaded it into `git_timeout=`, so an operator who
     set `fleet.git_timeout_seconds:` in their profile got silence, not
-    effect. This closes that gap at `_build_adapter`, its ONE
+    effect (R10). This closes that gap at `_build_adapter`, its ONE
     construction choke point.
 
-    The default-preservation half is the reason this compares against
-    `fleet_config.DEFAULT_GIT_TIMEOUT_SECONDS` rather than simply
-    returning `cfg.git_timeout_seconds` outright: `FleetConfig` has no
-    separate flag for "the profile never mentioned this key" -- an absent
-    key and an explicit `git_timeout_seconds: 0.25` resolve to the
-    IDENTICAL float. Forwarding that value unconditionally would change
-    every existing caller's adapter-construction default from 30s (each
-    adapter's own constructor default, pinned by
-    `test_observe.py::test_collect_git_facts_uses_30s_default_when_
-    git_timeout_omitted`) to 0.25s (config.py's NFR-2-adjacent figure,
-    sized for `observe.py`'s OWN bounded façade calls, not for a general
-    adapter default) -- exactly the regression PM ruling R10 forbids.
-    Returning `None` here when the two are equal lets every existing
-    caller fall through to each adapter's own default, unchanged.
+    A direct passthrough, deliberately: R11 corrected R10's first attempt,
+    which forwarded `cfg.git_timeout_seconds` only when it DIFFERED from a
+    package-default constant -- a VALUE comparison. That made an operator
+    who wrote `git_timeout_seconds: 0.25` (config.py's own documented
+    default, and therefore one of the likeliest values someone being
+    explicit would pick) indistinguishable from one who never set the key
+    at all, so their deliberate 0.25 was silently discarded in favor of
+    the adapter's 30s default -- 120x what they asked for. The defect
+    R10 exists to close reappeared in miniature, on one specific value
+    instead of every value.
+
+    R11's fix moves the distinction to where it belongs: `FleetConfig.
+    git_timeout_seconds` is now `None` unless the profile's `fleet:`
+    block sets a genuinely usable (positive, non-bool) number -- a
+    PRESENCE signal, not a value one one caller here can misread. `None`
+    is also each adapter constructor's own default for `git_timeout`, so
+    this passthrough is a byte-identical no-op for anyone who has not set
+    the key, and forwards ANY deliberately-set value verbatim, including
+    one that happens to equal the package default.
 
     Args:
         workspace: the working tree to resolve fleet configuration for.
 
     Returns:
-        float | None: the profile's `git_timeout_seconds` when it
-        differs from the package default; `None` otherwise (including
-        when fleet is disabled or unconfigured for `workspace`, since
-        `resolve_fleet_config` never raises and a disabled `FleetConfig`
-        carries the same field default).
+        float | None: the profile's `git_timeout_seconds` if the operator
+        set one; `None` otherwise (absent key, a malformed value, fleet
+        disabled, or no profile at all -- `resolve_fleet_config` never
+        raises and every one of those cases already resolves to `None`
+        at the config layer, per its own docstring).
     """
     cfg = fleet_config.resolve_fleet_config(workspace)
-    if cfg.git_timeout_seconds == fleet_config.DEFAULT_GIT_TIMEOUT_SECONDS:
-        return None
     return cfg.git_timeout_seconds
 
 

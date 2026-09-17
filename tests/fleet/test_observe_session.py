@@ -738,30 +738,37 @@ def test_every_hook_payload_verb_and_harness_builds_an_adapter_that_uses_git_fac
 
 
 class TestBuildAdapterGitTimeoutWiring:
-    """PM ruling R10 (chunk 9 review, follow-up (c)): `FleetConfig.
-    git_timeout_seconds` was declared (config.py:67), documented (:58,
-    "the façade's own per-subprocess git timeout"), and parsed (:195) --
-    but consumed by nothing. No adapter construction site threaded it
-    into `git_timeout=`, so an operator who set
-    `fleet.git_timeout_seconds:` in their profile got silence, not
-    effect -- the same "reads as configured, does nothing" class this
-    project exists to close. Wired through `cli._build_adapter`, its
-    ONE construction choke point (mirrors the `git_facts_root` wiring
-    tests immediately above, same shape, same reason to test at this
-    layer rather than only the `Namespace` level).
+    """PM rulings R10 and R11 (chunk 9 review, follow-up (c)):
+    `FleetConfig.git_timeout_seconds` was declared (config.py), documented,
+    and parsed -- but consumed by nothing. No adapter construction site
+    threaded it into `git_timeout=`, so an operator who set
+    `fleet.git_timeout_seconds:` in their profile got silence, not effect
+    (R10) -- the same "reads as configured, does nothing" class this
+    project exists to close. Wired through `cli._build_adapter`, its ONE
+    construction choke point (mirrors the `git_facts_root` wiring tests
+    immediately above, same shape, same reason to test at this layer
+    rather than only the `Namespace` level).
 
-    The default-preservation constraint (PM ruling R10) is the reason
-    the second test below exists at all: `FleetConfig.git_timeout_seconds`
-    has NO way to distinguish "the profile set it to exactly the
-    default" from "the profile never mentioned it" -- both resolve to
-    the identical float. `_build_adapter` therefore only forwards an
-    override when the resolved value differs from
-    `fleet_config.DEFAULT_GIT_TIMEOUT_SECONDS`, so "no key in the
-    profile" continues to omit `git_timeout` entirely, leaving each
-    adapter's OWN constructor default (portable's 30s, pinned by
+    R10's FIRST attempt forwarded an override only when the resolved
+    value DIFFERED from a package-default constant -- a VALUE
+    comparison. That reintroduced the exact defect R10 closes, in
+    miniature: an operator who wrote `git_timeout_seconds: 0.25`
+    (config.py's own documented default, so one of the likeliest values
+    someone being explicit would pick) was indistinguishable from one who
+    never set the key, and their deliberate 0.25 was silently discarded
+    in favor of the adapter's 30s default -- 120x what they asked for.
+    **R11, binding: the forwarding decision is based on whether the key
+    was PRESENT, never on what its value equals.** `FleetConfig.
+    git_timeout_seconds` is now `None` unless the profile sets a
+    genuinely usable (positive, non-bool) number -- a presence signal a
+    value comparison could never express, since "the default" and
+    "unset" would always share one number. `_build_adapter` is therefore
+    a direct passthrough of `cfg.git_timeout_seconds`: `None` (unset)
+    lands on each adapter's OWN default (portable's 30s, pinned by
     `test_observe.py`'s `test_collect_git_facts_uses_30s_default_when_
-    git_timeout_omitted`) untouched -- exactly as before this wiring
-    existed.
+    git_timeout_omitted`, unchanged by this wiring); ANY deliberately-set
+    number, including one equal to the package default, is forwarded
+    verbatim.
     """
 
     def _repo_with_profile(
@@ -794,15 +801,22 @@ class TestBuildAdapterGitTimeoutWiring:
         )
         return fleet_cli._build_adapter(args)
 
-    def test_profile_set_value_reaches_the_adapters_git_facts_call(
-        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        slug = self._repo_with_profile(
-            git_repo,
-            tmp_path,
-            monkeypatch,
-            "fleet:\n  enabled: true\n  git_timeout_seconds: 5.0\n",
-        )
+    def _captured_git_facts_kwargs(
+        self,
+        git_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        profile_body: str,
+    ) -> dict[str, object]:
+        """Build the adapter `_build_adapter` builds for `profile_body`,
+        spy on `collect_git_facts`, call `git_facts()`, and return
+        whatever keyword arguments actually reached it -- the same
+        spying shape `test_observe.py`'s own
+        `test_portable_adapter_git_facts_omits_override_by_default` uses,
+        so a check at this layer catches a future silent re-drop the way
+        that precedent already does for `git_facts_root`.
+        """
+        slug = self._repo_with_profile(git_repo, tmp_path, monkeypatch, profile_body)
         adapter = self._adapter_from_args(git_repo, slug)
 
         from scripts.fleet.adapter import portable as portable_module
@@ -815,45 +829,78 @@ class TestBuildAdapterGitTimeoutWiring:
             return real_collect(cwd, **kwargs)
 
         monkeypatch.setattr("scripts.fleet.adapter.portable.collect_git_facts", _spy_collect)
-
         adapter.git_facts()
+        return captured
 
+    def test_profile_set_value_reaches_the_adapters_git_facts_call(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured = self._captured_git_facts_kwargs(
+            git_repo, tmp_path, monkeypatch, "fleet:\n  enabled: true\n  git_timeout_seconds: 5.0\n"
+        )
         assert captured.get("git_timeout") == 5.0, (
             "a profile-set fleet.git_timeout_seconds did not reach the "
             f"adapter's own git_facts() call -- captured={captured!r}"
+        )
+
+    def test_explicit_value_equal_to_the_package_default_still_forwards(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R11's own regression case, quoted in the PM's ruling: an
+        operator who explicitly writes `git_timeout_seconds: 0.25` --
+        config.py's own documented default, and therefore one of the
+        likeliest values someone being explicit would pick -- must reach
+        the adapter as 0.25, not silently become the adapter's 30s
+        default because 0.25 happens to equal something a VALUE
+        comparison treats as "no override". Against R10's first
+        (value-comparison) attempt this returns 30.0 and fails; that is
+        the exact red the PM's ruling asked to see quoted back."""
+        captured = self._captured_git_facts_kwargs(
+            git_repo,
+            tmp_path,
+            monkeypatch,
+            "fleet:\n  enabled: true\n  git_timeout_seconds: 0.25\n",
+        )
+        assert captured.get("git_timeout") == 0.25, (
+            "an operator who explicitly set fleet.git_timeout_seconds: 0.25 "
+            f"did not get 0.25 at the adapter -- captured={captured!r} -- "
+            "a value comparison against the package default would silently "
+            "discard exactly this deliberate setting (PM ruling R11)"
+        )
+
+    def test_explicit_thirty_still_forwards_as_a_deliberate_setting(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mirror case: 30 happens to equal the portable adapter's OWN
+        constructor default, but an operator who wrote it explicitly in
+        their profile still made a deliberate choice, not silence -- it
+        must be forwarded as a real override (verifiable here only via
+        presence in `captured`, since the numeric VALUE the adapter ends
+        up using is identical either way)."""
+        captured = self._captured_git_facts_kwargs(
+            git_repo, tmp_path, monkeypatch, "fleet:\n  enabled: true\n  git_timeout_seconds: 30\n"
+        )
+        assert captured.get("git_timeout") == 30.0, (
+            "an operator who explicitly set fleet.git_timeout_seconds: 30 "
+            f"was not forwarded as a deliberate override -- captured={captured!r}"
         )
 
     def test_no_key_in_the_profile_omits_the_override_entirely(
         self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The default-preservation half: an operator who never set the
-        key must reach the adapter's OWN default (30s), not config.py's
-        0.25 NFR-2-adjacent figure -- `_build_adapter` must pass NOTHING,
-        not `git_timeout=0.25`, or every existing caller's behaviour
-        would silently change from 30s to 0.25s."""
-        slug = self._repo_with_profile(
+        key must reach the adapter's OWN default (30s) unchanged --
+        `_build_adapter` must pass NOTHING at all, not any concrete
+        number, or every existing caller's behaviour would silently
+        change."""
+        captured = self._captured_git_facts_kwargs(
             git_repo, tmp_path, monkeypatch, "fleet:\n  enabled: true\n"
         )
-        adapter = self._adapter_from_args(git_repo, slug)
-
-        from scripts.fleet.adapter import portable as portable_module
-
-        captured: dict[str, object] = {}
-        real_collect = portable_module.collect_git_facts
-
-        def _spy_collect(cwd, **kwargs):  # type: ignore[no-untyped-def]
-            captured.update(kwargs)
-            return real_collect(cwd, **kwargs)
-
-        monkeypatch.setattr("scripts.fleet.adapter.portable.collect_git_facts", _spy_collect)
-
-        adapter.git_facts()
-
         assert "git_timeout" not in captured, (
             "no fleet.git_timeout_seconds key was set in the profile, but "
             f"_build_adapter forwarded an override anyway -- captured={captured!r} "
-            "-- this would change every existing caller's default from the "
-            "adapter's own 30s to config.py's 0.25s"
+            "-- this would change every existing caller's default away from "
+            "the adapter's own 30s"
         )
 
 

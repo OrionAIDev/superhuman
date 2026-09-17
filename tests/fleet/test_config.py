@@ -133,7 +133,13 @@ def test_defaults_apply_when_only_enabled_is_set(tmp_path: Path) -> None:
     assert cfg.enabled is True
     assert cfg.manifest_dir is None
     assert cfg.observe_deadline_seconds == 5.0
-    assert cfg.git_timeout_seconds == 0.25
+    # `None`, not `0.25` (chunk 9, PM ruling R11): an absent key means "no
+    # value was given", never "the default value was given" -- the two
+    # were indistinguishable under the old float-with-a-default shape,
+    # which is exactly what let a deliberately-set 0.25 be silently
+    # discarded as though it were unset (see cli.py's
+    # `_resolved_git_timeout_override`).
+    assert cfg.git_timeout_seconds is None
     assert cfg.lock_timeout_seconds == 0.8
 
 
@@ -240,4 +246,10 @@ def test_non_positive_overrides_fall_back_to_defaults(tmp_path: Path) -> None:
 
     assert cfg.enabled is True
     assert cfg.observe_deadline_seconds == 5.0
-    assert cfg.git_timeout_seconds == 0.25
+    # `None` (chunk 9, PM ruling R11), not `0.25`: a malformed value (here
+    # a bool, explicitly excluded even though `isinstance(True, int)` is
+    # true in Python) is just as "nothing usable was deliberately given"
+    # as an absent key -- there is no concrete default left to fall back
+    # to for THIS field once presence, not value, is what a consumer
+    # needs to know.
+    assert cfg.git_timeout_seconds is None
