@@ -26,6 +26,7 @@ from typing import Any
 from uuid import uuid4
 
 from .. import superhuman_profile
+from . import config as fleet_config
 from . import doctor as fleet_doctor
 from . import hook_payload as fleet_hook_payload
 from . import hooks_install as fleet_hooks_install
@@ -331,6 +332,48 @@ def _default_fleet_dir(workspace: Path, slug: str) -> Path:
     return workspace / "docs" / "superhuman" / slug / "fleet"
 
 
+def _resolved_git_timeout_override(workspace: Path | str) -> float | None:
+    """Resolve the `git_timeout=` override `_build_adapter` should forward
+    to the adapter it constructs (chunk 9, PM ruling R10).
+
+    `FleetConfig.git_timeout_seconds` (config.py:67) was declared,
+    documented, and parsed but consumed by NOTHING -- no adapter
+    construction site threaded it into `git_timeout=`, so an operator who
+    set `fleet.git_timeout_seconds:` in their profile got silence, not
+    effect. This closes that gap at `_build_adapter`, its ONE
+    construction choke point.
+
+    The default-preservation half is the reason this compares against
+    `fleet_config.DEFAULT_GIT_TIMEOUT_SECONDS` rather than simply
+    returning `cfg.git_timeout_seconds` outright: `FleetConfig` has no
+    separate flag for "the profile never mentioned this key" -- an absent
+    key and an explicit `git_timeout_seconds: 0.25` resolve to the
+    IDENTICAL float. Forwarding that value unconditionally would change
+    every existing caller's adapter-construction default from 30s (each
+    adapter's own constructor default, pinned by
+    `test_observe.py::test_collect_git_facts_uses_30s_default_when_
+    git_timeout_omitted`) to 0.25s (config.py's NFR-2-adjacent figure,
+    sized for `observe.py`'s OWN bounded façade calls, not for a general
+    adapter default) -- exactly the regression PM ruling R10 forbids.
+    Returning `None` here when the two are equal lets every existing
+    caller fall through to each adapter's own default, unchanged.
+
+    Args:
+        workspace: the working tree to resolve fleet configuration for.
+
+    Returns:
+        float | None: the profile's `git_timeout_seconds` when it
+        differs from the package default; `None` otherwise (including
+        when fleet is disabled or unconfigured for `workspace`, since
+        `resolve_fleet_config` never raises and a disabled `FleetConfig`
+        carries the same field default).
+    """
+    cfg = fleet_config.resolve_fleet_config(workspace)
+    if cfg.git_timeout_seconds == fleet_config.DEFAULT_GIT_TIMEOUT_SECONDS:
+        return None
+    return cfg.git_timeout_seconds
+
+
 def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
     """Construct the `SessionAdapter` selected by `args.harness`.
 
@@ -348,6 +391,7 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             `adapter/subagent.py`'s module docstring), so the PM-minted
             dispatch id must be supplied explicitly.
     """
+    git_timeout = _resolved_git_timeout_override(args.workspace)
     if args.harness == "claude":
         sessions = None
         if args.sessions_json is not None:
@@ -363,6 +407,11 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             # not a getattr fallback that would hide the attribute's existence
             # from a reader.
             git_facts_root=args.git_facts_root,
+            # Chunk 9, PM ruling R10: `None` (the overwhelming common case --
+            # see `_resolved_git_timeout_override`) is this constructor's own
+            # default too, so this line is a byte-identical no-op for every
+            # caller who has not set `fleet.git_timeout_seconds`.
+            git_timeout=git_timeout,
         )
     if args.harness == "subagent":
         if not args.local_id:
@@ -382,6 +431,7 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             # templates/hooks/claude-code/subagent-start), so this was the
             # live path the defect was measured on, not a theoretical gap.
             git_facts_root=args.git_facts_root,
+            git_timeout=git_timeout,
         )
     return PortableAdapter(
         args.workspace,
@@ -390,6 +440,7 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
         # Same fix, same rationale, for this CLI's own default harness
         # (`--harness` defaults to "portable" — see `_add_harness_arguments`).
         git_facts_root=args.git_facts_root,
+        git_timeout=git_timeout,
     )
 
 

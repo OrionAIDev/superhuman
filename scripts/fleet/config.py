@@ -33,6 +33,17 @@ _DEFAULT_OBSERVE_DEADLINE_SECONDS = 5.0
 #: 1.75s, inside the 2.0s git-stage ceiling.
 _DEFAULT_GIT_TIMEOUT_SECONDS = 0.25
 
+#: Public alias of `_DEFAULT_GIT_TIMEOUT_SECONDS` (chunk 9, PM ruling R10).
+#: `cli._build_adapter` — the wiring this constant exists for — needs to
+#: tell "the profile never set `git_timeout_seconds`" apart from "the
+#: profile set it to exactly the default", since `FleetConfig` itself
+#: carries no separate flag for that (both resolve to the identical
+#: float). Comparing the resolved value against this NAMED, imported
+#: constant — rather than a duplicated literal `0.25` in `cli.py` — is
+#: what keeps that comparison from silently drifting out of sync if this
+#: default ever changes.
+DEFAULT_GIT_TIMEOUT_SECONDS = _DEFAULT_GIT_TIMEOUT_SECONDS
+
 #: Per-attempt manifest-lock timeout for the façade's own write calls.
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 0.8
 

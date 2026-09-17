@@ -924,3 +924,46 @@ class TestNonAsciiPathDecoding:
         )
         assert result.workspace == repo
         assert result.slug == "solo-project"
+
+
+# --- PM follow-up (a), chunk 9 review: `_resolved_git_timeout`'s DEFAULT
+# path (env var unset, or set but unparseable) had no test at all -- only
+# the three tests that SET it existed. Matches
+# `tests/fleet/test_observe.py:1186`'s precedent
+# (`test_collect_git_facts_uses_30s_default_when_git_timeout_omitted`) for
+# pinning an adapter's own timeout constant the same way. -----------------
+
+
+class TestResolvedGitTimeoutDefault:
+    """`_resolved_git_timeout` must resolve to the production NFR-2 bound
+    (0.25) whenever `SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS` is
+    unset, empty, or not parseable as a float -- this is new production
+    surface (an env var that can widen a deliberately-tight bound), and
+    without this test nothing would notice if its default silently
+    stopped being 0.25."""
+
+    def test_unset_resolves_to_the_production_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS", raising=False)
+        assert locate_module._resolved_git_timeout() == locate_module._GIT_TIMEOUT_SECONDS
+        assert locate_module._resolved_git_timeout() == 0.25
+
+    def test_empty_string_resolves_to_the_production_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS", "")
+        assert locate_module._resolved_git_timeout() == 0.25
+
+    def test_unparseable_value_resolves_to_the_production_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS", "abc")
+        assert locate_module._resolved_git_timeout() == 0.25
+
+    def test_a_valid_override_is_honored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The positive case, so a fallback bug that ALWAYS returns 0.25
+        (which would make the three tests above pass vacuously) cannot
+        hide behind them."""
+        monkeypatch.setenv("SUPERHUMAN_FLEET_LOCATE_GIT_TIMEOUT_SECONDS", "5.0")
+        assert locate_module._resolved_git_timeout() == 5.0
