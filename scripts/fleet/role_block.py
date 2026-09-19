@@ -67,6 +67,8 @@ from pathlib import Path
 from typing import Any
 
 from . import config as fleet_config
+from .bounded_journal import append_bounded_line
+from .core.errors import LockTimeoutError
 from .dispatch_predicate import leads_with_role_block
 from .path_safety import slug_is_safe
 
@@ -374,9 +376,12 @@ def record_role_gate_decision(
 ) -> None:
     """Append one D7.7 decision-log line for a `NON_ROLE`/`MISMATCH`/`UNMARKED` verdict.
 
-    Mirrors `observe.py`'s `_write_journal` bounded-tail-append primitive
+    Shares `observe.py`'s `_write_journal` bounded-tail-append primitive
     (D7.7: "using the journaling primitive `observe-failures.log` already
-    uses") — a JSON line per decision, a rolling bounded tail
+    uses") — both now call `bounded_journal.append_bounded_line` (Phase
+    3.3 preflight: the two were previously independent, un-locked
+    read-modify-write copies of the same shape, which lost rows under
+    parallel dispatch) — a JSON line per decision, a rolling bounded tail
     (`_ROLE_GATE_LOG_MAX_LINES`), and a silent no-op on any I/O failure. A
     failed write must never change the verdict already computed and acted
     on by the caller (TC-89) — this function's return value carries no
@@ -457,12 +462,14 @@ def record_role_gate_decision(
             },
             sort_keys=True,
         )
-        existing = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-        existing.append(line)
-        if len(existing) > _ROLE_GATE_LOG_MAX_LINES:
-            existing = existing[-_ROLE_GATE_LOG_MAX_LINES:]
-        path.write_text("\n".join(existing) + "\n", encoding="utf-8")
-    except OSError:
+        # Phase 3.3 preflight: delegates to the shared, lock-protected
+        # primitive (see `bounded_journal`'s module docstring) rather than
+        # this module's own read-modify-write -- without a lock, two hook
+        # processes racing to append here under parallel dispatch lose
+        # rows: one writer's whole-file rewrite silently discards the
+        # other's already-durable line.
+        append_bounded_line(path, line, max_lines=_ROLE_GATE_LOG_MAX_LINES)
+    except (OSError, LockTimeoutError):
         # Loudness tier 2 (mirrors observe.py's identical posture): the
         # fleet directory unwritable is often the very failure that would
         # have blocked the primary write too; there is no primary write

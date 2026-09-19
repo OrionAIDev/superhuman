@@ -38,6 +38,7 @@ from typing import Any, Callable, TypeVar
 from . import config as fleet_config
 from . import project as fleet_project
 from .adapter.base import SessionAdapter
+from .bounded_journal import append_bounded_line
 from .path_safety import slug_is_safe
 from .core.errors import LockTimeoutError, OwnershipError, SessionIdentityUnresolved, ValidationError
 from .handoff import emit as handoff_emit_impl
@@ -402,7 +403,13 @@ def _write_journal(
     failure — the fleet directory unwritable, which is often the very
     failure that caused the primary write to fail too — this emits exactly
     one `fleet observe:`-prefixed stderr line and gives up (DESIGN's
-    Loudness tier 2), never retried, never a second line.
+    Loudness tier 2), never retried, never a second line. Phase 3.3
+    preflight: the read-modify-write bounded-tail append is delegated to
+    `bounded_journal.append_bounded_line`, which holds an OS-native
+    advisory lock for the whole critical section -- without it, two hook
+    processes racing to append here lose rows under parallel dispatch (one
+    writer's whole-file rewrite silently discards the other's
+    already-durable line).
     """
     line = json.dumps(
         {
@@ -418,14 +425,8 @@ def _write_journal(
     try:
         fleet_dir.mkdir(parents=True, exist_ok=True)
         path = _journal_path(fleet_dir)
-        existing: list[str] = []
-        if path.is_file():
-            existing = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln]
-        existing.append(line)
-        if len(existing) > _JOURNAL_MAX_LINES:
-            existing = existing[-_JOURNAL_MAX_LINES:]
-        path.write_text("\n".join(existing) + "\n", encoding="utf-8")
-    except OSError as exc:
+        append_bounded_line(path, line, max_lines=_JOURNAL_MAX_LINES)
+    except (OSError, LockTimeoutError) as exc:
         print(
             f"fleet observe: {event} failed ({error_class}) and the failure "
             f"journal itself could not be written: {exc}",
