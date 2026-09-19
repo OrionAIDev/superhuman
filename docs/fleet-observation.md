@@ -245,6 +245,21 @@ Like every other check in this project, a fault in the gate's own machinery (an 
 dispatch through, log nothing" rather than becoming a basis for denial — a missing directory must
 never deny every dispatch on the machine.
 
+**Which `roles/` a verdict is judged against.** The primary comparison above always runs against
+the checkout the hook itself was installed from — fixed once, at install time. That is not
+necessarily the checkout the session is actually working in: a worktree on another branch, or a
+branch that edits `roles/pm.md`, is this estate's normal working mode, so a dispatch that is
+verbatim against the session's *own* copy could otherwise still earn a would-deny verdict here. To
+close that gap, a `MISMATCH`/`UNMARKED` verdict gets one more chance: if the session's own working
+tree resolves to a project that is itself a distinct superhuman checkout (its own `roles/`, its own
+`SKILL.md` naming `superhuman`) with a `roles/` different from the hook's, the check re-runs against
+*that* `roles/` before the deny goes out. The rule is **widen-only**: a second `roles/` can turn a
+pending deny into a pass, but can never turn a pass into a deny, and a fault in this second check
+(an unreadable or empty session `roles/`) lets the dispatch through exactly like any other fault
+above — the gate never denies on a check it could not actually complete. When both checks deny, the
+deny reason and the logged decision name the session's own role file, not the hook's, since that is
+the copy the session can actually open and fix.
+
 ## The D4 boundary: the portable floor and the harness ceiling
 
 Superhuman ships harness-agnostic; hooks are inherently harness-specific. This project drew the

@@ -33,6 +33,35 @@ project. **The locator is called ONLY when the verdict could deny or is
 dispatch, and a `FAULT` verdict, never pay for it and never reach the
 locator.
 
+**Two `roles/` directories (G6/B4, DESIGN.md D7 "Decisions locked",
+2026-09-19T18:30Z).** The primary check above always runs against
+`roles_dir` — the checkout THIS HOOK ITSELF runs from, fixed once at
+install time (`--roles-dir`, default `_SKILL_ROOT / "roles"`). That is not
+necessarily the checkout the SESSION is actually working from: a worktree
+on another branch, or a branch that edits `roles/pm.md`, is this estate's
+normal working mode, so a dispatch that is verbatim against the session's
+own copy can still earn a would-deny verdict here. When the primary
+verdict is `MISMATCH`/`UNMARKED` and the locator-resolved `workspace` is
+ITSELF a distinct superhuman checkout (`workspace/roles/` a directory,
+`workspace/SKILL.md` present with frontmatter `name: superhuman`, and its
+`roles/` resolving to a different directory than `roles_dir`), `run`
+re-runs `check_role_block` against `workspace/roles/` before committing to
+the deny. The locked invariant: **a second `roles/` can only WIDEN a pass,
+never cause a deny.** `ROLE`/`NON_ROLE` from the second check always
+overrides the pending deny (print nothing, log per the verdict); a `FAULT`
+there lets the dispatch through too — the gate cannot certify a deny it
+could not actually verify against the copy the session reads (NFR-9
+extends to this seam); only `MISMATCH`/`UNMARKED` on BOTH checks lets the
+original deny stand, and then the deny reason and the logged fields name
+the SESSION's own role file (the copy it actually reads), not the hook's.
+`workspace` here is the locator's resolved value, which may come back from
+an agent-writable cache file (`_cached_locate`'s own scratchpad cache)
+rather than a fresh git call — acceptable specifically because this seam
+is widen-only: an agent that tampered with the cache to redirect
+`workspace` could only ever manufacture a PASS it would already be
+entitled to by pasting the real role file verbatim, never a deny it would
+not otherwise have earned.
+
 **Decision log (D7.7).** For an in-scope `NON_ROLE`/`MISMATCH`/`UNMARKED`
 verdict, one line is appended to the project's `role-gate.jsonl` via
 `scripts.fleet.role_block.record_role_gate_decision` — never for `ROLE`
@@ -51,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -81,6 +111,23 @@ _VERDICTS_NEEDING_SCOPE = (Verdict.NON_ROLE, Verdict.MISMATCH, Verdict.UNMARKED)
 _DENYING_VERDICTS = (Verdict.MISMATCH, Verdict.UNMARKED)
 
 _LOCATOR_CACHE_FILENAME_PREFIX = "role-gate-locator-"
+
+#: `SKILL.md`'s own leading frontmatter block. Mirrors
+#: `scripts/fleet/role_block.py`'s `_FRONTMATTER_RE`/`_NAME_LINE_RE`
+#: byte-for-byte (not imported — those are that module's private members,
+#: and duplicating two small regexes here is cheaper and safer than
+#: widening role_block.py's public surface for a single caller; same
+#: rationale role_block.py itself gives for not importing
+#: dispatch_predicate.py's identical pair).
+_SKILL_FRONTMATTER_RE = re.compile(
+    r"\A---[ \t]*\r?\n(?P<body>.*?)\r?\n---[ \t]*(?:\r?\n|\Z)",
+    re.DOTALL,
+)
+_SKILL_NAME_LINE_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
+
+#: The `name:` value `SKILL.md` must carry for `_is_superhuman_checkout` to
+#: treat a workspace as a distinct superhuman checkout (G6/B4).
+_SUPERHUMAN_SKILL_NAME = "superhuman"
 
 
 class _CachedLocation(NamedTuple):
@@ -167,6 +214,65 @@ def _cached_locate(
     except OSError:
         pass  # best-effort cache write only
     return result
+
+
+def _is_superhuman_checkout(workspace: Path) -> bool:
+    """Return whether `workspace` is itself a distinct superhuman skill checkout.
+
+    G6/B4 (2026-09-19T18:30Z): the session's own working tree may be a
+    DIFFERENT superhuman copy than the one the hook itself runs from (a
+    worktree on another branch is this estate's normal working mode) —
+    this predicate decides when that is true, so `run` knows a second,
+    session-scoped `roles/` comparison is even meaningful. Never raises:
+    every failure (missing/unreadable `SKILL.md`, no frontmatter, no
+    `name:` line) resolves to `False`.
+
+    Args:
+        workspace: the locator-resolved project workspace to test.
+
+    Returns:
+        bool: `True` iff `workspace/roles/` is a directory AND
+        `workspace/SKILL.md` exists with frontmatter naming
+        `name: superhuman`.
+    """
+    roles_dir = workspace / "roles"
+    skill_md = workspace / "SKILL.md"
+    try:
+        if not roles_dir.is_dir():
+            return False
+        if not skill_md.is_file():
+            return False
+        text = skill_md.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        # `ValueError` covers `UnicodeDecodeError` on a non-UTF-8 file.
+        return False
+    match = _SKILL_FRONTMATTER_RE.match(text)
+    if match is None:
+        return False
+    name_match = _SKILL_NAME_LINE_RE.search(match.group("body"))
+    return name_match is not None and name_match.group(1) == _SUPERHUMAN_SKILL_NAME
+
+
+def _resolved_paths_differ(first: Path, second: Path) -> bool:
+    """Return whether `first` and `second` resolve to different filesystem paths.
+
+    Never raises: an `OSError` from either `.resolve()` call is treated as
+    "differ" — the safer direction here is to attempt the second
+    `check_role_block` call rather than silently skip it, since that
+    call's own verdicts can only widen a pending deny into a pass (see
+    `_is_superhuman_checkout`'s caller), never cause one.
+
+    Args:
+        first: the hook checkout's `roles/` directory.
+        second: the session workspace's own `roles/` directory.
+
+    Returns:
+        bool: `True` if the two do not resolve to the same path.
+    """
+    try:
+        return first.resolve() != second.resolve()
+    except OSError:
+        return True
 
 
 def _build_deny_reason(result: Any, roles_dir: Path) -> str:
@@ -332,16 +438,59 @@ def run(
         return
 
     assert result.verdict in _DENYING_VERDICTS  # MISMATCH, UNMARKED
-    reason = _build_deny_reason(result, roles_dir)
+
+    # G6/B4 (2026-09-19T18:30Z): one more chance against the SESSION's own
+    # roles/, when `workspace` (see the module docstring on its
+    # agent-writable-cache provenance and why that is safe here) is itself
+    # a distinct superhuman checkout differing from the hook's own
+    # `roles_dir`. Widen-only: ROLE/NON_ROLE below always overrides this
+    # pending deny; only MISMATCH/UNMARKED on both checks lets it stand.
+    effective_result = result
+    effective_roles_dir = roles_dir
+    session_roles_dir = workspace / "roles"
+    if _is_superhuman_checkout(workspace) and _resolved_paths_differ(
+        roles_dir, session_roles_dir
+    ):
+        second_result = check_role_block(prompt, session_roles_dir)
+        if second_result.verdict == Verdict.ROLE:
+            # Widened to a pass: print nothing, log nothing (D7.7 — a ROLE
+            # verdict is never logged).
+            return
+        if second_result.verdict == Verdict.NON_ROLE:
+            record_role_gate_decision(
+                workspace,
+                slug,
+                session_id=session_id,
+                verdict=Verdict.NON_ROLE,
+                role=None,
+                subagent_type=subagent_type,
+                mismatch_line_number=None,
+            )
+            return
+        if second_result.verdict == Verdict.FAULT:
+            # The gate cannot certify the pending deny would survive a
+            # check it could not actually run against the session's own
+            # copy (NFR-9 extends to this seam) — let the dispatch
+            # through, log nothing (a fault is never a decision).
+            return
+        assert second_result.verdict in _DENYING_VERDICTS  # MISMATCH, UNMARKED
+        # Both copies deny: the original deny stands, but D7.5 item 4 —
+        # the reason (and the logged fields) name the copy the SESSION
+        # itself reads, not the hook checkout's, so the file this names is
+        # always one the session can actually open and fix.
+        effective_result = second_result
+        effective_roles_dir = session_roles_dir
+
+    reason = _build_deny_reason(effective_result, effective_roles_dir)
     _print_deny(reason)
     record_role_gate_decision(
         workspace,
         slug,
         session_id=session_id,
-        verdict=result.verdict,
-        role=result.role,
+        verdict=effective_result.verdict,
+        role=effective_result.role,
         subagent_type=subagent_type,
-        mismatch_line_number=result.mismatch_line_number,
+        mismatch_line_number=effective_result.mismatch_line_number,
     )
 
 

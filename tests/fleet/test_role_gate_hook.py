@@ -641,6 +641,283 @@ class TestRoleGateAdapterFaultsDirect:
     # test_unreadable_role_file_is_fault_not_mismatch`.
 
 
+# --- TC-112: G6/B4 second roles/ check on the deny path (widen-only) -------------------
+
+
+#: A SYNTHETIC session-copy `roles/pm.md` for TC-112 -- deliberately
+#: different from the hook checkout's real `roles/pm.md`, never real
+#: project content (NFR-8).
+_SESSION_PM_CONTENT = (
+    "---\n"
+    "name: pm\n"
+    "tier: standard\n"
+    "---\n"
+    "\n"
+    "# PM role (session checkout copy)\n"
+    "\n"
+    "This is a SYNTHETIC session-copy pm role file for TC-112 -- deliberately\n"
+    "different from the hook checkout's real roles/pm.md, and never real\n"
+    "project content (NFR-8).\n"
+)
+
+
+def _write_session_superhuman_checkout(
+    root: Path, *, slug: str, pm_content: str = _SESSION_PM_CONTENT
+) -> None:
+    """Make `root` look like a DISTINCT superhuman skill checkout the
+    locator can resolve to: `SKILL.md` naming `superhuman`, a `roles/pm.md`
+    (synthetic, differing from the real skill's), plus the ordinary
+    `docs/superhuman/<slug>/SUPERHUMAN.md` project marker `_write_project`
+    already builds for every other fixture in this file.
+
+    Args:
+        root: the git repo root to build the checkout under.
+        slug: the project slug `_write_project` registers.
+        pm_content: the session copy's `roles/pm.md` content.
+    """
+    (root / "SKILL.md").write_text(
+        "---\nname: superhuman\ndescription: TC-112 test fixture\n---\n\n# Superhuman\n",
+        encoding="utf-8",
+    )
+    roles_dir = root / "roles"
+    roles_dir.mkdir(exist_ok=True)
+    (roles_dir / "pm.md").write_text(pm_content, encoding="utf-8")
+    _write_project(root, slug)
+
+
+@pytest.fixture
+def session_checkout_project(git_repo: Path, tmp_path: Path) -> tuple[Path, str, Path]:
+    """A resolvable workspace that is ITSELF a distinct superhuman checkout
+    (its own `roles/pm.md`, differing from the hook checkout's) — the
+    G6/B4 scenario: a worktree on another branch than the one the hook
+    itself runs from, this estate's normal working mode."""
+    slug = "session-checkout-project"
+    profile = tmp_path / "profile.yaml"
+    _write_profile(profile)
+    _write_session_superhuman_checkout(git_repo, slug=slug)
+    return git_repo, slug, profile
+
+
+@pytest.mark.skipif(
+    _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+)
+class TestRoleGateSecondRolesDirCheck:
+    """TC-112 (G6/B4, DESIGN.md D7 'Decisions locked' 2026-09-19T18:30Z): a
+    would-deny verdict against the HOOK checkout's roles/ gets one more
+    chance against the SESSION's own roles/, when the located workspace is
+    itself a distinct superhuman checkout. Widen-only: the second check can
+    turn a pending deny into a pass, but never the reverse."""
+
+    def test_session_copy_verbatim_dispatch_is_no_longer_denied(
+        self, skill_root: Path, session_checkout_project: tuple[Path, str, Path]
+    ) -> None:
+        """RED against the pre-B4 code: the hook checkout's real
+        `roles/pm.md` differs from this session copy, so `check_role_block`
+        against `skill_root/roles` alone yields MISMATCH and denies — even
+        though this prompt is the FULL, UNEDITED content of the copy the
+        session itself actually reads. After the fix: empty stdout."""
+        workspace, slug, profile = session_checkout_project
+        payload = _pre_tool_use_payload(
+            prompt=_SESSION_PM_CONTENT, cwd=workspace, subagent_type="pm"
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert result.stdout == "", (
+            "a dispatch verbatim against the SESSION's own roles/pm.md was still denied "
+            f"(second check did not widen the pass): {result.stdout!r}"
+        )
+        # A widened ROLE verdict is never logged (D7.7) -- confirms this
+        # really was widened to ROLE, not silently swallowed some other way.
+        assert _role_gate_log_text(workspace, slug) == ""
+
+    def test_prompt_matching_neither_copy_still_denies(
+        self, skill_root: Path, session_checkout_project: tuple[Path, str, Path]
+    ) -> None:
+        """A prompt that diverges from BOTH the hook's and the session's
+        `roles/pm.md` must still deny — the second check only ever widens
+        a pass, it never manufactures one for a genuinely edited body."""
+        workspace, slug, profile = session_checkout_project
+        edited = _SESSION_PM_CONTENT.replace("tier: standard", "tier: cheap", 1)
+        payload = _pre_tool_use_payload(prompt=edited, cwd=workspace, subagent_type="pm")
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        # D7.5 item 4: the reason should point at the copy the session
+        # itself reads, not the hook checkout's.
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert str(workspace / "roles" / "pm.md") in reason
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "MISMATCH"' in log
+
+    def test_workspace_without_skill_md_denies_unchanged(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """`enabled_project` is an ordinary project workspace with no
+        `SKILL.md` at its root at all — not a superhuman checkout, so no
+        second check ever runs; today's single-check behaviour (deny)
+        stands unchanged."""
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt="You are the Developer for chunk 7a. Implement the role gate...\n",
+            cwd=workspace,
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_workspace_with_non_superhuman_skill_md_denies_unchanged(
+        self, skill_root: Path, git_repo: Path, tmp_path: Path
+    ) -> None:
+        """A `SKILL.md` naming something OTHER than `superhuman` does not
+        count as a superhuman checkout — no second check, deny stands."""
+        slug = "not-superhuman-project"
+        profile = tmp_path / "profile.yaml"
+        _write_profile(profile)
+        (git_repo / "SKILL.md").write_text(
+            "---\nname: some-other-skill\n---\n\n# Not superhuman\n", encoding="utf-8"
+        )
+        roles_dir = git_repo / "roles"
+        roles_dir.mkdir()
+        (roles_dir / "pm.md").write_text(_SESSION_PM_CONTENT, encoding="utf-8")
+        _write_project(git_repo, slug)
+
+        payload = _pre_tool_use_payload(
+            prompt=_SESSION_PM_CONTENT, cwd=git_repo, subagent_type="pm"
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=git_repo,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_second_check_fault_gives_empty_stdout(
+        self, skill_root: Path, git_repo: Path, tmp_path: Path
+    ) -> None:
+        """The workspace IS a superhuman checkout, but its `roles/` is
+        empty — the second check FAULTs (D7.5's precondition), so the
+        original pending deny is suppressed entirely (NFR-9): the gate
+        cannot certify the deny would survive a check it could not run."""
+        slug = "empty-session-roles-project"
+        profile = tmp_path / "profile.yaml"
+        _write_profile(profile)
+        (git_repo / "SKILL.md").write_text(
+            "---\nname: superhuman\n---\n\n# Superhuman\n", encoding="utf-8"
+        )
+        (git_repo / "roles").mkdir()  # empty -- no *.md files at all
+        _write_project(git_repo, slug)
+
+        payload = _pre_tool_use_payload(
+            prompt="You are the Developer for chunk 7a...\n", cwd=git_repo
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=git_repo,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert _role_gate_log_text(git_repo, slug) == ""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-native interpreter invocation")
+class TestRoleGateSecondCheckSkippedWhenSameDirectory:
+    """TC-112 companion: when the located workspace's own `roles/` resolves
+    to the SAME directory as the hook checkout's (`--roles-dir`), no second
+    check happens at all — observable as the deny behaving byte-identically
+    to the pre-fix single-check path (same reason, same logged verdict),
+    since `_resolved_paths_differ` is the seam that decides whether the
+    second check even runs. Invokes the adapter directly (mirrors
+    `TestRoleGateAdapterFaultsDirect`'s precedent) so `--roles-dir` can be
+    pointed explicitly at the workspace's own `roles/`."""
+
+    def _run_adapter(
+        self,
+        *,
+        skill_root: Path,
+        stdin_text: str,
+        roles_dir: Path,
+        cwd: Path,
+        profile_path: Path,
+    ) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["SUPERHUMAN_PROFILE"] = str(profile_path)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(_adapter_script(skill_root)),
+                "--hook-payload",
+                "-",
+                "--roles-dir",
+                str(roles_dir),
+            ],
+            input=stdin_text,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+
+    def test_same_directory_skips_second_check(
+        self, skill_root: Path, git_repo: Path, tmp_path: Path
+    ) -> None:
+        slug = "same-roles-dir-project"
+        profile = tmp_path / "profile.yaml"
+        _write_profile(profile)
+        _write_session_superhuman_checkout(git_repo, slug=slug)
+
+        edited = _SESSION_PM_CONTENT.replace("tier: standard", "tier: cheap", 1)
+        payload = _pre_tool_use_payload(prompt=edited, cwd=git_repo, subagent_type="pm")
+
+        # `--roles-dir` points at the WORKSPACE's own roles/ -- identical
+        # to `workspace/roles` (the would-be session_roles_dir), so
+        # `_resolved_paths_differ` is False and the second check never
+        # runs; the deny reason and log must be byte-identical to a plain
+        # single-check MISMATCH.
+        result = self._run_adapter(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            roles_dir=git_repo / "roles",
+            cwd=git_repo,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        decision = json.loads(result.stdout)
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert str(git_repo / "roles" / "pm.md") in reason
+        log = _role_gate_log_text(git_repo, slug)
+        assert '"verdict": "MISMATCH"' in log
+
+
 # --- TC-91: cross-chunk interaction with chunk 7's SubagentStart filter ---------------
 
 
