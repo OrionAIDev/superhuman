@@ -86,6 +86,28 @@ class TestCheckRoleBlockRole:
         )
         assert check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir).verdict == Verdict.ROLE
 
+    def test_bom_on_role_file_but_not_prompt_still_role(self, roles_dir: Path) -> None:
+        """TC-119 (Phase 3.3 preflight item 5, direction A): the role FILE
+        on disk carries a leading BOM (a real-world shape -- some Windows
+        editors save `.md` files with one), the PROMPT does not. Both
+        sides must be normalised identically, so this must still yield
+        ROLE, not a false MISMATCH."""
+        (roles_dir / "developer.md").write_text(
+            "﻿" + _DEVELOPER_ROLE_CONTENT, encoding="utf-8"
+        )
+        result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
+        assert result.verdict == Verdict.ROLE
+
+    def test_bom_on_prompt_but_not_role_file_still_role(self, roles_dir: Path) -> None:
+        """TC-119 (Phase 3.3 preflight item 5, direction B): the PROMPT
+        carries a leading BOM, the role file does not. This direction
+        already passed before the fix (the prompt side was always
+        BOM-stripped) -- kept as a companion regression test so both
+        directions have explicit, permanent coverage."""
+        prompt = "﻿" + _DEVELOPER_ROLE_CONTENT
+        result = check_role_block(prompt, roles_dir)
+        assert result.verdict == Verdict.ROLE
+
 
 class TestCheckRoleBlockMismatch:
     """TC-78: frontmatter plus an edited body yields MISMATCH with the

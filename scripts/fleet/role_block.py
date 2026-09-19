@@ -40,11 +40,14 @@ the fail-closed CLI verb (unlike the hook, which must fail *soft* on its
 own infrastructure per NFR-9) exits non-zero for it, the same as MISMATCH/
 UNMARKED, since it cannot certify compliance either.
 
-**Normalisation (D7.3, exact).** Strip a leading BOM, strip leading
-whitespace, and normalise CRLF (and lone CR) to LF — on the prompt. The
-role file's content is normalised (CRLF -> LF) and has trailing whitespace
-stripped. The (normalised) prompt must then *start with* the (normalised)
-role file's content, immediately followed by end-of-text or a newline.
+**Normalisation (D7.3, exact; BOM stripping symmetrised across both sides
+at the Phase 3.3 preflight — item 5).** Both the prompt and the role
+file's content have a leading BOM and leading whitespace stripped, and
+CRLF (and lone CR) normalised to LF. The role file's content additionally
+has trailing whitespace stripped (the prompt's does not — trailing
+content after the role block, e.g. a task brief, matters to the caller).
+The (normalised) prompt must then *start with* the (normalised) role
+file's content, immediately followed by end-of-text or a newline.
 
 **Never raises.** `check_role_block` degrades to `Verdict.FAULT` (never an
 exception) on any unexpected failure — this is this module's own,
@@ -256,7 +259,8 @@ def _first_differing_line(prompt_norm: str, file_norm: str) -> tuple[int, str, s
     Args:
         prompt_norm: the normalised prompt (BOM/leading-whitespace
             stripped, CRLF normalised — NOT trailing-whitespace-stripped).
-        file_norm: the normalised, trailing-whitespace-stripped role file
+        file_norm: the normalised, BOM/leading-whitespace-stripped,
+            trailing-whitespace-stripped role file
             content.
 
     Returns:
@@ -326,7 +330,13 @@ def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
             return RoleCheckResult(verdict=Verdict.FAULT, role=role_name, role_file=role_file)
 
         prompt_norm = _normalize_newlines(_strip_bom_and_leading_ws(prompt))
-        file_norm = _normalize_newlines(file_content).rstrip()
+        # Phase 3.3 preflight item 5: the role file's content used to skip
+        # `_strip_bom_and_leading_ws` entirely, so a BOM present on one
+        # side only (most likely the role file, saved by an editor that
+        # adds one) produced a false MISMATCH even though the two texts
+        # were otherwise identical. Both sides now go through the exact
+        # same BOM/leading-whitespace stripping before comparison.
+        file_norm = _normalize_newlines(_strip_bom_and_leading_ws(file_content)).rstrip()
 
         matches = prompt_norm.startswith(file_norm) and (
             len(prompt_norm) == len(file_norm) or prompt_norm[len(file_norm)] == "\n"
