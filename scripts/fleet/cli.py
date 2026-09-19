@@ -1193,10 +1193,16 @@ def _cmd_hooks_uninstall(args: argparse.Namespace) -> int:
         args: parsed CLI arguments.
 
     Returns:
-        int: always `0` -- removing an already-absent entry is a no-op,
-        not an error.
+        int: `0` on success -- removing an already-absent entry is a
+        no-op, not an error; `1` if `settings_path` exists and is not
+        valid JSON (Phase 3.3 preflight item 4 -- named in the printed
+        error rather than a raw traceback).
     """
-    result = fleet_hooks_install.uninstall(args.settings_path)
+    try:
+        result = fleet_hooks_install.uninstall(args.settings_path)
+    except fleet_hooks_install.HooksInstallError as exc:
+        print(f"fleet hooks uninstall: {exc}", file=sys.stderr)
+        return 1
     print("uninstalled" if result.changed else "already not installed")
     return 0
 
@@ -1212,9 +1218,16 @@ def _cmd_hooks_status(args: argparse.Namespace) -> int:
         args: parsed CLI arguments.
 
     Returns:
-        int: always `0` -- a status report has nothing to reject.
+        int: `0` on success -- a status report otherwise has nothing to
+        reject; `1` if `settings_path` exists and is not valid JSON
+        (Phase 3.3 preflight item 4 -- named in the printed error rather
+        than a raw traceback).
     """
-    result = fleet_hooks_install.status(args.settings_path)
+    try:
+        result = fleet_hooks_install.status(args.settings_path)
+    except fleet_hooks_install.HooksInstallError as exc:
+        print(f"fleet hooks status: {exc}", file=sys.stderr)
+        return 1
     for entry in result.entries:
         line = f"{entry.hook_event}/{entry.matcher}: {'installed' if entry.present else 'NOT installed'}"
         if entry.present and not entry.command_path_exists:

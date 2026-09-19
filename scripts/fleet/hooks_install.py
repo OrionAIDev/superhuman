@@ -577,6 +577,76 @@ def _diff(before_text: str, after_text: str, settings_path: Path) -> str:
     )
 
 
+def _read_settings_text(settings_path: Path) -> str:
+    """Read `settings_path` as text, tolerating and discarding a leading BOM.
+
+    Phase 3.3 preflight item 4: the original code read with plain
+    `encoding="utf-8"`, which does NOT strip a BOM -- a BOM-prefixed but
+    otherwise valid settings.json then failed `json.loads` with a raw,
+    uncaught `json.JSONDecodeError` (`\\ufeff` is not valid at the start of
+    a JSON document). `"utf-8-sig"` strips a leading BOM if present and is
+    byte-identical to plain `"utf-8"` decoding when one is absent, so this
+    is a strict improvement with no behavior change for the common
+    no-BOM case. https://docs.python.org/3/library/codecs.html#encodings-and-unicode
+    ("utf-8-sig": "On encoding the utf-8-sig codec will write 0xef, 0xbb,
+    0xbf as the first three bytes... On decoding, an optional UTF-8
+    encoded BOM at the start of the data will be skipped").
+
+    Note on the BOM's fate: this installer's own writes (`_dump_settings`)
+    have never emitted a BOM, and still don't -- so a BOM-prefixed file
+    that this installer WRITES to comes back out with the BOM gone, not
+    preserved. This is safe: JSON content is BOM-agnostic, and every
+    consumer of this file (this module, the Claude Code harness) reads
+    UTF-8 either way.
+
+    Args:
+        settings_path: the settings file to read.
+
+    Returns:
+        str: the file's text content with any leading BOM stripped, or
+        `""` if the file does not exist.
+    """
+    if not settings_path.is_file():
+        return ""
+    return settings_path.read_text(encoding="utf-8-sig")
+
+
+def _parse_settings(settings_path: Path, text: str) -> dict[str, Any]:
+    """Parse `text` (already BOM-stripped) as the settings JSON document.
+
+    Phase 3.3 preflight item 4: malformed JSON used to reach a bare
+    `json.loads` call with nothing catching `json.JSONDecodeError`, so an
+    operator with a hand-edited, syntactically broken settings.json got a
+    raw Python traceback instead of a one-line, file-naming error -- and
+    every caller here runs this BEFORE any write, so a malformed file
+    still causes nothing to be written (install()/uninstall()/status() all
+    call this before touching `_atomic_write`).
+
+    Args:
+        settings_path: used only to name the file in an error message.
+        text: the file's text content (already BOM-stripped via
+            `_read_settings_text`), or `""`.
+
+    Returns:
+        dict[str, Any]: the parsed document, or `{}` for empty/absent
+        content.
+
+    Raises:
+        HooksInstallError: `text` is non-empty and not valid JSON, or its
+            top level is not a JSON object -- never a raw
+            `json.JSONDecodeError` traceback.
+    """
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HooksInstallError(f"{settings_path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HooksInstallError(f"{settings_path} does not contain a JSON object at its top level")
+    return data
+
+
 def install(
     settings_path: Path = DEFAULT_SETTINGS_PATH,
     *,
@@ -606,13 +676,17 @@ def install(
     Raises:
         SkillRootRefusedError: auto-resolution landed inside a linked
             worktree.
-        HooksInstallError: git resolution failed outright.
+        SkillRootInsideGitDirError: auto-resolution landed inside a `.git`
+            directory.
+        HooksInstallError: git resolution failed outright, or
+            `settings_path` exists and is not valid JSON (item 4: named in
+            the error, nothing written).
         OSError: the write failed.
     """
     root, pinned = resolve_skill_root(skill_root)
 
-    before_text = settings_path.read_text(encoding="utf-8") if settings_path.is_file() else ""
-    data: dict[str, Any] = json.loads(before_text) if before_text else {}
+    before_text = _read_settings_text(settings_path)
+    data = _parse_settings(settings_path, before_text)
     hooks = data.setdefault("hooks", {})
     _remove_owned(hooks)
     _add_owned(hooks, root)
@@ -642,13 +716,15 @@ def uninstall(settings_path: Path = DEFAULT_SETTINGS_PATH) -> UninstallResult:
         The `UninstallResult` describing what was written.
 
     Raises:
+        HooksInstallError: `settings_path` exists and is not valid JSON
+            (item 4: named in the error, nothing written).
         OSError: the write failed.
     """
     if not settings_path.is_file():
         return UninstallResult(changed=False, diff="")
 
-    before_text = settings_path.read_text(encoding="utf-8")
-    data: dict[str, Any] = json.loads(before_text) if before_text else {}
+    before_text = _read_settings_text(settings_path)
+    data = _parse_settings(settings_path, before_text)
     hooks = data.get("hooks")
     if isinstance(hooks, dict):
         _remove_owned(hooks)
@@ -702,10 +778,12 @@ def status(settings_path: Path = DEFAULT_SETTINGS_PATH) -> InstallStatus:
     Returns:
         The `InstallStatus`: `installed=True` iff every expected entry is
         present.
+
+    Raises:
+        HooksInstallError: `settings_path` exists and is not valid JSON
+            (item 4: named in the error).
     """
-    data: dict[str, Any] = (
-        json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {}
-    )
+    data = _parse_settings(settings_path, _read_settings_text(settings_path))
     hooks = data.get("hooks", {})
 
     entries = []

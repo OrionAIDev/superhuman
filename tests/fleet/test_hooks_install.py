@@ -51,7 +51,7 @@ from typing import Any
 
 import pytest
 
-from scripts.fleet import hooks_install
+from scripts.fleet import cli, hooks_install
 
 _REAL_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
@@ -709,6 +709,89 @@ class TestSkillRootInsideGitDir:
     def test_flags_a_dot_git_modules_path(self) -> None:
         """`_is_inside_dot_git` on its own: the exact submodule shape."""
         assert hooks_install._is_inside_dot_git(Path("C:/example/outer/.git/modules/sub")) is True
+
+
+class TestBomAndMalformedSettings:
+    """Phase 3.3 preflight item 4: `hooks install` (and, fixed alongside
+    it, `uninstall`/`status`) threw a raw traceback on a BOM-prefixed or
+    malformed settings.json instead of a clean, file-naming error."""
+
+    def test_bom_prefixed_valid_json_is_read_correctly(self, tmp_path: Path) -> None:
+        """TC-117: a settings.json carrying a leading UTF-8 BOM, but
+        otherwise valid JSON, is read correctly -- install() must not
+        raise, and the pre-existing foreign entries must survive. The BOM
+        is NOT preserved on write (stated in `_read_settings_text`'s
+        docstring): this installer has never emitted one, so a
+        BOM-prefixed file this installer writes to comes back out without
+        it."""
+        path = tmp_path / "settings.json"
+        body = json.dumps(
+            {"hooks": {"SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "foreign"}]}]}},
+            indent=2,
+        ) + "\n"
+        path.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+
+        result = hooks_install.install(settings_path=path)
+        assert result.changed is True
+
+        after_bytes = path.read_bytes()
+        assert not after_bytes.startswith(b"\xef\xbb\xbf"), "the BOM must not be preserved on write"
+        after = json.loads(after_bytes.decode("utf-8"))
+        foreign = [
+            c["command"]
+            for g in after["hooks"]["SessionStart"]
+            for c in g["hooks"]
+            if hooks_install._owned_basename(c["command"]) is None
+        ]
+        assert foreign == ["foreign"], "the BOM-prefixed file's pre-existing foreign entry must survive"
+
+    def test_malformed_json_raises_named_error_and_writes_nothing(self, tmp_path: Path) -> None:
+        """TC-118: a settings.json that is not valid JSON at all raises
+        `HooksInstallError` naming the file (never a raw
+        `json.JSONDecodeError` traceback), and writes NOTHING -- the file
+        is byte-identical after the failed call."""
+        path = tmp_path / "settings.json"
+        before_bytes = b"{ this is not valid json "
+        path.write_bytes(before_bytes)
+
+        with pytest.raises(hooks_install.HooksInstallError) as excinfo:
+            hooks_install.install(settings_path=path)
+        assert str(path) in str(excinfo.value)
+        assert path.read_bytes() == before_bytes
+
+    def test_cli_hooks_install_reports_one_line_error_and_exits_nonzero_on_malformed_json(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """TC-118 (CLI-level): `fleet hooks install` against a malformed
+        settings.json prints ONE line naming the file to stderr and exits
+        non-zero -- never a raw traceback."""
+        path = tmp_path / "settings.json"
+        before_bytes = b"not json at all"
+        path.write_bytes(before_bytes)
+
+        exit_code = cli.main(["hooks", "install", "--harness", "claude-code", "--settings-path", str(path)])
+
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        stderr_lines = [ln for ln in captured.err.splitlines() if ln.strip()]
+        assert len(stderr_lines) == 1, f"expected exactly one stderr line, got: {stderr_lines!r}"
+        assert str(path) in stderr_lines[0]
+        assert path.read_bytes() == before_bytes
+
+    def test_cli_hooks_uninstall_and_status_also_report_cleanly_on_malformed_json(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Companion coverage: `uninstall`/`status` share the same parsing
+        path and must not raw-traceback either."""
+        path = tmp_path / "settings.json"
+        path.write_bytes(b"not json at all")
+
+        uninstall_code = cli.main(["hooks", "uninstall", "--harness", "claude-code", "--settings-path", str(path)])
+        assert uninstall_code == 1
+
+        status_code = cli.main(["hooks", "status", "--harness", "claude-code", "--settings-path", str(path)])
+        assert status_code == 1
+
 
 
 class TestMigration:
