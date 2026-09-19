@@ -59,13 +59,25 @@ normal `superhuman kickoff` behaves exactly as it did before this project existe
 Enabling it does not change anything superhuman actually does. It only adds a parallel, best-effort
 record of what already happened.
 
-**Gitignore your own manifest directory.** The default `manifest_dir` (`<workspace>/docs/superhuman/
-<slug>/fleet`) sits inside your tracked tree. `events.jsonl`, the per-session fragments under
+**The manifest directory ignores itself.** `events.jsonl`, the per-session fragments under
 `sessions/`, and `observe-failures.log` all carry absolute local paths from the machine that wrote
-them (workspace roots, git toplevels). Add `docs/superhuman/<slug>/fleet/` (or your configured
-`manifest_dir`, if you overrode it) to your own repo's `.gitignore` before enabling — otherwise those
-host-specific paths get committed. (Superhuman's own repo already ignores this pattern for its own
-use; a newly-enabling project does not inherit that for free.)
+them (workspace roots, git toplevels) — local runtime state, not something to commit. Rather than
+relying on every consuming repo to remember to add `docs/superhuman/<slug>/fleet/` (or a configured
+`manifest_dir`) to its own `.gitignore`, `fleet observe` does it for you: the first time a manifest
+directory is about to be written and git (asked from the *workspace* root) does not already report
+it as ignored, `observe.py` drops a self-ignoring `.gitignore` (content `*`, which also ignores
+itself) inside that directory. Nothing outside the manifest directory is ever touched — your repo's
+own tracked `.gitignore` is never edited.
+
+This is best-effort, matching this module's fail-soft posture: if `git` is unavailable, the
+workspace is not a git repository, the check times out, or the directory turns out to be
+unwritable, nothing is written and nothing raises — silence, same as any other fault this façade
+absorbs. It is also deliberately skipped when the directory is *already* covered by an ignore rule
+further up the tree, which matters for one specific case: a project whose manifest directory is
+mounted inside a private git carrier repo that deliberately tracks fleet manifests as a permanent
+record (see `docs/superhuman/fleet-deterministic-seams/DECISIONS.md`, ruling R-b) is never given a
+self-ignoring marker, because the *outer* workspace repo (not the carrier) already ignores the mount
+point that contains it.
 
 **Scope: short-lived process invocation only.** `fleet observe` is designed and tested as a
 short-lived CLI process — invoked, does its bounded work, exits. That exit is load-bearing: on an

@@ -27,6 +27,8 @@ if the journal write itself fails. (3) Never stdout, never a non-zero exit
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +58,15 @@ _LOCK_RETRY_BACKOFF = 0.1
 _JOURNAL_MAX_LINES = 500
 
 _JOURNAL_FILENAME = "observe-failures.log"
+
+#: A fleet manifest directory is local runtime state (`docs/fleet-observation.md`
+#: §"Gitignore your own manifest directory") that a consuming repo is supposed
+#: to gitignore itself. In practice almost none do, so it shows up as
+#: untracked noise. This self-ignoring marker — content `*`, which also
+#: ignores itself — makes that automatic instead of relying on every
+#: consuming repo to remember the manual step.
+_SELF_IGNORE_FILENAME = ".gitignore"
+_SELF_IGNORE_CONTENT = "*\n"
 
 
 def _validate_slug(slug: str) -> None:
@@ -220,6 +231,111 @@ class _ObserveContext:
     start: float
 
 
+def _fleet_dir_already_ignored(workspace: Path, fleet_dir: Path, *, timeout: float) -> bool | None:
+    """Ask `workspace` — never `fleet_dir`'s own (possibly different) repo — whether it already ignores `fleet_dir`.
+
+    The exemption this exists to respect: `superhuman-project-docs` is a
+    private git carrier that deliberately *tracks* fleet manifests as its
+    permanent record (see `docs/superhuman/fleet-deterministic-seams/
+    DECISIONS.md`, ruling R-b). When a project's fleet directory is mounted
+    inside that carrier, the carrier's own `.gitignore` does not ignore it
+    — but the *outer* workspace repo does (it ignores the whole
+    `docs/superhuman/` mount point). Asking the outer workspace, exactly as
+    `git status` from that checkout would see it, is what tells the two
+    cases apart; asking `fleet_dir`'s innermost repo would get the carrier
+    case backwards and silently destroy its tracked record.
+
+    Args:
+        workspace: the project's working tree root — the same `workspace`
+            every `observe_*` call already receives.
+        fleet_dir: the fleet manifest directory to check.
+        timeout: seconds to allow the `git` subprocess (the façade's own
+            `git_timeout_seconds` budget — this call follows the same
+            per-subprocess idiom as `adapter.portable.run_git`).
+
+    Returns:
+        bool: `True` if `git check-ignore` reports `fleet_dir` is ignored;
+        `False` if it ran successfully and reports it is not.
+        None: unknown — `git` is unavailable, `workspace` is not a git
+        repository, the call timed out, or any other subprocess failure.
+        Callers must treat `None` the same as `True` (do nothing): writing
+        a marker is only ever safe on a *confirmed* "not ignored" answer.
+    """
+    # A trailing separator tells `git check-ignore` this pathspec names a
+    # directory even when `fleet_dir` does not exist yet — without it, a
+    # directory-only `.gitignore` pattern (as this repo's own `/docs/
+    # superhuman/` and a fixed consumer's `docs/superhuman/*/fleet/` both
+    # are) would not match a plain, existence-unverified path.
+    pathspec = f"{fleet_dir}{os.sep}"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), "check-ignore", "-q", pathspec],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    # Any other exit (128 "not a git repository", or anything else git
+    # might report) is treated as unknown, never as "not ignored".
+    return None
+
+
+def _write_self_ignore_marker(fleet_dir: Path) -> None:
+    """Best-effort: drop a self-ignoring `.gitignore` inside `fleet_dir`.
+
+    Never raises. Idempotent and at-most-once per manifest directory: skips
+    immediately if the marker already exists, without re-reading or
+    re-writing it.
+
+    Args:
+        fleet_dir: the fleet manifest directory to mark.
+    """
+    marker = fleet_dir / _SELF_IGNORE_FILENAME
+    if marker.exists():
+        return
+    try:
+        fleet_dir.mkdir(parents=True, exist_ok=True)
+        marker.write_text(_SELF_IGNORE_CONTENT, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _ensure_self_ignored(workspace: Path | str, fleet_dir: Path, *, timeout: float) -> None:
+    """Best-effort: give `fleet_dir` a self-ignoring `.gitignore` unless it is already covered.
+
+    Called once per `observe_*` invocation, from `_resolve_context` — the
+    single chokepoint every verb (`dispatch`, `relay`, `handoff-emit`,
+    `launch`) passes through after confirming fleet observation is enabled
+    for `workspace`. This is deliberately outside this module's own
+    wall-clock deadline accounting (`ctx.start` is captured after this
+    returns): it is a small, separately-bounded side effect, not part of
+    the observed write's own budget.
+
+    Never raises — a failure here (unreadable git, an unwritable directory,
+    a git binary that is not on `PATH`, a timeout) must degrade to doing
+    nothing, exactly like every other fault this façade absorbs. It never
+    warns on the happy path (this module's documented no-noise-on-success
+    posture) and never blocks or delays superhuman's real work beyond the
+    bounded `git` call itself.
+
+    Args:
+        workspace: the project's working tree root.
+        fleet_dir: the resolved fleet manifest directory for this call.
+        timeout: seconds to allow the underlying `git check-ignore` call.
+    """
+    try:
+        ignored = _fleet_dir_already_ignored(Path(workspace), fleet_dir, timeout=timeout)
+        if ignored is False:
+            _write_self_ignore_marker(fleet_dir)
+    except Exception:  # noqa: BLE001 - this helper must never raise (see docstring)
+        pass
+
+
 def _resolve_context(workspace: Path | str, slug: str) -> _ObserveContext:
     """Resolve config + identity for one observe call, or raise a sentinel.
 
@@ -239,6 +355,7 @@ def _resolve_context(workspace: Path | str, slug: str) -> _ObserveContext:
         raise _Disabled(cfg.reason)
 
     fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+    _ensure_self_ignored(workspace, fleet_dir, timeout=cfg.git_timeout_seconds)
     identity = fleet_project.read_project_identity(workspace, slug)
     if identity is None:
         raise _IdentityUnresolved(
