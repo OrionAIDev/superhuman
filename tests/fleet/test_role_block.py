@@ -787,6 +787,113 @@ class TestD4NoHarnessVocabularyInScripts:
         assert "check_role_block(" in cli_text
 
 
+
+#: DECISIONS.md D4 clause 1, reworded (2026-09-19 G6): "the harness HOOK
+#: CONTRACT lives only in the templates and the installer." TC-87 above
+#: only greps three tokens (`hookSpecificOutput`, `permissionDecision`,
+#: `tool_input`); this widens the vocabulary to the full contract shape --
+#: the settings file the installer edits, the template directory the hook
+#: bodies live under, and the three hook event names -- and requires every
+#: hit to be on an explicit, reasoned allowlist rather than silently
+#: passing because the grep was too narrow to see it.
+_HOOK_CONTRACT_VOCABULARY: tuple[str, ...] = (
+    "hookSpecificOutput",
+    "permissionDecision",
+    "tool_input",
+    "settings.json",
+    "templates/hooks",
+    "SessionStart",
+    "SubagentStart",
+    "PreToolUse",
+)
+
+#: Every `scripts/**/*.py` file this repo ships that contains any token in
+#: `_HOOK_CONTRACT_VOCABULARY`, with the one-line reason it is admitted.
+#: A file not on this list that contains a token fails the test below.
+#: Discovered while writing TC-122 (2026-09-19): only two of these --
+#: `hooks_install.py` and `cli.py` -- were anticipated going in; the other
+#: five were found by running the widened scan and are docstring-only
+#: cross-references (verified by hand against the source at the time this
+#: test was written), never harness-shaped code or data. Reported to the
+#: PM alongside this chunk rather than silently allowlisted.
+_ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES: dict[str, str] = {
+    "scripts/fleet/hooks_install.py": (
+        "the installer itself -- D4 clause 2's second sanctioned home for "
+        "harness knowledge; edits settings.json and names the hook events "
+        "it installs"
+    ),
+    "scripts/fleet/cli.py": (
+        "hosts the `hooks install|uninstall|status` verbs' thin CLI "
+        "translation layer, admitted by clause 2 alongside the installer "
+        "it wraps"
+    ),
+    "scripts/fleet/hook_payload.py": (
+        "the generic payload reader D4's own caveat names as the one "
+        "place the boundary is a judgment call, not a syntactic fact -- "
+        "it documents field names generically (CHUNK-1-FINDINGS.md), "
+        "never a harness-shaped structure"
+    ),
+    "scripts/fleet/adapter/subagent.py": (
+        "docstring only -- cross-references the SubagentStart-consuming "
+        "CLI verb (`cli._cmd_observe_dispatch`) by name to explain why "
+        "git_facts_root exists; no harness JSON or verb code"
+    ),
+    "scripts/fleet/dispatch_predicate.py": (
+        "docstring only -- names the Claude-Code-specific counterpart "
+        "file (templates/hooks/claude-code/subagent_dispatch_filter.py) "
+        "that imports this portable module, per chunk 7 PM ruling 4"
+    ),
+    "scripts/fleet/observe.py": (
+        "docstring only -- references CHUNK-1-FINDINGS.md's measurement "
+        "that the transcript is frequently unreadable at a bare "
+        "SessionStart; no harness JSON or verb code"
+    ),
+    "scripts/fleet/role_block.py": (
+        "docstring only -- names the Claude-Code-specific counterpart "
+        "file (templates/hooks/claude-code/pre_tool_use_role_gate.py) "
+        "that imports this portable module, per D7.6"
+    ),
+}
+
+
+class TestD4ClauseOneHookContractVocabularyBoundary:
+    """TC-122 (D4 clause 1, reworded 2026-09-19 G6): every `.py` file under
+    `scripts/` that mentions ANY token in `_HOOK_CONTRACT_VOCABULARY` is on
+    `_ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES`, with a one-line reason. TC-87
+    above still runs (three tokens, narrower); this is the superset."""
+
+    def test_every_hook_contract_vocabulary_hit_is_on_the_reasoned_allowlist(self) -> None:
+        scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+        offenders: list[str] = []
+        for path in sorted(scripts_dir.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            rel = path.relative_to(scripts_dir.parent).as_posix()
+            if rel in _ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            hits = [token for token in _HOOK_CONTRACT_VOCABULARY if token in text]
+            if hits:
+                offenders.append(f"{rel}: {hits}")
+        assert not offenders, (
+            "hook-contract vocabulary found outside the reasoned allowlist "
+            f"(D4 clause 1): {offenders}. Either the file belongs on "
+            "_ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES with a one-line reason, "
+            "or it is a real boundary leak."
+        )
+
+    def test_every_allowlist_entry_still_exists(self) -> None:
+        """A stale allowlist entry (the file was renamed or deleted) must
+        fail this test rather than silently stop being checked."""
+        skill_root = Path(__file__).resolve().parents[2]
+        missing = [
+            rel for rel in _ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES if not (skill_root / rel).is_file()
+        ]
+        assert not missing, f"stale allowlist entries (file no longer exists): {missing}"
+
+
+
+
 class TestDoctorRoleGateHealth:
     """TC-90: `fleet doctor` counts correctly, and with an absent or empty
     log reports UNKNOWN, never OK or zero."""
