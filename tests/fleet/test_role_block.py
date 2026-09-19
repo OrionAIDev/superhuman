@@ -10,6 +10,7 @@ the subprocess level, in `tests/fleet/test_role_gate_hook.py`.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -892,6 +893,88 @@ class TestD4ClauseOneHookContractVocabularyBoundary:
         assert not missing, f"stale allowlist entries (file no longer exists): {missing}"
 
 
+#: DECISIONS.md D4 clause 3, reworded (2026-09-19 G6): "never invoked by
+#: kickoff, a phase recipe or any skill prose; tests drive it only against
+#: an explicit temporary settings path." Scope, per the PM brief: agent-
+#: facing skill prose the harness or an operator dispatch might literally
+#: follow -- SKILL.md, phases/, roles/, adaptation/, conventions/,
+#: references/, templates/ -- as TEXT files. Operator documentation that
+#: DESCRIBES the command (docs/fleet-observation.md, READMEs) is OUT of
+#: this scan's scope by design (it is read by a human deciding whether to
+#: run the command, never executed as skill prose); neither lives under
+#: the scanned roots, so no explicit exclusion is needed for them.
+#:
+#: One further, narrow exclusion IS needed and is called out here rather
+#: than silently applied: `templates/hooks/claude-code/` (the physical
+#: hook body scripts) contains three header-comment lines naming `fleet
+#: hooks install` (found while writing this test -- see the class
+#: docstring for the exact hits). D4 clause 2 explicitly assigns harness
+#: AND installer knowledge to `templates/hooks/<harness>/` as one of only
+#: two sanctioned homes, so a hook script documenting its own install
+#: mechanism in its own header is that clause's content, not "skill prose"
+#: an agent reads and follows -- it is never read at kickoff or by a phase
+#: recipe. This exclusion is reported to the PM alongside this chunk,
+#: with the exact lines, rather than silently applied.
+_SKILL_PROSE_SCAN_ROOTS: tuple[str, ...] = (
+    "phases",
+    "roles",
+    "adaptation",
+    "conventions",
+    "references",
+    "templates",
+)
+_SKILL_PROSE_SCAN_FILES: tuple[str, ...] = ("SKILL.md",)
+_SKILL_PROSE_EXCLUDED_PATH_PREFIXES: tuple[str, ...] = ("templates/hooks/",)
+_INSTALLER_INVOCATION_VERB_RE = re.compile(r"hooks\s+(install|uninstall)")
+
+
+class TestD4ClauseThreeNoSkillProseInvokesTheInstaller:
+    """TC-123 (D4 clause 3, reworded 2026-09-19 G6, part a): no file under
+    the scanned skill-prose roots contains the installer's verb form
+    (`hooks install` / `hooks uninstall`), outside the one reasoned,
+    reported exclusion above.
+
+    Real hits found while writing this test, reported rather than used to
+    silently widen the exclusion list: `templates/hooks/claude-code/
+    pre-tool-use-role-gate:9`, `.../session-start:7`, `.../subagent-
+    start:8` -- each a header comment reading "Installed via `fleet hooks
+    install` (Chunk 8) into a harness's ...". All three are under the one
+    excluded prefix above; no other file in the scanned roots matches.
+    """
+
+    def _scan_files(self, skill_root: Path) -> list[Path]:
+        files: list[Path] = [skill_root / name for name in _SKILL_PROSE_SCAN_FILES]
+        for root_name in _SKILL_PROSE_SCAN_ROOTS:
+            root = skill_root / root_name
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*")):
+                if not path.is_file():
+                    continue
+                if "__pycache__" in path.parts or path.suffix in {".pyc", ".cmd"}:
+                    continue
+                files.append(path)
+        return files
+
+    def test_no_skill_prose_file_invokes_the_installer(self) -> None:
+        skill_root = Path(__file__).resolve().parents[2]
+        offenders: list[str] = []
+        for path in self._scan_files(skill_root):
+            rel = path.relative_to(skill_root).as_posix()
+            if any(rel.startswith(prefix) for prefix in _SKILL_PROSE_EXCLUDED_PATH_PREFIXES):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="strict")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if _INSTALLER_INVOCATION_VERB_RE.search(line):
+                    offenders.append(f"{rel}:{lineno}: {line.strip()!r}")
+        assert not offenders, (
+            f"skill prose invokes the installer (D4 clause 3): {offenders}. "
+            "The installer is an operator command, never something skill "
+            "prose tells a session to run."
+        )
 
 
 class TestDoctorRoleGateHealth:
