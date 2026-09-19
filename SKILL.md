@@ -264,7 +264,7 @@ Format rules (all Type A gates):
 1. Recommendation first, always.
 2. Use `<dispatch:ask>` for discrete choices.
 3. Artifacts by path, not paste (token-efficiency).
-4. Fixed preamble: header → 3-5 bullets → artifact path → decision prompt. Use cached templates from `templates/gate-headers.md`.
+4. Fixed preamble: header → briefing → 3-5 bullets → artifact path → decision prompt. Use cached templates from `templates/gate-headers.md`. The briefing says, for a stakeholder who hasn't seen this project recently, what the project is, what is being decided and why it matters now; it is presentation only and never enters the decisions log.
 5. Append gate + timestamp + decision to SUPERHUMAN.md.
 6. Never auto-proceed past Type A when a human is the one answering it. (At HITL-L, G6/G8/G9 are answered by the PM/surrogate itself, not skipped — see "HITL levels" above; every such answer is still logged to SUPERHUMAN.md exactly like a human decision would be.)
 7. G6 is unconditional at HITL-H/M — cadence mode does not silence it. At level 2 it always fires too, just resolved by the PM/surrogate rather than paused on.

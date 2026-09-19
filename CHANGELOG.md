@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Added
 
+- **Type A gates open with a plain-language briefing.** `templates/gate-headers.md` now puts a
+  short paragraph under the gate header, written for a stakeholder who hasn't seen the project
+  recently: what the project is, what is being decided, and why it matters now. It uses no
+  requirement IDs, file paths or code names. Each option now states what it leads to, the
+  recommendation carries its reason, and the artifact path moves below the briefing. Format rule 4
+  in `roles/pm.md` and `SKILL.md` now reads `header → briefing → 3-5 bullets → artifact path →
+  decision prompt`. The briefing is presentation only and is never copied into the SUPERHUMAN.md
+  decisions log, so the log line format (rule 5) is unchanged. Pinned by four new tests in
+  `tests/test_content.py`.
 - `tests/test_content.py::test_published_specs_are_tracked` — pins the positive half of the
   publication invariant. Its sibling `test_no_per_project_docs_are_tracked` asserts an emptiness,
   and an emptiness assertion keeps passing when the paths silently move out from under it.
