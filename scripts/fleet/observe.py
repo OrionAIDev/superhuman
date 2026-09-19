@@ -38,6 +38,7 @@ from typing import Any, Callable, TypeVar
 from . import config as fleet_config
 from . import project as fleet_project
 from .adapter.base import SessionAdapter
+from .path_safety import slug_is_safe
 from .core.errors import LockTimeoutError, OwnershipError, SessionIdentityUnresolved, ValidationError
 from .handoff import emit as handoff_emit_impl
 from .handoff import extract_handoff_id
@@ -73,6 +74,13 @@ def _validate_slug(slug: str) -> None:
     call in this module passes through, so one check here covers all of
     them.
 
+    The character check itself lives in `path_safety.slug_is_safe` (moved
+    there at preflight B5, which found `role_block.py`'s own
+    `record_role_gate_decision` builds the identical shape of path from the
+    identical shape of untrusted input and had never inherited this guard —
+    a shared, public helper replaces what would otherwise be two
+    independently-maintained copies of one check).
+
     Raises the existing `_Disabled` sentinel rather than a new exception
     type: every caller of `_default_fleet_dir` already has a "fleet is
     disabled/unconfigured for this workspace" branch, so an invalid slug is
@@ -87,7 +95,7 @@ def _validate_slug(slug: str) -> None:
     Raises:
         _Disabled: if `slug` contains `/`, `\\`, or a `..` segment.
     """
-    if "/" in slug or "\\" in slug or ".." in slug:
+    if not slug_is_safe(slug):
         raise _Disabled(
             f"invalid slug {slug!r}: path separators and '..' are not permitted"
         )

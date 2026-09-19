@@ -65,6 +65,7 @@ def _run_git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
+    """A real temp git repo with one commit on a non-default-named branch."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _run_git(repo, "init", "-q", "-b", "trunk")

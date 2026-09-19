@@ -235,9 +235,10 @@ literal first differing line and the role file's path; the gate never emits `all
 `defer` — it only ever stays silent (empty stdout, exit 0) or denies. `NON_ROLE`, `MISMATCH`, and
 `UNMARKED` decisions are appended to `<fleet-dir>/role-gate.jsonl` as one JSON line each, carrying
 exactly six fields (a timestamp, the session id, the verdict, the claimed role name where
-applicable, the dispatch tool's `subagent_type`, and the mismatch's first differing line where
-applicable) and never the prompt text itself or any free-form description (this project's own
-sensitive-data discipline). A compliant `ROLE`/`NON_ROLE` dispatch is never logged here at all.
+applicable, the dispatch tool's `subagent_type`, and the mismatch's first differing line NUMBER
+where applicable — an integer locating the divergence, never the line's own content) and never the
+prompt text itself or any free-form description (this project's own sensitive-data discipline). A
+compliant `ROLE`/`NON_ROLE` dispatch is never logged here at all.
 
 Like every other check in this project, a fault in the gate's own machinery (an unreadable
 `roles/` directory, an unrecognised locator result, a corrupted payload) degrades to "let the

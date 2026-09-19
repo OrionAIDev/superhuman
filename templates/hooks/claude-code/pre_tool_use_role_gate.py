@@ -327,7 +327,7 @@ def run(
             verdict=Verdict.NON_ROLE,
             role=None,
             subagent_type=subagent_type,
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
         return
 
@@ -341,7 +341,7 @@ def run(
         verdict=result.verdict,
         role=result.role,
         subagent_type=subagent_type,
-        mismatch_line=result.prompt_mismatch_line,
+        mismatch_line_number=result.mismatch_line_number,
     )
 
 

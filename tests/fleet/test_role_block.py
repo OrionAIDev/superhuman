@@ -109,6 +109,7 @@ class TestCheckRoleBlockMismatch:
         assert result.prompt_mismatch_line is not None
         assert result.file_mismatch_line is not None
         assert result.prompt_mismatch_line != result.file_mismatch_line
+        assert result.mismatch_line_number is not None
 
     def test_edited_tier_line_yields_mismatch(self, roles_dir: Path) -> None:
         edited = _DEVELOPER_ROLE_CONTENT.replace("tier: standard", "tier: cheap")
@@ -116,6 +117,10 @@ class TestCheckRoleBlockMismatch:
         assert result.verdict == Verdict.MISMATCH
         assert result.prompt_mismatch_line == "tier: cheap"
         assert result.file_mismatch_line == "tier: standard"
+        # B6: `_DEVELOPER_ROLE_CONTENT`'s "tier: standard" line is the
+        # 3rd line (1-based) -- confirms the log-safe field points at the
+        # same divergence the text-carrying fields above do.
+        assert result.mismatch_line_number == 3
 
     def test_paraphrase_yields_mismatch(self, roles_dir: Path) -> None:
         edited = _DEVELOPER_ROLE_CONTENT.replace(
@@ -277,19 +282,68 @@ class TestRecordRoleGateDecision:
             verdict=Verdict.MISMATCH,
             role="developer",
             subagent_type="developer",
-            mismatch_line="tier: cheap",
+            mismatch_line_number=3,
         )
 
         fleet_dir = workspace / "docs" / "superhuman" / "demo-slug" / "fleet"
         rows = read_role_gate_log(fleet_dir)
         assert len(rows) == 1
         row = rows[0]
-        assert set(row) == {"ts", "session_id", "verdict", "role", "subagent_type", "mismatch_line"}
+        assert set(row) == {
+            "ts",
+            "session_id",
+            "verdict",
+            "role",
+            "subagent_type",
+            "mismatch_line_number",
+        }
         assert row["verdict"] == "MISMATCH"
         assert row["role"] == "developer"
         assert row["subagent_type"] == "developer"
-        assert row["mismatch_line"] == "tier: cheap"
+        assert row["mismatch_line_number"] == 3
         assert row["session_id"] == "sess-1"
+
+    def test_mismatch_row_carries_no_substring_of_the_prompt(
+        self, tmp_path: Path, roles_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Preflight B6: `mismatch_line` used to carry the prompt's own
+        first differing line VERBATIM, contradicting this function's own
+        docstring and `docs/fleet-observation.md` ("never the prompt text
+        itself"). A MISMATCH verdict selects precisely for prompts that
+        have diverged into the operator's own brief -- in an estate whose
+        hard rule is that regulated data never reaches GitHub, and whose
+        convention puts `docs/superhuman/` inside tracked product
+        repositories, that was a real egress path. Proves the log line
+        contains no substring of the actual prompt text on either side of
+        the divergence, not just that the OLD field name is gone.
+        """
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        profile = tmp_path / "profile.yaml"
+        self._write_profile(profile)
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        edited = _DEVELOPER_ROLE_CONTENT.replace("tier: standard", "tier: cheap")
+        result = check_role_block(edited, roles_dir)
+        assert result.verdict == Verdict.MISMATCH
+
+        record_role_gate_decision(
+            workspace,
+            "demo-slug",
+            session_id="sess-1",
+            verdict=result.verdict,
+            role=result.role,
+            subagent_type="developer",
+            mismatch_line_number=result.mismatch_line_number,
+        )
+
+        fleet_dir = workspace / "docs" / "superhuman" / "demo-slug" / "fleet"
+        log_text = (fleet_dir / "role-gate.jsonl").read_text(encoding="utf-8")
+        assert "tier: cheap" not in log_text
+        assert "tier: standard" not in log_text
+        assert result.prompt_mismatch_line not in log_text
+        assert result.file_mismatch_line not in log_text
+        assert '"mismatch_line_number": 3' in log_text
 
     def test_disabled_workspace_writes_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -311,7 +365,7 @@ class TestRecordRoleGateDecision:
             verdict=Verdict.NON_ROLE,
             role=None,
             subagent_type=None,
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
 
         fleet_dir = workspace / "docs" / "superhuman" / "demo-slug" / "fleet"
@@ -343,7 +397,7 @@ class TestRecordRoleGateDecision:
             verdict=Verdict.UNMARKED,
             role=None,
             subagent_type="general-purpose",
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
 
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -375,8 +429,86 @@ class TestRecordRoleGateDecision:
             verdict=Verdict.NON_ROLE,
             role=None,
             subagent_type=None,
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
+
+
+class TestRecordRoleGateDecisionPathSafety:
+    """Preflight B5: `workspace`/`slug` reach `record_role_gate_decision`
+    from a locator cache file the agent itself writes into its own
+    scratchpad (`pre_tool_use_role_gate.py`'s `_cached_locate`) -- no more
+    trustworthy than a raw CLI argument, and this function joined them into
+    a path with zero validation. Invalid input must write nothing at all
+    to disk, and never raise.
+    """
+
+    def _write_profile(self, profile_path: Path) -> None:
+        profile_path.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+
+    def test_traversal_slug_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        profile = tmp_path / "profile.yaml"
+        self._write_profile(profile)
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        before = sorted(tmp_path.rglob("*"))
+        record_role_gate_decision(
+            workspace,
+            "../../evil",
+            session_id="sess-1",
+            verdict=Verdict.NON_ROLE,
+            role=None,
+            subagent_type=None,
+            mismatch_line_number=None,
+        )
+        after = sorted(tmp_path.rglob("*"))
+        assert after == before, "a traversal-shaped slug wrote something to disk"
+
+    def test_relative_workspace_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = tmp_path / "profile.yaml"
+        self._write_profile(profile)
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+        monkeypatch.chdir(tmp_path)
+
+        before = sorted(tmp_path.rglob("*"))
+        record_role_gate_decision(
+            Path("relative-workspace"),
+            "demo-slug",
+            session_id="sess-1",
+            verdict=Verdict.NON_ROLE,
+            role=None,
+            subagent_type=None,
+            mismatch_line_number=None,
+        )
+        after = sorted(tmp_path.rglob("*"))
+        assert after == before, "a relative workspace path wrote something to disk"
+
+    def test_nonexistent_workspace_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "does-not-exist"
+        profile = tmp_path / "profile.yaml"
+        self._write_profile(profile)
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        before = sorted(tmp_path.rglob("*"))
+        record_role_gate_decision(
+            workspace,
+            "demo-slug",
+            session_id="sess-1",
+            verdict=Verdict.NON_ROLE,
+            role=None,
+            subagent_type=None,
+            mismatch_line_number=None,
+        )
+        after = sorted(tmp_path.rglob("*"))
+        assert after == before, "a nonexistent workspace path wrote something to disk"
+        assert not workspace.exists()
 
 
 class TestReadRoleGateLog:
@@ -689,7 +821,7 @@ class TestDoctorRoleGateHealth:
             verdict=Verdict.NON_ROLE,
             role=None,
             subagent_type="general-purpose",
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
         record_role_gate_decision(
             workspace,
@@ -698,7 +830,7 @@ class TestDoctorRoleGateHealth:
             verdict=Verdict.MISMATCH,
             role="developer",
             subagent_type="developer",
-            mismatch_line="tier: cheap",
+            mismatch_line_number=3,
         )
         record_role_gate_decision(
             workspace,
@@ -707,7 +839,7 @@ class TestDoctorRoleGateHealth:
             verdict=Verdict.UNMARKED,
             role=None,
             subagent_type="developer",
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
 
         fleet_dir = workspace / "docs" / "superhuman" / "demo-slug" / "fleet"
@@ -824,7 +956,7 @@ class TestDoctorCliRoleGateSection:
             verdict=Verdict.NON_ROLE,
             role=None,
             subagent_type="general-purpose",
-            mismatch_line=None,
+            mismatch_line_number=None,
         )
 
         parser = build_parser()

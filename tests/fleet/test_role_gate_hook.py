@@ -242,7 +242,13 @@ class TestRoleGateDenyShape:
         assert str(skill_root / "roles" / "developer.md") in reason or "developer.md" in reason
         log = _role_gate_log_text(workspace, slug)
         assert '"verdict": "MISMATCH"' in log
-        assert '"mismatch_line": "tier: cheap"' in log
+        # B6: the decision log carries the divergence's 1-based line
+        # NUMBER, never the line's own text -- the deny reason above (the
+        # harness-facing `reason` string) is the only place the actual
+        # "tier: cheap"/"tier: standard" text is allowed to appear.
+        assert '"mismatch_line_number": 3' in log
+        assert "tier: cheap" not in log
+        assert "tier: standard" not in log
 
 
 @pytest.mark.skipif(

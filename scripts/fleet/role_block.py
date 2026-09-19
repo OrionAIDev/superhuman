@@ -68,6 +68,7 @@ from typing import Any
 
 from . import config as fleet_config
 from .dispatch_predicate import leads_with_role_block
+from .path_safety import slug_is_safe
 
 #: The literal first-line marker for a deliberately non-role dispatch
 #: (D7.2, chunk 7a G3-narrow ruling). Cited verbatim by the floor docs
@@ -120,9 +121,14 @@ class RoleCheckResult:
             for `ROLE`); `None` for `NON_ROLE`/`UNMARKED`/`FAULT`.
         role_file: `roles_dir/<role>.md` — set alongside `role`.
         prompt_mismatch_line: the prompt's own first differing line
-            (`MISMATCH` only; `None` otherwise).
+            (`MISMATCH` only; `None` otherwise). Verbatim prompt text —
+            used only to build the deny reason shown to the harness
+            (D7.5), never written to the decision log (NFR-8; B6).
         file_mismatch_line: the role file's first differing line at the
             same position (`MISMATCH` only; `None` otherwise).
+        mismatch_line_number: the 1-based line number the two diverge at
+            (`MISMATCH` only; `None` otherwise). Carries no content — this
+            is the field safe to write to the decision log.
     """
 
     verdict: Verdict
@@ -130,6 +136,7 @@ class RoleCheckResult:
     role_file: Path | None = None
     prompt_mismatch_line: str | None = None
     file_mismatch_line: str | None = None
+    mismatch_line_number: int | None = None
 
 
 def _normalize_newlines(text: str) -> str:
@@ -237,7 +244,7 @@ def _frontmatter_role_name(prompt: str) -> str | None:
     return name_match.group(1)
 
 
-def _first_differing_line(prompt_norm: str, file_norm: str) -> tuple[str, str]:
+def _first_differing_line(prompt_norm: str, file_norm: str) -> tuple[int, str, str]:
     """Return the first line at which `prompt_norm` and `file_norm` diverge.
 
     Only ever called after a `startswith` comparison between the two has
@@ -251,16 +258,18 @@ def _first_differing_line(prompt_norm: str, file_norm: str) -> tuple[str, str]:
             content.
 
     Returns:
-        tuple[str, str]: `(prompt_line, file_line)` at the first index
-        where the two differ. An empty string stands in for "this side
-        ran out of lines first."
+        tuple[int, str, str]: `(line_number, prompt_line, file_line)` at
+        the first index where the two differ. `line_number` is 1-based.
+        An empty string stands in for "this side ran out of lines first."
     """
     prompt_lines = prompt_norm.split("\n")
     file_lines = file_norm.split("\n")
-    for prompt_line, file_line in zip_longest(prompt_lines, file_lines, fillvalue=None):
+    for index, (prompt_line, file_line) in enumerate(
+        zip_longest(prompt_lines, file_lines, fillvalue=None)
+    ):
         if prompt_line != file_line:
-            return (prompt_line or "", file_line or "")
-    return ("", "")  # pragma: no cover - unreachable: callers only invoke this once startswith() has already failed, guaranteeing a divergence
+            return (index + 1, prompt_line or "", file_line or "")
+    return (0, "", "")  # pragma: no cover - unreachable: callers only invoke this once startswith() has already failed, guaranteeing a divergence
 
 
 def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
@@ -323,13 +332,14 @@ def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
         if matches:
             return RoleCheckResult(verdict=Verdict.ROLE, role=role_name, role_file=role_file)
 
-        prompt_line, file_line = _first_differing_line(prompt_norm, file_norm)
+        line_number, prompt_line, file_line = _first_differing_line(prompt_norm, file_norm)
         return RoleCheckResult(
             verdict=Verdict.MISMATCH,
             role=role_name,
             role_file=role_file,
             prompt_mismatch_line=prompt_line,
             file_mismatch_line=file_line,
+            mismatch_line_number=line_number,
         )
     except Exception:  # noqa: BLE001 - this module's sole broad catch; see module docstring (NFR-9)
         return RoleCheckResult(verdict=Verdict.FAULT)
@@ -360,7 +370,7 @@ def record_role_gate_decision(
     verdict: Verdict,
     role: str | None,
     subagent_type: str | None,
-    mismatch_line: str | None,
+    mismatch_line_number: int | None,
 ) -> None:
     """Append one D7.7 decision-log line for a `NON_ROLE`/`MISMATCH`/`UNMARKED` verdict.
 
@@ -378,7 +388,15 @@ def record_role_gate_decision(
     Writes nothing when fleet observation is disabled/unconfigured for
     `workspace` (mirrors `observe.journal_early_cli_failure`'s zero-I/O
     guarantee for a disabled workspace) and never carries prompt or
-    description text (NFR-8) — only the six named fields.
+    description text (NFR-8) — only the six named fields. Preflight B6:
+    this field used to be `mismatch_line`, the verbatim first differing
+    LINE OF THE PROMPT — a real egress path for whatever an operator's
+    prompt happened to diverge into, in an estate whose hard rule is that
+    regulated data never reaches GitHub, and whose convention puts
+    `docs/superhuman/` inside tracked product repositories. Replaced by
+    `mismatch_line_number`, the 1-based line NUMBER the divergence starts
+    at — locates the diff for a human re-running the check by hand,
+    without ever writing its content anywhere.
 
     Args:
         workspace: the project's working tree root.
@@ -389,16 +407,43 @@ def record_role_gate_decision(
         role: the frontmatter-claimed role name, if any (`MISMATCH` only;
             `None` for `NON_ROLE`/`UNMARKED`).
         subagent_type: the payload's dispatch-tool `subagent_type` field, if any.
-        mismatch_line: the prompt's first differing line (`MISMATCH`
-            only) — never the full prompt or a description (NFR-8).
+        mismatch_line_number: the prompt's first differing line's 1-based
+            line number (`MISMATCH` only) — never the line's own content,
+            the full prompt, or a description (NFR-8).
     """
+    # Preflight B5: `workspace`/`slug` reach this function from a locator
+    # cache file the agent itself writes into its own scratchpad
+    # (`pre_tool_use_role_gate.py`'s `_cached_locate`) — agent-writable, so
+    # no more trustworthy than a raw CLI argument, and this function joined
+    # them into a path with no validation at all. Reuses `observe.py`'s
+    # guard (moved to `path_safety.slug_is_safe`, B5) plus two more checks
+    # that guard specifically named: `workspace` must be an absolute,
+    # existing directory, and the path actually about to be written must
+    # resolve inside `<workspace>/docs/superhuman/<slug>/`. Any failure
+    # here writes nothing and never raises — same contract as every other
+    # fault this function already degrades silently on.
+    if not slug_is_safe(slug):
+        return
+    workspace_path = Path(workspace)
+    if not workspace_path.is_absolute() or not workspace_path.is_dir():
+        return
     try:
         cfg = fleet_config.resolve_fleet_config(workspace)
         if not cfg.enabled:
             return
-        fleet_dir = cfg.manifest_dir or (
-            Path(workspace) / "docs" / "superhuman" / slug / "fleet"
-        )
+        if cfg.manifest_dir is not None:
+            # An explicit operator override from the profile YAML (a
+            # trusted, separate configuration surface `resolve_fleet_config`
+            # already confines to `workspace`, Phase 3.3 preflight FIX 2) —
+            # not the untrusted workspace/slug pair this function guards
+            # against, so it is not additionally required to land inside
+            # `<workspace>/docs/superhuman/<slug>/` specifically.
+            fleet_dir = cfg.manifest_dir
+        else:
+            fleet_dir = workspace_path / "docs" / "superhuman" / slug / "fleet"
+            expected_root = (workspace_path / "docs" / "superhuman" / slug).resolve()
+            if not fleet_dir.resolve().is_relative_to(expected_root):
+                return  # pragma: no cover - unreachable once slug_is_safe rejects traversal; kept as defense in depth (B5), mirroring config.py's identical resolve+is_relative_to pattern for manifest_dir
         fleet_dir.mkdir(parents=True, exist_ok=True)
         path = role_gate_log_path(fleet_dir)
         line = json.dumps(
@@ -408,7 +453,7 @@ def record_role_gate_decision(
                 "verdict": verdict.value,
                 "role": role,
                 "subagent_type": subagent_type,
-                "mismatch_line": mismatch_line,
+                "mismatch_line_number": mismatch_line_number,
             },
             sort_keys=True,
         )
