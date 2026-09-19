@@ -207,6 +207,82 @@ def _run_hook_script(
     )
 
 
+# --- Phase 3.3 preflight B8: wrapper executable bits -------------------------------
+
+#: The three harness-invoked wrappers the installer registers BY BARE PATH
+#: (`hooks_install.py`) — as opposed to their `*.py`/`*.cmd` siblings in the
+#: same directory, which are always invoked explicitly via an interpreter
+#: (`python .../pre_tool_use_role_gate.py`, or the `.cmd` shim itself, which
+#: `cmd.exe` runs regardless of the Unix executable bit) and so never depend
+#: on this bit to run.
+_BARE_PATH_WRAPPERS = ("session-start", "subagent-start", "pre-tool-use-role-gate")
+
+
+class TestWrapperFilesAreExecutable:
+    """Preflight B8: the three wrappers were committed 100644 while every
+    comparable POSIX script in this repo (e.g. `scripts/autonomous-
+    precondition.sh`) is 100755, and `hooks_install.py` registers them BY
+    BARE PATH in a harness's hook config — so a non-Windows install gets
+    `exit 126` (permission denied) before the wrapper's own
+    `trap 'exit 0' EXIT` can run. Invisible to the rest of this file's
+    subprocess tests because `_run_hook_script` above invokes bash
+    explicitly (`[_BASH, str(script)]`), which never requires the
+    executable bit at all. Superhuman is a public repository; this breaks
+    every non-Windows install.
+    """
+
+    def test_extensionless_wrappers_are_mode_100755_in_git(self, skill_root: Path) -> None:
+        result = subprocess.run(
+            ["git", "ls-files", "-s", "templates/hooks/claude-code/"],
+            cwd=skill_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        modes_by_name: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            mode, _sha, stage_and_path = line.split(None, 2)
+            _stage, path = stage_and_path.split("\t", 1)
+            modes_by_name[Path(path).name] = mode
+
+        extensionless = [name for name in modes_by_name if "." not in name]
+        assert set(extensionless) == set(_BARE_PATH_WRAPPERS), (
+            f"expected exactly {sorted(_BARE_PATH_WRAPPERS)!r} as the extensionless "
+            f"files under templates/hooks/claude-code/, found {sorted(extensionless)!r}"
+        )
+        for name in _BARE_PATH_WRAPPERS:
+            assert modes_by_name[name] == "100755", (
+                f"templates/hooks/claude-code/{name} is committed mode "
+                f"{modes_by_name[name]} — the installer registers it BY BARE PATH "
+                "(hooks_install.py), so a non-Windows install exits 126 before the "
+                "wrapper's own exit-0 trap can run. Every comparable POSIX script in "
+                "this repo (e.g. scripts/autonomous-precondition.sh) is 100755."
+            )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="bare-path execution needs a POSIX exec bit"
+    )
+    @pytest.mark.parametrize("name", _BARE_PATH_WRAPPERS)
+    def test_wrapper_runs_by_bare_path(self, skill_root: Path, name: str) -> None:
+        """Executes the wrapper directly (no `bash script` prefix) — exactly
+        how `hooks_install.py` registers it in a harness's hook config. A
+        non-executable file fails here with `PermissionError` (errno
+        `EACCES`) before the script's own logic ever runs.
+        """
+        script = skill_root / "templates" / "hooks" / "claude-code" / name
+        result = subprocess.run(
+            [str(script)],
+            input="{}",
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+        )
+        assert result.returncode == 0, (
+            f"{script} exited {result.returncode} when run by bare path "
+            f"(stderr={result.stderr!r})"
+        )
+
+
 # --- Chunk 6: SessionStart hook -----------------------------------------------------
 
 
