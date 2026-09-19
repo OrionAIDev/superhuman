@@ -1784,6 +1784,10 @@ def test_gate_format_rule_4_includes_briefing_everywhere(skill_root: Path) -> No
 
 def test_briefing_never_reaches_the_decisions_log(skill_root: Path) -> None:
     """The briefing is presentation only; the log line format stays rule 5's."""
-    for rel in ("roles/pm.md", "templates/gate-headers.md"):
+    for rel in ("roles/pm.md", "SKILL.md", "templates/gate-headers.md"):
         text = (skill_root / rel).read_text(encoding="utf-8")
         assert _NEVER_COPY_SENTENCE in text, f"{rel} must say the briefing is {_NEVER_COPY_SENTENCE}"
+    pm = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    assert "5. Every gate appended to SUPERHUMAN.md with timestamp + decision.\n" in pm, (
+        "rule 5 (the decisions-log entry) must stay unchanged"
+    )
