@@ -261,7 +261,7 @@ Gate inventory (DESIGN.md §7):
 
 Format rules (all Type A gates):
 
-1. Recommendation first, always.
+1. Recommendation before the alternatives, always — after the briefing (rule 4), never above it.
 2. Use `<dispatch:ask>` for discrete choices.
 3. Artifacts by path, not paste (token-efficiency).
 4. Fixed preamble: header → briefing → 3-5 bullets → artifact path → decision prompt. Use cached templates from `templates/gate-headers.md`. The briefing says, for a stakeholder who hasn't seen this project recently, what the project is, what is being decided and why it matters now; it is presentation only and is never copied into the SUPERHUMAN.md decisions log.

@@ -24,7 +24,7 @@ consulted: [business-expert]
 
 3. **G2: REQUIREMENTS approval.**
    - Type A gate using gate-headers template.
-   - Path + 3-5 bullet summary + ambiguity-resolution options (if any).
+   - Briefing + path + 3-5 bullet summary + ambiguity-resolution options (if any), in the template's order.
    - Recommendation: "approve and proceed to design".
 
 ## Outputs

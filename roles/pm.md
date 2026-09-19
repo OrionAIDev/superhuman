@@ -356,7 +356,7 @@ Emit it exactly once, only after G8 sign-off, and never at any earlier gate. It 
 
 ### 9 format rules
 
-1. Every Type A gate with a choice **must present the recommendation first.**
+1. Every Type A gate with a choice **must present the recommendation before the alternatives** — after the briefing, per rule 4, never above it.
 2. Use `<dispatch:ask>` (or OpenClaw equivalent) for discrete choices.
 3. **Artifacts by path, never by paste.** Token-efficiency rule applied.
 4. Fixed-shape preamble: `header → briefing → 3-5 bullets → artifact path → decision prompt`. Use cached templates. The briefing, written for a stakeholder who hasn't seen this project recently, says what the project is, what is being decided and why it matters now; each option then says what it leads to. The briefing is presentation only and is never copied into the SUPERHUMAN.md decisions log.
