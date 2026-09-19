@@ -1723,3 +1723,71 @@ def test_kickoff_interpreter_resolution_is_array_safe(skill_root: Path) -> None:
     assert result.returncode == 0, (
         f"interpreter-resolution snippet failed `bash -n`: {result.stderr}"
     )
+
+
+# --- Gate-question briefing (Type A gates open with a plain-language briefing) ---
+
+_RULE_4_SEQUENCE = "header → briefing → 3-5 bullets → artifact path → decision prompt"
+_NEVER_COPY_SENTENCE = "never copied into the SUPERHUMAN.md decisions log"
+
+
+def _type_a_block(skill_root: Path) -> str:
+    """Return the fenced Type A template from `templates/gate-headers.md`.
+
+    Args:
+        skill_root: path to the skill root.
+
+    Returns:
+        str: the body of the first fenced block under `## Type A`.
+    """
+    text = (skill_root / "templates" / "gate-headers.md").read_text(encoding="utf-8")
+    section = text.split("## Type A", 1)[1].split("\n## ", 1)[0]
+    match = re.search(r"```\n(.*?)```", section, re.DOTALL)
+    assert match, "Type A section must hold a fenced template"
+    return match.group(1)
+
+
+def test_type_a_template_opens_with_a_briefing(skill_root: Path) -> None:
+    """The briefing sits between the header and the summary bullets.
+
+    A stakeholder who hasn't seen the project recently needs what it is,
+    what's being decided and why it matters now before any detail.
+    """
+    block = _type_a_block(skill_root)
+    header = block.index("**[G<n>]")
+    briefing = block.index("<Briefing")
+    bullets = block.index("<3-5 bullet summary")
+    assert header < briefing < bullets, "briefing must sit between header and bullets"
+    lowered = " ".join(block.lower().split())
+    for cue in ("hasn't seen this project recently", "what is being decided", "why it matters now"):
+        assert cue in lowered, f"briefing guidance must mention: {cue}"
+
+
+def test_type_a_template_options_are_outcomes_and_artifact_follows_briefing(
+    skill_root: Path,
+) -> None:
+    """Options say what they lead to; the artifact path is supporting detail."""
+    block = _type_a_block(skill_root)
+    assert "— <what it leads to>" in block, "options must be written as outcomes"
+    assert "because <reason>" in block, "the recommendation must carry its reason"
+    assert block.index("**Artifact:**") > block.index("<Briefing"), (
+        "the artifact path must come after the briefing, never in the lead"
+    )
+
+
+def test_gate_format_rule_4_includes_briefing_everywhere(skill_root: Path) -> None:
+    """`roles/pm.md` and `SKILL.md` state the same rule-4 sequence."""
+    for rel in ("roles/pm.md", "SKILL.md"):
+        text = (skill_root / rel).read_text(encoding="utf-8")
+        assert _RULE_4_SEQUENCE in text, f"{rel} rule 4 must read: {_RULE_4_SEQUENCE}"
+
+
+def test_briefing_never_reaches_the_decisions_log(skill_root: Path) -> None:
+    """The briefing is presentation only; the log line format stays rule 5's."""
+    for rel in ("roles/pm.md", "SKILL.md", "templates/gate-headers.md"):
+        text = (skill_root / rel).read_text(encoding="utf-8")
+        assert _NEVER_COPY_SENTENCE in text, f"{rel} must say the briefing is {_NEVER_COPY_SENTENCE}"
+    pm = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    assert "5. Every gate appended to SUPERHUMAN.md with timestamp + decision.\n" in pm, (
+        "rule 5 (the decisions-log entry) must stay unchanged"
+    )
