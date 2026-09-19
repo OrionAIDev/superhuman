@@ -29,6 +29,7 @@ from publication_patterns import find_tokens, locate_tokens_file, resolve_tokens
 
 sys.path.insert(0, str(_REPO_ROOT))
 import scripts.fleet as fleet_package  # noqa: E402
+from scripts.fleet.adapter.base import format_launch_instruction  # noqa: E402
 from scripts.fleet.cli import build_parser  # noqa: E402
 
 
@@ -40,14 +41,106 @@ def _operator_tokens() -> list[str]:
 #: The literal "python -m scripts.fleet.cli observe <verb>" invocation,
 #: capturing just the verb group -- `observe session-start` or
 #: `observe dispatch` -- so two occurrences can be compared for BYTE
-#: equality rather than mere containment (TC-64/FR-15).
+#: equality rather than mere containment (TC-64/FR-15). Matches the literal
+#: word `python`, which is correct for PROSE sources (SKILL.md, roles/pm.md,
+#: phases/3-implementation.md, and `format_launch_instruction()`'s returned
+#: string) -- none of those spell the interpreter as a shell variable.
 _VERB_INVOCATION_RE = re.compile(r"python -m scripts\.fleet\.cli (observe [\w-]+)")
+
+#: Same idea, but for the BASH HOOK WRAPPERS, which invoke `"$PYTHON"` (an
+#: interpreter resolved at runtime -- see each wrapper's own comment on the
+#: Microsoft Store "app execution alias" stub), never the literal word
+#: `python`.
+#:
+#: B3 preflight regression: the previous `_VERB_INVOCATION_RE` above matched
+#: only the literal word `python`, which exists in these wrappers'
+#: COMMENTS (e.g. session-start's line-16 prose explaining what the script
+#: does) but never on the executable line, which reads `"$PYTHON" -m ...`.
+#: That comment-only match let this identity test pass no matter what the
+#: executable line actually invoked -- confirmed by mutation (see this
+#: chunk's status report).
+_HOOK_VERB_RE = re.compile(
+    r'(?:"\$PYTHON"|\$PYTHON|python3?)\s+-m\s+scripts\.fleet\.cli\s+(observe\s+[\w-]+)'
+)
+
+#: A `--flag-name` token, used to extract the flag SHAPE of an invocation
+#: for comparison, not just its verb (B3 requirement (c): compare the verb
+#: AND the flag names).
+_FLAG_RE = re.compile(r"--[a-zA-Z][\w-]*")
+
+#: A backtick-delimited span (Markdown/docstring code span). `[^`]` is a
+#: negated character class, not `.`, so it matches embedded newlines --
+#: needed because roles/pm.md's own invocation is hand-wrapped across two
+#: source lines inside one backtick span.
+_BACKTICK_SPAN_RE = re.compile(r"`([^`]*)`")
 
 
 def _first_verb(text: str) -> str | None:
     """Return the first `observe <verb>` token `_VERB_INVOCATION_RE` finds."""
     match = _VERB_INVOCATION_RE.search(text)
     return match.group(1) if match else None
+
+
+def _prose_command_flags(text: str, near: re.Match, window: int = 300) -> frozenset[str]:
+    """Return every `--flag` name found in a backtick code span near `near`.
+
+    `near` is the verb-invocation match this flag set belongs to. Only
+    backtick spans starting within `window` characters of it count -- e.g.
+    SKILL.md's floor step splits one invocation across two adjacent spans
+    (`` `python -m ... observe session-start --workspace ... --slug ...` ``
+    then, ~100 characters later, `` `--handoff-id ...` ``), so a raw
+    "first backtick span only" scope would miss the conditional flag. But
+    scoping to backtick spans ANYWHERE in the subsection is too wide: both
+    SKILL.md and roles/pm.md separately warn readers not to confuse the
+    invocation with `` `--workspace` ``, over a thousand characters away in
+    the same subsection -- unrelated prose that happens to also be
+    backtick-wrapped. The window keeps the real, nearby continuation while
+    excluding that unrelated, far-off mention.
+    """
+    flags: set[str] = set()
+    for span_match in _BACKTICK_SPAN_RE.finditer(text):
+        if abs(span_match.start() - near.start()) <= window:
+            flags.update(_FLAG_RE.findall(span_match.group(1)))
+    return frozenset(flags)
+
+
+def _strip_bash_comment_lines(text: str) -> str:
+    """Drop every line whose stripped form starts with `#` -- a full-line
+    bash comment.
+
+    B3 requirement (a): a verb/flag mentioned only in a wrapper's own
+    explanatory comment (e.g. session-start's line 16) must never be able
+    to satisfy a check meant to read the EXECUTED invocation.
+    """
+    return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
+
+
+def _executed_hook_invocation(
+    comment_stripped_text: str,
+) -> tuple[str, frozenset[str]] | None:
+    """Return `(verb, flag_names)` for the first EXECUTED `observe <verb>`
+    call in a comment-stripped bash hook wrapper, or None if there is none.
+
+    B3 requirement (b): finds the invocation on an actual executable line
+    (matching `"$PYTHON" -m ...`, never the literal word `python`, which
+    only ever appears in these wrappers' comments), then gathers flag names
+    across every physical line of that SAME backslash-continued logical
+    statement, so a flag on a continuation line (e.g. `--harness claude \\`)
+    is not missed.
+    """
+    lines = comment_stripped_text.splitlines()
+    for i, line in enumerate(lines):
+        match = _HOOK_VERB_RE.search(line)
+        if not match:
+            continue
+        block = [line]
+        j = i
+        while block[-1].rstrip().endswith("\\"):
+            j += 1
+            block.append(lines[j])
+        flags = frozenset(_FLAG_RE.findall("\n".join(block)))
+        return match.group(1), flags
+    return None
 
 
 def _find_heading_containing(lines: list[str], *substrings: str) -> tuple[int, int]:
@@ -199,63 +292,173 @@ class TestPortabilityRegression:
 class TestIdenticalVerb:
     """FR-15 / TC-64. Both pairs the floor names a verb for: the
     session-start pair (hook <-> `SKILL.md`) and the dispatch pair (hook
-    <-> `roles/pm.md` / `phases/3-implementation.md`)."""
+    <-> `roles/pm.md` / `phases/3-implementation.md`) -- plus, since B7, the
+    session-start floor's SECOND carrier (`format_launch_instruction()`,
+    embedded in every adapter's handoff prompt).
+
+    B3 preflight regression: the OLD version of this test read every
+    invocation with `_VERB_INVOCATION_RE`, which matches only the literal
+    word `python`. The bash hook wrappers invoke `"$PYTHON"` (a resolved-
+    at-runtime interpreter path) on their EXECUTED line, so the only place
+    that regex ever matched in a wrapper was a COMMENT describing the
+    invocation, never the invocation itself -- the test could not fail no
+    matter what the executable line said. Fixed by (a) stripping comment
+    lines from the hook wrapper text before searching
+    (`_strip_bash_comment_lines`), (b) matching the real interpreter
+    reference (`_HOOK_VERB_RE`) on what remains, (c) comparing flag names in
+    addition to the verb wherever the two sides are meant to have the same
+    shape, and (d) adding the base.py/B7 pair below. Confirmed by mutation
+    (see this chunk's status report): changing the verb OR a flag name on
+    session-start's executable line (leaving its comments untouched) turns
+    this test red; reverting turns it green again.
+    """
 
     def test_hook_and_prose_floor_name_identical_verb(self) -> None:
-        session_start_hook_text = (
-            _REPO_ROOT / "templates" / "hooks" / "claude-code" / "session-start"
-        ).read_text(encoding="utf-8")
-        subagent_start_hook_text = (
-            _REPO_ROOT / "templates" / "hooks" / "claude-code" / "subagent-start"
-        ).read_text(encoding="utf-8")
+        session_start_hook_text = _strip_bash_comment_lines(
+            (
+                _REPO_ROOT / "templates" / "hooks" / "claude-code" / "session-start"
+            ).read_text(encoding="utf-8")
+        )
+        subagent_start_hook_text = _strip_bash_comment_lines(
+            (
+                _REPO_ROOT / "templates" / "hooks" / "claude-code" / "subagent-start"
+            ).read_text(encoding="utf-8")
+        )
         skill_md_text = (_REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
         pm_md_text = (_REPO_ROOT / "roles" / "pm.md").read_text(encoding="utf-8")
         impl_md_text = (_REPO_ROOT / "phases" / "3-implementation.md").read_text(
             encoding="utf-8"
         )
 
-        # Session-start pair: the SessionStart hook vs. SKILL.md's
-        # session-start-floor first-action step (chunk 9's own migration,
-        # PM ruling R7 -- previously a MISMATCH: the hook said
-        # `observe session-start`, SKILL.md said `observe launch`). Scoped
-        # to the specific subsection (not a whole-file first-match) so
-        # this stays correct even if SKILL.md's section order changes.
-        skill_md_floor_subsection = _subsection(skill_md_text, "fleet observation", "floor")
-        hook_session_verb = _first_verb(session_start_hook_text)
-        floor_session_verb = _first_verb(skill_md_floor_subsection)
-        assert hook_session_verb == "observe session-start", (
-            f"templates/hooks/claude-code/session-start names {hook_session_verb!r}, "
-            "expected 'observe session-start'"
+        # --- Session-start pair: the SessionStart hook vs. SKILL.md's -----
+        # --- session-start-floor first-action step -------------------------
+        #
+        # Read from the EXECUTED line (comments already stripped above).
+        # Both verb AND flags are pinned against a hardcoded expectation, so
+        # either kind of mutation on the hook's real invocation fails this
+        # test -- not just a verb change.
+        hook_session_result = _executed_hook_invocation(session_start_hook_text)
+        assert hook_session_result is not None, (
+            "templates/hooks/claude-code/session-start: no EXECUTED "
+            "`observe <verb>` invocation found (comment lines excluded)"
         )
+        hook_session_verb, hook_session_flags = hook_session_result
+        assert (hook_session_verb, hook_session_flags) == (
+            "observe session-start",
+            frozenset({"--hook-payload", "--harness"}),
+        ), (
+            f"templates/hooks/claude-code/session-start's EXECUTED invocation is "
+            f"{hook_session_verb!r} with flags {sorted(hook_session_flags)} -- "
+            "expected 'observe session-start' with flags ['--harness', '--hook-payload']"
+        )
+
+        skill_md_floor_subsection = _subsection(skill_md_text, "fleet observation", "floor")
+        floor_session_match = _VERB_INVOCATION_RE.search(skill_md_floor_subsection)
+        assert floor_session_match, (
+            "SKILL.md's session-start-floor step names no `observe <verb>` invocation"
+        )
+        floor_session_verb = floor_session_match.group(1)
+        floor_session_flags = _prose_command_flags(skill_md_floor_subsection, floor_session_match)
         assert floor_session_verb == hook_session_verb, (
             f"SKILL.md's session-start-floor step names {floor_session_verb!r}, but "
             f"templates/hooks/claude-code/session-start names {hook_session_verb!r} -- "
             "FR-15 requires the identical verb in both places, no parallel or "
             "divergent invocation"
         )
+        assert floor_session_flags == frozenset(
+            {"--workspace", "--slug", "--handoff-id"}
+        ), (
+            f"SKILL.md's session-start-floor step names flags "
+            f"{sorted(floor_session_flags)} -- expected "
+            "['--handoff-id', '--slug', '--workspace']"
+        )
+        # NOTE: the hook's flags and the floor's flags are asserted
+        # separately above, never against EACH OTHER -- they legitimately
+        # differ. The hook derives --workspace/--slug/--handoff-id from the
+        # harness's own hook JSON via --hook-payload (D2b; ARCHITECTURE.md
+        # Addendum A); the floor has no hook payload to parse and so
+        # names them directly. Only the verb is required to match across
+        # this pair; weakening either side's flag assertion to force a
+        # false equality would hide a real regression, not catch one.
 
-        # Dispatch pair: the SubagentStart hook vs. both prose call-outs
-        # (already wired identically since chunks 3/7 -- pinned here too,
-        # in the one place FR-15's own requirement is centrally asserted,
-        # rather than left implicit in test_seams.py's separate seam
-        # checks). Each prose file also carries an EARLIER, unrelated
-        # `observe handoff-emit` mention (Chunk 2's seam), so this must be
-        # scoped to the dispatch-observation subsection specifically,
-        # never a whole-file first-match.
-        hook_dispatch_verb = _first_verb(subagent_start_hook_text)
-        assert hook_dispatch_verb == "observe dispatch", (
-            f"templates/hooks/claude-code/subagent-start names {hook_dispatch_verb!r}, "
-            "expected 'observe dispatch'"
+        # --- Second floor carrier (B7): format_launch_instruction(), -------
+        # --- embedded in every adapter's handoff prompt ---------------------
+        #
+        # Calls the real function rather than regex-scraping base.py's
+        # source, so this reads the actual text a launched session would
+        # see, not a comment near it. Unlike the hook-vs-floor pair above,
+        # this carrier and SKILL.md's floor step use the SAME explicit-flag
+        # form (both name --workspace/--slug/--handoff-id directly), so verb
+        # AND flags are required to match exactly here.
+        base_instruction = format_launch_instruction()
+        base_match = _VERB_INVOCATION_RE.search(base_instruction)
+        assert base_match, (
+            "scripts/fleet/adapter/base.py's format_launch_instruction() no longer "
+            f"names an `observe <verb>` invocation: {base_instruction!r}"
+        )
+        base_verb = base_match.group(1)
+        base_flags = _prose_command_flags(base_instruction, base_match)
+        assert base_verb == floor_session_verb, (
+            f"scripts/fleet/adapter/base.py's format_launch_instruction() names "
+            f"{base_verb!r}, but SKILL.md's floor step names {floor_session_verb!r} -- "
+            "FR-15 has two floor carriers (SKILL.md's first-action step and "
+            "base.py's _LAUNCH_INSTRUCTION, embedded in every adapter's handoff "
+            "prompt) and both must name the identical verb"
+        )
+        assert base_flags == floor_session_flags, (
+            f"scripts/fleet/adapter/base.py's format_launch_instruction() names "
+            f"flags {sorted(base_flags)}, but SKILL.md's floor step names "
+            f"{sorted(floor_session_flags)} -- both carriers use the same explicit "
+            "--workspace/--slug/--handoff-id form and must name the same flags"
+        )
+
+        # --- Dispatch pair: the SubagentStart hook vs. both prose ----------
+        # --- call-outs -------------------------------------------------------
+        #
+        # Each prose file also carries an EARLIER, unrelated
+        # `observe handoff-emit` mention (Chunk 2's seam), so this stays
+        # scoped to the dispatch-observation subsection specifically, never
+        # a whole-file first-match.
+        hook_dispatch_result = _executed_hook_invocation(subagent_start_hook_text)
+        assert hook_dispatch_result is not None, (
+            "templates/hooks/claude-code/subagent-start: no EXECUTED "
+            "`observe <verb>` invocation found (comment lines excluded)"
+        )
+        hook_dispatch_verb, hook_dispatch_flags = hook_dispatch_result
+        assert (hook_dispatch_verb, hook_dispatch_flags) == (
+            "observe dispatch",
+            frozenset({"--hook-payload", "--harness"}),
+        ), (
+            f"templates/hooks/claude-code/subagent-start's EXECUTED invocation is "
+            f"{hook_dispatch_verb!r} with flags {sorted(hook_dispatch_flags)} -- "
+            "expected 'observe dispatch' with flags ['--harness', '--hook-payload']"
+        )
+
+        # The dispatch floor prose names --dispatch-id/--local-id, which the
+        # hook has no counterpart for (the hook derives them from the
+        # transcript via --hook-payload, D5) -- a legitimate difference,
+        # same reasoning as the session-start pair above, so only --harness
+        # is shared and only the verb is compared across hook and floor.
+        expected_dispatch_prose_flags = frozenset(
+            {"--harness", "--dispatch-id", "--local-id"}
         )
         for label, text in (
             ("roles/pm.md", pm_md_text),
             ("phases/3-implementation.md", impl_md_text),
         ):
-            floor_dispatch_verb = _first_verb(_subsection(text, "dispatch", "observation"))
+            dispatch_subsection = _subsection(text, "dispatch", "observation")
+            floor_dispatch_match = _VERB_INVOCATION_RE.search(dispatch_subsection)
+            assert floor_dispatch_match, f"{label}: no `observe <verb>` invocation found"
+            floor_dispatch_verb = floor_dispatch_match.group(1)
+            floor_dispatch_flags = _prose_command_flags(dispatch_subsection, floor_dispatch_match)
             assert floor_dispatch_verb == hook_dispatch_verb, (
                 f"{label} names {floor_dispatch_verb!r}, but "
                 f"templates/hooks/claude-code/subagent-start names {hook_dispatch_verb!r} "
                 "-- FR-15 requires the identical verb in both places"
+            )
+            assert floor_dispatch_flags == expected_dispatch_prose_flags, (
+                f"{label} names flags {sorted(floor_dispatch_flags)} -- expected "
+                f"{sorted(expected_dispatch_prose_flags)}"
             )
 
     def test_hooks_contain_no_operator_token(self) -> None:
