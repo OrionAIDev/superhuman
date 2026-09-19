@@ -44,6 +44,7 @@ import copy
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -793,7 +794,6 @@ class TestBomAndMalformedSettings:
         assert status_code == 1
 
 
-
 class TestMigration:
     def test_migrates_worktree_rooted_hand_install_to_exactly_one_entry(self, temp_settings_json: Path) -> None:
         """TC-95: the seeded `startup` group already carries ONE
@@ -884,6 +884,52 @@ class TestAtomicWrite:
         assert temp_settings_json.read_text(encoding="utf-8") == before_text
         leftover = list(temp_settings_json.parent.glob(f".{temp_settings_json.name}.*.tmp"))
         assert leftover == [], f"orphaned temp file(s) left behind: {leftover}"
+
+    def test_non_os_error_during_write_still_cleans_up_the_temp_file(
+        self, temp_settings_json: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-120 (Phase 3.3 preflight item 6, orphan half): the old code's
+        cleanup was `except OSError: tmp_path.unlink(...); raise`, which
+        only fires for `OSError`. A NON-`OSError` failure partway through
+        the write (simulated here at `os.fsync`, after the temp file
+        already exists on disk) must still leave no orphaned temp file --
+        proving cleanup no longer depends on the failure being an
+        `OSError`."""
+        before_text = temp_settings_json.read_text(encoding="utf-8")
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("simulated non-OSError failure mid-write")
+
+        monkeypatch.setattr(hooks_install.os, "fsync", _boom)
+
+        with pytest.raises(ValueError):
+            hooks_install.install(settings_path=temp_settings_json)
+
+        assert temp_settings_json.read_text(encoding="utf-8") == before_text
+        leftover = list(temp_settings_json.parent.glob(f".{temp_settings_json.name}.*.tmp"))
+        assert leftover == [], f"orphaned temp file(s) left behind: {leftover}"
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX file-permission bits (item 6's other half) are not meaningfully "
+        "testable via os.chmod/stat over an NTFS working copy on Windows",
+    )
+    def test_original_file_permissions_are_preserved_across_a_write(
+        self, temp_settings_json_clean: Path
+    ) -> None:
+        """TC-121 (Phase 3.3 preflight item 6, permissions half, POSIX
+        only): `tempfile.mkstemp` creates its file `0600`, and
+        `os.replace` carries the REPLACING file's mode over the replaced
+        file's -- so writing through an untouched temp file silently
+        tightens a pre-existing, more permissive settings.json (e.g.
+        `0644`) down to `0600` on every install. The original file's mode
+        must survive the write unchanged."""
+        os.chmod(temp_settings_json_clean, 0o644)
+
+        hooks_install.install(settings_path=temp_settings_json_clean)
+
+        mode_after = stat.S_IMODE(temp_settings_json_clean.stat().st_mode)
+        assert mode_after == 0o644, f"expected mode 0o644 preserved, got {oct(mode_after)}"
 
 
 class TestGitResolutionFaults:

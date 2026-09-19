@@ -57,6 +57,7 @@ import difflib
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -445,33 +446,59 @@ def _atomic_write(settings_path: Path, text: str) -> None:
 
     Writes to a temp file in the SAME directory, then `os.replace()` --
     never edited in place, so a crash between the two leaves the real file
-    exactly as it was, never observed half-written. On any failure this
-    function can still observe, the temp file is removed rather than left
-    orphaned.
+    exactly as it was, never observed half-written. On any failure --
+    including one this function cannot otherwise observe, e.g. a
+    non-`OSError` exception -- the temp file is removed rather than left
+    orphaned (Phase 3.3 preflight item 6: the original code only cleaned
+    up on `OSError`, via `except OSError: tmp_path.unlink(...); raise`, so
+    any other exception type leaked the temp file; the `try/finally`
+    below cleans up on ANY exception, not just that one family).
+
+    Also preserves `settings_path`'s existing file mode across the replace
+    (item 6's other half): `tempfile.mkstemp` creates its file mode
+    `0600` (owner read/write only) per the stdlib docs --
+    https://docs.python.org/3/library/tempfile.html#tempfile.mkstemp
+    ("the file is readable and writable only by the creating user ID") --
+    and `os.replace` carries the REPLACING file's own mode over the
+    replaced file's, so writing through an unmodified temp file would
+    silently tighten a pre-existing, more permissive settings.json (e.g.
+    `0644`) down to `0600` on every install/uninstall. When `settings_path`
+    already exists, this function reads its mode first and `os.chmod`s the
+    temp file to match before the replace; `os.chmod` is a no-op beyond
+    the read-only attribute bit on Windows, so this is harmless there.
+    When `settings_path` does not exist yet (a brand-new file), there is
+    no prior mode to preserve and the temp file's own default stands.
 
     Args:
         settings_path: the real destination path.
         text: the full new file content.
 
     Raises:
-        OSError: the write or replace failed; `settings_path` itself is
-            unmodified either way -- `os.replace` is atomic on both POSIX
-            and Windows for a same-volume rename.
+        OSError: the write, chmod, or replace failed; `settings_path`
+            itself is unmodified either way -- `os.replace` is atomic on
+            both POSIX and Windows for a same-volume rename.
     """
     settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original_mode: int | None = None
+    if settings_path.exists():
+        original_mode = stat.S_IMODE(settings_path.stat().st_mode)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{settings_path.name}.", suffix=".tmp", dir=str(settings_path.parent)
     )
     tmp_path = Path(tmp_name)
+    replaced = False
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
+        if original_mode is not None:
+            os.chmod(tmp_path, original_mode)
         os.replace(tmp_path, settings_path)
-    except OSError:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        replaced = True
+    finally:
+        if not replaced:
+            tmp_path.unlink(missing_ok=True)
 
 
 def _remove_owned(hooks: dict[str, Any]) -> None:
