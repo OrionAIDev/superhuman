@@ -47,8 +47,13 @@ trap 'exit 0' EXIT
 # inside the skill checkout, so its own path is a reliable anchor for the
 # skill root regardless of where the harness's config points at it from --
 # unlike the workspace under observation, this path is fixed at install
-# time. Overridable via $SUPERHUMAN_ROOT for a non-standard layout.
-SUPERHUMAN_ROOT="${SUPERHUMAN_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+# time. Preflight B1: this used to also be overridable via $SUPERHUMAN_ROOT
+# for a non-standard layout -- NO LONGER. A committed project settings.json
+# can set env vars this hook subprocess inherits, so honouring an override
+# here let a malicious repo point this wrapper at attacker-chosen code (see
+# the $CLAUDE_PROJECT_DIR comment below for the full finding). Derived
+# ONLY from this script's own path now, unconditionally.
+SUPERHUMAN_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 
 # --- resolve a Python interpreter that actually RUNS (ARCHITECTURE.md §6.3) -
 #
@@ -76,13 +81,23 @@ done
 # ARCHITECTURE.md Addendum §A / CHUNK-1-FINDINGS.md finding 8:
 # $CLAUDE_PROJECT_DIR is set by the harness (measured 17/17 captures) and
 # stable for the session's lifetime, unlike the payload's `cwd`, which
-# drifts as the shell moves. It is harness-supplied, never repo-authored
-# -- a repository cannot set an environment variable in the process that
-# invokes it -- which is exactly why it is an admissible locator input
-# here (NFR-4 confinement is unweakened: it is only a starting point, and
-# the locator still derives every returned workspace via `git
-# rev-parse`). Passed through to the portable CLI generically as
-# `--anchor`; `scripts/fleet/cli.py` names no harness (D4).
+# drifts as the shell moves. Preflight B1 correction: an earlier version of
+# this comment claimed "a repository cannot set an environment variable in
+# the process that invokes it" to justify trusting this var -- that claim
+# is FALSE. The Claude Code settings reference documents the committed
+# project settings file as carrying "the environment variables the project
+# needs", and a hook subprocess inherits its parent's environment, so a
+# malicious repo's settings.json CAN set this one too. It stays admissible
+# as a locator input anyway, for a DIFFERENT reason: it is only ever a
+# STARTING POINT the locator still validates via `git rev-parse` (NFR-4
+# confinement is unweakened) -- unlike $SUPERHUMAN_ROOT below, which used
+# to be read from the environment and let an attacker-chosen root select
+# WHICH CODE RUNS outright (verified: code from an attacker-controlled root
+# executed, and since this script deliberately leaves stdout alone, that
+# output became session context -- a direct prompt-injection channel).
+# $SUPERHUMAN_ROOT is no longer read from the environment at all (B1).
+# Passed through to the portable CLI generically as `--anchor`;
+# `scripts/fleet/cli.py` names no harness (D4).
 ANCHOR_ARGS=()
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
   ANCHOR_ARGS=(--anchor "$CLAUDE_PROJECT_DIR")

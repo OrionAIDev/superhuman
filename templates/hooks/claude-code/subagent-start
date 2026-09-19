@@ -49,8 +49,13 @@ payload="$(cat 2>/dev/null || true)"
 # inside the skill checkout, so its own path is a reliable anchor for the
 # skill root regardless of where the harness's config points at it from --
 # unlike the workspace under observation, this path is fixed at install
-# time. Overridable via $SUPERHUMAN_ROOT for a non-standard layout.
-SUPERHUMAN_ROOT="${SUPERHUMAN_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+# time. Preflight B1: this used to also be overridable via $SUPERHUMAN_ROOT
+# for a non-standard layout -- NO LONGER. A committed project settings.json
+# can set env vars this hook subprocess inherits, so honouring an override
+# here let a malicious repo point this wrapper at attacker-chosen code (see
+# session-start's identical $CLAUDE_PROJECT_DIR comment for the full
+# finding). Derived ONLY from this script's own path now, unconditionally.
+SUPERHUMAN_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 
 # --- resolve a Python interpreter that actually RUNS (ARCHITECTURE.md §6.3) -
 #
