@@ -1791,3 +1791,36 @@ def test_briefing_never_reaches_the_decisions_log(skill_root: Path) -> None:
     assert "5. Every gate appended to SUPERHUMAN.md with timestamp + decision.\n" in pm, (
         "rule 5 (the decisions-log entry) must stay unchanged"
     )
+
+
+def test_drift_gate_template_carries_a_briefing(skill_root: Path) -> None:
+    """G6 is a Type A gate, so its delta report opens with a briefing too."""
+    text = (skill_root / "templates" / "delta-report.md.tpl").read_text(encoding="utf-8")
+    assert "**Briefing:**" in text, "the delta report must open with a briefing line"
+    assert text.index("**Briefing:**") < text.index("**Trigger:**"), (
+        "the briefing must come before the trigger line"
+    )
+
+
+def test_recommendation_rule_is_relative_to_the_alternatives(skill_root: Path) -> None:
+    """Rule 1 must not read as 'above the briefing'.
+
+    The briefing now precedes the recommendation, so 'recommendation first'
+    has to say what it is first *of*.
+    """
+    for rel in ("roles/pm.md", "SKILL.md"):
+        text = (skill_root / rel).read_text(encoding="utf-8")
+        assert "recommendation before the alternatives" in text.lower(), (
+            f"{rel} rule 1 must say the recommendation comes before the alternatives"
+        )
+
+
+@pytest.mark.parametrize(
+    "phase_file", ["1-requirements.md", "2.1-test-plan.md"]
+)
+def test_phase_recipes_name_the_briefing(skill_root: Path, phase_file: str) -> None:
+    """Phase recipes that spell out a gate's shape must include the briefing."""
+    text = (skill_root / "phases" / phase_file).read_text(encoding="utf-8")
+    assert "briefing" in text.lower(), (
+        f"phases/{phase_file} describes a Type A gate and must name the briefing"
+    )
