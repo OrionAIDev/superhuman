@@ -160,6 +160,39 @@ class SkillRootRefusedError(HooksInstallError):
         self.root = root
 
 
+class SkillRootInsideGitDirError(HooksInstallError):
+    """The resolved skill root is inside a `.git` directory (Phase 3.3
+    preflight recommended fix, item 2): a submodule's `git rev-parse
+    --git-common-dir` names `<superproject>/.git/modules/<name>`, and this
+    module's `_default_skill_root` takes that value's `.parent` unchanged
+    -- landing on `<superproject>/.git/modules`, a directory *inside*
+    `.git` that is never a working tree at all. `_is_linked_worktree` does
+    not catch this (its own `(root / ".git").is_file()` test is False
+    there -- `<superproject>/.git/modules/.git` does not exist), so
+    without this check `resolve_skill_root` would silently accept a
+    nonsense root and register hook commands nobody could ever run.
+
+    Attributes:
+        root: the refused root.
+    """
+
+    def __init__(self, root: Path) -> None:
+        """Initialize with the refused root, building the operator-facing message.
+
+        Args:
+            root: the resolved root that was refused.
+        """
+        super().__init__(
+            f"refusing to install: resolved skill root {root} is inside a "
+            "`.git` directory, not a working tree -- this is the shape "
+            "`git rev-parse --git-common-dir` produces when this module's "
+            "own file is running from inside a git submodule "
+            "(`<superproject>/.git/modules/<name>`). Pass an explicit "
+            "--skill-root to override deliberately."
+        )
+        self.root = root
+
+
 @dataclass(frozen=True, slots=True)
 class InstallResult:
     """Outcome of one `install()` call.
@@ -304,6 +337,28 @@ def _is_linked_worktree(root: Path) -> bool:
     return (root / ".git").is_file()
 
 
+def _is_inside_dot_git(root: Path) -> bool:
+    """Structurally test whether `root` sits inside a `.git` directory.
+
+    A submodule's `git rev-parse --git-common-dir` names
+    `<superproject>/.git/modules/<name>`; `_default_skill_root` takes that
+    value's `.parent`, landing on `<superproject>/.git/modules` -- a
+    directory whose own path carries `.git` as an ancestor SEGMENT, never
+    as its own final component (a normal main checkout's `--git-common-dir`
+    is exactly `<root>/.git`, whose parent is the working tree root
+    itself, with no `.git` segment anywhere in it).
+
+    Args:
+        root: a candidate working-tree root.
+
+    Returns:
+        True iff `.git` appears anywhere among `root`'s own path
+        components -- the sound, structural signature of "this path is
+        inside git's own private directory," not a real working tree.
+    """
+    return ".git" in root.parts
+
+
 def _default_skill_root() -> Path:
     """Resolve the main checkout root from this module's OWN location (R1).
 
@@ -357,11 +412,15 @@ def resolve_skill_root(skill_root: Path | None = None) -> tuple[Path, bool]:
     Raises:
         SkillRootRefusedError: auto-resolution (`skill_root` is None)
             landed inside a linked worktree.
+        SkillRootInsideGitDirError: auto-resolution landed inside a `.git`
+            directory (the submodule shape -- Phase 3.3 preflight item 2).
         HooksInstallError: git resolution failed outright.
     """
     if skill_root is not None:
         return skill_root, True
     root = _default_skill_root()
+    if _is_inside_dot_git(root):
+        raise SkillRootInsideGitDirError(root)
     if _is_linked_worktree(root):
         raise SkillRootRefusedError(root)
     return root, False

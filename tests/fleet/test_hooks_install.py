@@ -676,6 +676,41 @@ class TestOwnershipTightening:
         )
 
 
+class TestSkillRootInsideGitDir:
+    def test_refuses_when_resolved_root_is_inside_a_dot_git_directory(
+        self, temp_settings_json: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-115 (Phase 3.3 preflight item 2): monkeypatch the git-based
+        resolver to return a fixture directory shaped exactly like the
+        submodule failure mode -- `<superproject>/.git/modules/<name>`,
+        the value `git rev-parse --git-common-dir`'s `.parent` produces
+        from inside a submodule (reproduced directly against a real git
+        submodule during development: `git rev-parse --path-format=
+        absolute --git-common-dir` from inside the submodule returned
+        `<outer>/.git/modules/sub`) -- and assert install() refuses rather
+        than silently registering a path inside git's own private
+        directory. Nothing is written."""
+        fake_root = tmp_path / "outer" / ".git" / "modules" / "sub"
+        fake_root.mkdir(parents=True)
+        monkeypatch.setattr(hooks_install, "_default_skill_root", lambda: fake_root)
+
+        before_text = temp_settings_json.read_text(encoding="utf-8")
+        with pytest.raises(hooks_install.SkillRootInsideGitDirError) as excinfo:
+            hooks_install.install(settings_path=temp_settings_json)
+
+        assert str(fake_root) in str(excinfo.value)
+        assert temp_settings_json.read_text(encoding="utf-8") == before_text
+
+    def test_not_confused_with_an_ordinary_main_checkout_root(self) -> None:
+        """Companion sanity check: an ordinary main-checkout root (no
+        `.git` path segment) must NOT be flagged by the new check."""
+        assert hooks_install._is_inside_dot_git(Path("C:/example/skills/superhuman")) is False
+
+    def test_flags_a_dot_git_modules_path(self) -> None:
+        """`_is_inside_dot_git` on its own: the exact submodule shape."""
+        assert hooks_install._is_inside_dot_git(Path("C:/example/outer/.git/modules/sub")) is True
+
+
 class TestMigration:
     def test_migrates_worktree_rooted_hand_install_to_exactly_one_entry(self, temp_settings_json: Path) -> None:
         """TC-95: the seeded `startup` group already carries ONE
