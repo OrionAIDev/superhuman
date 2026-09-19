@@ -16,14 +16,15 @@ This module is the tests/-wide superset: it parses every `tests/**/*.py`
 file's AST (not `hooks_install.py`'s own tests only) and asserts, for
 every candidate call:
 
-  (a) a direct call to `install`/`uninstall`/`status` (by bare or
-      attribute name -- `hooks_install.install(...)` or a bare
-      `install(...)` after an `from ... import install`) supplies either
-      a `settings_path=` keyword or at least one positional argument
-      (the function's first parameter IS `settings_path`, so a
-      positional call is equally explicit -- this module does not
-      require the keyword spelling, only that a path was actually
-      supplied, which is the property that matters); and
+  (a) a direct call to `install`/`uninstall`/`status` -- by bare name, by
+      attribute (`hooks_install.install(...)`), or through a FUNCTION-
+      level import alias (`from scripts.fleet.hooks_install import
+      install as do_it`, then `do_it(...)`) -- supplies either a
+      `settings_path=` keyword or at least one positional argument (the
+      function's first parameter IS `settings_path`, so a positional call
+      is equally explicit -- this module does not require the keyword
+      spelling, only that a path was actually supplied, which is the
+      property that matters); and
 
   (b) any call whose argument is a list literal shaped like a CLI argv
       (contains the consecutive string literals `"hooks"` then one of
@@ -32,28 +33,39 @@ every candidate call:
       covers `cli.main(["hooks", "install", ...])` and an equivalent
       `subprocess.run([..., "hooks", "install", ...])` shape.
 
-**Why this cannot be bypassed by the obvious call shapes.** Both checks
-are pure static AST inspection of every file `tests/` ships -- they do
-not import or execute the scanned files, so a test that is skipped,
-xfailed, or never collected by the current pytest invocation is still
-caught. Bare-name matching (rather than requiring a specific import
-alias) means neither `from scripts.fleet.hooks_install import install`
-nor `hooks_install.install` nor a locally-renamed import can dodge check
-(a) -- the guard matches on the CALLED name, not on how it was imported.
-Check (b) matches on the literal argv shape regardless of which function
-receives it (`cli.main`, a `subprocess.run`/`subprocess.check_output`
-call, or a test helper wrapping either), so a new call site does not need
-to be enumerated here by name.
+**PM review, 2026-09-19: check (a) missed an import alias.** The
+original version matched only a call's bare/attribute name, and its own
+docstring wrongly claimed a "locally-renamed import" could not dodge it.
+The PM disproved that with a throwaway plant: `from
+scripts.fleet.hooks_install import install as do_it` then
+`do_it(dry_run=True)` passed check (a) uncaught (2 passed, should have
+been 1 failed). Fixed by `_collect_installer_import_aliases`, which reads
+every `from <...>hooks_install import install|uninstall|status as X` in
+the file being scanned and resolves a later bare-name call through `X`
+back to its canonical verb before checking for an explicit path. An
+attribute call (`hooks_install.install(...)`, `hi.install(...)`,
+`scripts.fleet.hooks_install.install(...)`) never needed this -- `.attr`
+already names the guarded function regardless of what the OBJECT before
+the dot is called, so only the module ALIAS varies, never the verb name.
 
-**Known, stated limitation.** A call site that builds its argument list
-dynamically (e.g. `args = base_args + ["hooks", "install"]`, or passes a
-variable rather than a literal to `install(...)`) is not resolvable by
-static AST inspection and is NOT caught by either check -- this is the
-same class of limitation `_call_target_name` in `test_hooks_install.py`
+**Why this still cannot cover everything -- and why it does not need
+to.** A call site that builds its argument list dynamically, or that
+rebinds a name via a plain assignment rather than an import
+(`x = hooks_install.install; x()`), is not resolvable by static AST
+inspection and is NOT caught by either check here -- this is the same
+class of limitation `_call_target_name` in `test_hooks_install.py`
 already accepts for TC-58, restated here because it now applies estate-
 wide rather than to one file. Every call site in `tests/` today (verified
 while writing this test) uses a literal list and an explicit keyword or
-positional path, so this limitation is not presently exploited.
+positional path, so this limitation is not presently exploited. TC-124c
+(`tests/fleet/conftest.py`'s `_forbid_real_settings_file_io` autouse
+fixture) is the deliberate, PM-directed answer to "an AST scan can always
+be dodged": it patches `hooks_install.py`'s own lowest I/O seams
+(`_read_settings_text`, `_atomic_write`), which `install()`/`uninstall()`/
+`status()` call by their own internal, unaliased name no matter what an
+external caller renamed the public function to -- so it catches a call
+shape this module's static scan cannot enumerate, including the one that
+motivated this note.
 """
 
 from __future__ import annotations
@@ -64,9 +76,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TESTS_DIR = _REPO_ROOT / "tests"
 
-#: The installer's three verbs (`scripts/fleet/hooks_install.py`). Matched
-#: by bare/attribute name only -- see the module docstring's "cannot be
-#: bypassed" note.
+#: The installer's three verbs (`scripts/fleet/hooks_install.py`).
 _GUARDED_INSTALLER_FUNCS = frozenset({"install", "uninstall", "status"})
 
 #: The CLI verbs the `hooks` subcommand group exposes for the same three
@@ -87,27 +97,71 @@ def _iter_test_files() -> list[Path]:
     )
 
 
-def _call_target_name(node: ast.Call) -> str | None:
-    """Return a `Call` node's called function's bare name.
+def _collect_installer_import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Map a local name a `from ...hooks_install import X as Y` binds,
+    for X in `install`/`uninstall`/`status`, back to its canonical name.
 
-    Mirrors `test_hooks_install.py`'s own `_call_target_name` helper
-    (TC-58) -- duplicated rather than imported, so this guard keeps
-    working even if that module's helper is ever renamed or removed.
+    Only `ImportFrom` aliasing needs tracking. An attribute call's `.attr`
+    already identifies the guarded function regardless of what the
+    module-level object is called (`hooks_install.install(...)`,
+    `hi.install(...)`, and `scripts.fleet.hooks_install.install(...)` all
+    resolve via `.attr == "install"` with no alias tracking needed) --
+    only a FUNCTION-level import alias changes the CALLED name itself,
+    which is what this resolves.
+
+    Matches on the module name ending in `hooks_install` (or being
+    exactly that), tolerating `scripts.fleet.hooks_install`,
+    `fleet.hooks_install`, or a bare `hooks_install` -- whatever import
+    root form a given test file uses.
+
+    Args:
+        tree: a parsed module.
+
+    Returns:
+        A dict mapping each local alias to its canonical verb
+        (`"install"`, `"uninstall"`, or `"status"`). Empty if the file
+        imports no verb under an alias.
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = node.module or ""
+        if not (module == "hooks_install" or module.endswith(".hooks_install")):
+            continue
+        for alias in node.names:
+            if alias.name in _GUARDED_INSTALLER_FUNCS:
+                local_name = alias.asname or alias.name
+                aliases[local_name] = alias.name
+    return aliases
+
+
+def _resolve_guarded_call(node: ast.Call, aliases: dict[str, str]) -> str | None:
+    """Return the canonical guarded verb (`install`/`uninstall`/`status`)
+    a `Call` node invokes, or `None` if it invokes something else.
 
     Args:
         node: an `ast.Call` node.
+        aliases: this file's import-alias map, from
+            `_collect_installer_import_aliases`.
 
     Returns:
-        The callee's simple name for an `ast.Attribute` (e.g.
-        `hooks_install.install`) or `ast.Name` (e.g. `install`) call
-        shape; `None` for any other call shape (e.g. a call through a
-        subscript or a chained call).
+        The canonical verb name for an `ast.Attribute` call whose `.attr`
+        is a guarded verb, an `ast.Name` call whose bare name IS a
+        guarded verb, or an `ast.Name` call whose bare name is a tracked
+        import alias for one; `None` for any other call shape (including
+        one through a subscript, a chained call, or an untracked
+        reassignment -- see the module docstring's stated limitation).
     """
     func = node.func
     if isinstance(func, ast.Attribute):
-        return func.attr
+        if func.attr in _GUARDED_INSTALLER_FUNCS:
+            return func.attr
+        return None
     if isinstance(func, ast.Name):
-        return func.id
+        if func.id in _GUARDED_INSTALLER_FUNCS:
+            return func.id
+        return aliases.get(func.id)
     return None
 
 
@@ -131,9 +185,10 @@ def _string_constants(node: ast.AST) -> list[str]:
 
 
 class TestNoInstallerFunctionCallOmitsAnExplicitSettingsPath:
-    """TC-124a: every direct call to `install`/`uninstall`/`status`
-    anywhere under `tests/` supplies an explicit path (keyword or
-    positional) -- the tests/-wide superset of TC-58."""
+    """TC-124a: every direct call to `install`/`uninstall`/`status` --
+    including through a function-level import alias -- anywhere under
+    `tests/` supplies an explicit path (keyword or positional). The
+    tests/-wide superset of TC-58."""
 
     def test_every_installer_call_in_tests_supplies_a_path(self) -> None:
         offenders: list[str] = []
@@ -141,10 +196,11 @@ class TestNoInstallerFunctionCallOmitsAnExplicitSettingsPath:
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(path))
             rel = path.relative_to(_REPO_ROOT).as_posix()
+            aliases = _collect_installer_import_aliases(tree)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                if _call_target_name(node) not in _GUARDED_INSTALLER_FUNCS:
+                if _resolve_guarded_call(node, aliases) is None:
                     continue
                 has_positional = len(node.args) >= 1
                 has_keyword = any(
