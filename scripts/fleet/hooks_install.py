@@ -83,12 +83,54 @@ _PRE_TOOL_USE_MATCHER: Final[str] = "Agent|Task"
 #: G4-locked backstop (SUPERHUMAN.md "Decisions locked", TC-60).
 _TIMEOUT_SECONDS: Final[int] = 10
 
-#: R5's ownership test: a command resolves to one of the three basenames
-#: under a `templates/hooks/claude-code/` path segment, whatever root
-#: precedes it. Matched after normalising `\` to `/` so a Windows-style
-#: command string still matches.
+#: R5's ownership test, TIGHTENED at the Phase 3.3 preflight (recommended
+#: fix, not one of B1-B8): a command resolves to one of the three basenames
+#: under a `templates/hooks/claude-code/` path segment, AND the path also
+#: names a `superhuman` directory segment somewhere before it. Matched
+#: after normalising `\` to `/` so a Windows-style command string still
+#: matches.
+#:
+#: Two independent defects, fixed together because the fix for one shapes
+#: the fix for the other:
+#:
+#: **False negative** -- the original pattern anchored on the wrapper
+#: basename alone (`session-start` etc.), so a `.cmd`-suffixed command --
+#: R2's own documented Windows fallback, and the most likely shape of a
+#: hand install on a machine where the extensionless form is not
+#: executable -- was never recognised as ours, producing a DUPLICATE entry
+#: on install() instead of a migration (TC-113). Fixed by the trailing
+#: `(?:\.cmd)?` alternative.
+#:
+#: **False positive** -- the original pattern matched ANY command ending in
+#: `/templates/hooks/claude-code/<basename>`, whatever preceded it, so an
+#: unrelated tool that happened to use the identical conventional layout
+#: would be silently claimed as ours and removed/replaced (TC-114). The
+#: minimal SOUND criterion considered was requiring the resolved root to
+#: exist on disk as a real superhuman checkout (e.g. `scripts/fleet/
+#: hooks_install.py` present under it) -- rejected: R1's own chunk-8 ruling
+#: is that a real install today points at the MAIN checkout, which does
+#: NOT yet carry `scripts/fleet/` at all until this branch merges (see
+#: SUPERHUMAN.md, chunk 8 R1's "a real install today would leave the fleet
+#: hooks inert until this branch merges"), so an on-disk check would make
+#: every pre-merge install a false NEGATIVE against its own intended
+#: target -- reintroducing the very defect class this fix exists to close.
+#: Adopted instead: require a `superhuman` path segment. Every real
+#: deployment shape carries one -- the main checkout (`.../skills/
+#: superhuman/`), a linked worktree (`.../skills/superhuman/.claude/
+#: worktrees/<slug>/`), and the real 2026-09-09 hand install all do -- and
+#: an unrelated tool would need to coincidentally use BOTH the exact
+#: `templates/hooks/claude-code/<basename>` layout AND a `superhuman`
+#: ancestor directory name to still collide, which this module's docstring
+#: judges acceptably unlikely for a "should fix, not blocking" item.
+#: Known residual limitation, stated rather than silently accepted: an
+#: operator who passes an explicit `--skill-root` NOT containing
+#: `superhuman` (a deliberate override to a differently-named checkout)
+#: writes entries a later call will no longer recognise as owned -- a
+#: pre-existing risk of that override, now made slightly more visible
+#: rather than newly introduced by this tightening.
 _OWNED_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
-    r"/templates/hooks/claude-code/(session-start|subagent-start|pre-tool-use-role-gate)$"
+    r"/superhuman/.*templates/hooks/claude-code/"
+    r"(session-start|subagent-start|pre-tool-use-role-gate)(?:\.cmd)?$"
 )
 
 

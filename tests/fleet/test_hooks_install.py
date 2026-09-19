@@ -600,6 +600,82 @@ class TestSkillRootResolution:
         assert temp_settings_json.read_text(encoding="utf-8") == before_text
 
 
+class TestOwnershipTightening:
+    """Phase 3.3 preflight recommended-fix: R5's ownership test had a false
+    NEGATIVE (a `.cmd` shim was never recognised as ours) and a false
+    POSITIVE (any third party at the identical conventional layout was
+    claimed as ours). TC-113/TC-114."""
+
+    def test_cmd_shim_is_recognised_as_owned_and_migrated(self, temp_settings_json: Path) -> None:
+        """TC-113: a pre-existing entry pointing at the `.cmd` form of one
+        of our three wrapper basenames -- the most likely shape of a
+        hand-install on Windows, per R2's own note that the `.cmd` shim is
+        the fallback when the extensionless form is not executable -- is
+        recognised as superhuman-owned and MIGRATED (replaced), not left
+        beside a second, freshly-added entry as a duplicate."""
+        before = json.loads(temp_settings_json.read_text(encoding="utf-8"))
+        startup_before = next(g for g in before["hooks"]["SessionStart"] if g["matcher"] == "startup")["hooks"]
+        # Rewrite the fixture's pre-existing migration entry to the `.cmd`
+        # form -- same root, same basename, `.cmd` suffix.
+        for command in startup_before:
+            if command["command"].endswith("/session-start"):
+                command["command"] += ".cmd"
+        temp_settings_json.write_text(json.dumps(before, indent=2) + "\n", encoding="utf-8")
+
+        assert hooks_install._owned_basename(startup_before[-1]["command"]) == "session-start", (
+            "a `.cmd`-suffixed command at our conventional layout must be recognised as owned"
+        )
+
+        hooks_install.install(settings_path=temp_settings_json)
+
+        after = json.loads(temp_settings_json.read_text(encoding="utf-8"))
+        startup_after = next(g for g in after["hooks"]["SessionStart"] if g["matcher"] == "startup")["hooks"]
+        owned_after = [
+            c["command"]
+            for c in startup_after
+            if hooks_install._owned_basename(c["command"]) == "session-start"
+        ]
+        assert len(owned_after) == 1, (
+            f"expected the `.cmd` entry to be migrated (replaced), not duplicated: {owned_after}"
+        )
+
+    def test_unrelated_tool_at_the_same_conventional_layout_is_not_claimed(
+        self, temp_settings_json_clean: Path
+    ) -> None:
+        """TC-114: a THIRD-PARTY command that happens to sit at the exact
+        same conventional layout (`.../templates/hooks/claude-code/
+        session-start`) but under a root that is not a superhuman checkout
+        at all (no `superhuman` path segment anywhere) must NOT be treated
+        as ours -- install() must not replace it, and uninstall() must not
+        remove it."""
+        before = json.loads(temp_settings_json_clean.read_text(encoding="utf-8"))
+        unrelated_command = "C:/tools/some-other-project/templates/hooks/claude-code/session-start"
+        before["hooks"]["SessionStart"][0]["hooks"].append({"type": "command", "command": unrelated_command})
+        temp_settings_json_clean.write_text(json.dumps(before, indent=2) + "\n", encoding="utf-8")
+
+        assert hooks_install._owned_basename(unrelated_command) is None, (
+            "a look-alike path with no `superhuman` segment must not be recognised as owned"
+        )
+
+        hooks_install.install(settings_path=temp_settings_json_clean)
+        after_install = json.loads(temp_settings_json_clean.read_text(encoding="utf-8"))
+        startup_after_install = next(
+            g for g in after_install["hooks"]["SessionStart"] if g["matcher"] == "startup"
+        )["hooks"]
+        assert any(c["command"] == unrelated_command for c in startup_after_install), (
+            "install() must leave the unrelated third-party entry untouched"
+        )
+
+        hooks_install.uninstall(settings_path=temp_settings_json_clean)
+        after_uninstall = json.loads(temp_settings_json_clean.read_text(encoding="utf-8"))
+        startup_after_uninstall = next(
+            g for g in after_uninstall["hooks"]["SessionStart"] if g["matcher"] == "startup"
+        )["hooks"]
+        assert any(c["command"] == unrelated_command for c in startup_after_uninstall), (
+            "uninstall() must not remove the unrelated third-party entry"
+        )
+
+
 class TestMigration:
     def test_migrates_worktree_rooted_hand_install_to_exactly_one_entry(self, temp_settings_json: Path) -> None:
         """TC-95: the seeded `startup` group already carries ONE
@@ -749,7 +825,7 @@ class TestRemoveOwnedEdgeCases:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "C:/x/templates/hooks/claude-code/pre-tool-use-role-gate",
+                            "command": "C:/x/superhuman/templates/hooks/claude-code/pre-tool-use-role-gate",
                         }
                     ],
                 }
@@ -813,7 +889,7 @@ class TestUninstallEdgeCases:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "C:/x/templates/hooks/claude-code/subagent-start",
+                                "command": "C:/x/superhuman/templates/hooks/claude-code/subagent-start",
                             }
                         ],
                     }
