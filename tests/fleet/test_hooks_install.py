@@ -40,6 +40,7 @@ Enforcement layers (TEST.md's Chunk 8 section, in full):
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json
 import os
@@ -368,6 +369,44 @@ class TestUninstall:
 
         after_text = temp_settings_json_clean.read_text(encoding="utf-8")
         assert after_text == before_text
+
+    def test_round_trip_preserves_foreign_empty_and_keyless_hook_groups(
+        self, tmp_path: Path
+    ) -> None:
+        """Preflight B2, round-trip form: TC-57's exact-round-trip
+        guarantee, re-run against a seed `temp_settings_json_clean` never
+        exercises -- a `PostToolUse` group with an empty `"hooks": []`
+        array, and a `Stop` group with no `"hooks"` key at all. Both must
+        survive `install()` then `uninstall()` byte-identical, exactly
+        like every other foreign entry (TC-56/TC-57's own guarantee,
+        applied to the shape B2 found broken).
+        """
+        path = tmp_path / "settings.json"
+        seed: dict[str, Any] = {
+            "hooks": {
+                "PostToolUse": [{"matcher": "Bash", "hooks": []}],
+                "Stop": [{"matcher": "*"}],
+            }
+        }
+        before_text = json.dumps(seed, indent=2) + "\n"
+        path.write_text(before_text, encoding="utf-8")
+
+        hooks_install.install(settings_path=path)
+        after_install = json.loads(path.read_text(encoding="utf-8"))
+        assert after_install["hooks"]["PostToolUse"] == [{"matcher": "Bash", "hooks": []}], (
+            "install() altered the foreign PostToolUse group with an empty "
+            "hooks array"
+        )
+        assert after_install["hooks"]["Stop"] == [{"matcher": "*"}], (
+            "install() altered the foreign Stop group with no hooks key"
+        )
+
+        hooks_install.uninstall(settings_path=path)
+        after_text = path.read_text(encoding="utf-8")
+        assert after_text == before_text, (
+            "uninstall() did not restore the seed exactly -- the foreign "
+            "PostToolUse/Stop groups did not round-trip"
+        )
 
 
 class TestStatus:
@@ -718,6 +757,27 @@ class TestRemoveOwnedEdgeCases:
         }
         hooks_install._remove_owned(hooks)
         assert hooks == {}
+
+    def test_preserves_a_foreign_empty_hooks_list_and_a_foreign_keyless_group(self) -> None:
+        """Preflight B2: a foreign group with an empty `"hooks": []` array,
+        or with no `"hooks"` key at all, must survive untouched. The OLD
+        `_remove_owned` kept a group only if it had a SURVIVING command
+        afterward (`if remaining:`), so a foreign group with NOTHING of
+        OURS to remove -- because `commands` was empty or absent -- was
+        indistinguishable from a group THIS installer had just emptied,
+        and was dropped either way. An event left with only such groups
+        was then popped entirely too. This falsified the round-trip
+        guarantee (TC-57) against exactly this shape: PM-reproduced by
+        seeding a `PostToolUse` group with `"hooks": []` and a `Stop`
+        group with no `hooks` key and observing both vanish.
+        """
+        hooks: dict[str, Any] = {
+            "PostToolUse": [{"matcher": "Bash", "hooks": []}],
+            "Stop": [{"matcher": "*"}],
+        }
+        original = copy.deepcopy(hooks)
+        hooks_install._remove_owned(hooks)
+        assert hooks == original
 
 
 class TestUninstallEdgeCases:

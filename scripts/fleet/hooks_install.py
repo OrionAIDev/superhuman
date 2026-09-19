@@ -376,12 +376,18 @@ def _atomic_write(settings_path: Path, text: str) -> None:
 def _remove_owned(hooks: dict[str, Any]) -> None:
     """Strip every superhuman-owned entry from `hooks`, in place (R5).
 
-    A matcher group left with zero commands afterward is dropped entirely
-    (rather than kept as an empty `"hooks": []` group), and an event left
-    with zero groups is dropped too -- this is what makes `uninstall()`'s
-    exact-round-trip guarantee (TC-57) hold against a clean seed, and what
-    makes a migrated worktree-rooted entry (TC-95) disappear rather than
-    leave behind an empty group nothing else ever created.
+    Only a group that actually CONTAINED a superhuman-owned command is
+    ever modified or dropped; a foreign group survives byte-identical no
+    matter its shape -- including an empty `"hooks": []` array or a
+    missing `"hooks"` key entirely (preflight B2). A group that DID carry
+    one or more owned commands is dropped entirely once they are removed
+    if nothing else remains (this is what makes a migrated worktree-rooted
+    entry, TC-95, disappear rather than leave behind an empty group
+    nothing else ever created). An event is popped only if THIS call
+    removed every group it had; an event that never had any superhuman
+    entries to begin with -- including one whose only group(s) already had
+    an empty or absent `"hooks"` array -- is left exactly as found, per
+    `uninstall()`'s exact-round-trip guarantee (TC-57).
 
     Args:
         hooks: the settings document's `"hooks"` sub-object.
@@ -390,16 +396,33 @@ def _remove_owned(hooks: dict[str, Any]) -> None:
         groups = hooks.get(event)
         if not isinstance(groups, list):
             continue
+        owned_removed_from_event = False
         kept_groups = []
         for group in groups:
-            commands = group.get("hooks", [])
+            commands = group.get("hooks")
+            if not isinstance(commands, list):
+                # No "hooks" key, or a malformed non-list value: nothing of
+                # ours could be in here. Foreign -- keep byte-identical.
+                kept_groups.append(group)
+                continue
+            owned_in_group = [
+                command for command in commands if _owned_basename(command.get("command", "")) is not None
+            ]
+            if not owned_in_group:
+                # Nothing of ours in this group (commands may be empty or
+                # entirely foreign) -- keep byte-identical, never drop it.
+                kept_groups.append(group)
+                continue
+            owned_removed_from_event = True
             remaining = [command for command in commands if _owned_basename(command.get("command", "")) is None]
             if remaining:
                 kept_groups.append({**group, "hooks": remaining})
-        if kept_groups:
-            hooks[event] = kept_groups
-        else:
+            # else: this group held ONLY owned commands and none remain --
+            # drop it entirely rather than leaving an empty "hooks": [].
+        if owned_removed_from_event and not kept_groups:
             hooks.pop(event, None)
+        else:
+            hooks[event] = kept_groups
 
 
 def _add_owned(hooks: dict[str, Any], root: Path) -> None:
