@@ -187,7 +187,9 @@ class TestPortableAdapterEmitPrompt:
         prompt = adapter.emit_prompt("Continue the work.", handoff_id)
 
         id_pos = prompt.index(f"FLEET-HANDOFF-ID: {handoff_id}")
-        assert "python -m scripts.fleet.cli observe launch" in prompt[id_pos:]
+        # B7 (Phase 3.3 preflight): migrated from `observe launch` to
+        # `observe session-start`, matching SKILL.md's floor step (R7).
+        assert "python -m scripts.fleet.cli observe session-start" in prompt[id_pos:]
         assert "best-effort" in prompt.lower()
         assert "never blocks" in prompt.lower()
 

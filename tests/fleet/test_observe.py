@@ -138,7 +138,10 @@ class TestDisabledWorkspace:
         assert "FLEET-HANDOFF-ID" not in result.prompt_text
         assert extract_handoff_id(result.prompt_text) is None
         assert "self-register" not in result.prompt_text.lower()
-        assert "observe launch" not in result.prompt_text.lower()
+        # B7 (Phase 3.3 preflight): the self-register instruction's verb was
+        # migrated from `observe launch` to `observe session-start` (R7);
+        # this negative check follows it so it still guards real behavior.
+        assert "observe session-start" not in result.prompt_text.lower()
         assert not _fleet_dir(workspace, slug).exists()
 
 
