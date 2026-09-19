@@ -9,6 +9,7 @@ the subprocess level, in `tests/fleet/test_role_gate_hook.py`.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -808,31 +809,52 @@ _HOOK_CONTRACT_VOCABULARY: tuple[str, ...] = (
     "PreToolUse",
 )
 
-#: Every `scripts/**/*.py` file this repo ships that contains any token in
-#: `_HOOK_CONTRACT_VOCABULARY`, with the one-line reason it is admitted.
-#: A file not on this list that contains a token fails the test below.
-#: Discovered while writing TC-122 (2026-09-19): only two of these --
-#: `hooks_install.py` and `cli.py` -- were anticipated going in; the other
-#: five were found by running the widened scan and are docstring-only
-#: cross-references (verified by hand against the source at the time this
-#: test was written), never harness-shaped code or data. Reported to the
-#: PM alongside this chunk rather than silently allowlisted.
-_ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES: dict[str, str] = {
+#: Tier (a) -- SANCTIONED: files that genuinely use the vocabulary in real
+#: code (not merely a docstring/comment), each with a one-line reason and
+#: at least one real-code citation. A whole-file exemption is correct
+#: here: D4 clause 2 assigns these two files the harness/installer
+#: knowledge itself, so their CODE is expected to name hook events and
+#: `settings.json`.
+#:
+#: Confirmed real-code usage (not exhaustive, cited to ground the
+#: exemption): `hooks_install.py` builds the installed-entries tuple from
+#: literal event-name strings (`("SessionStart", matcher, ...)`,
+#: `("SubagentStart", ...)`, `("PreToolUse", ...)`, lines ~275-277),
+#: derives `DEFAULT_SETTINGS_PATH` from `"settings.json"` (line 69), and
+#: matches the installed-wrapper path against a `templates/hooks/claude-
+#: code/` marker string (line 320 and the regex on line 133).
+#: `cli.py` passes `"the settings.json to modify"` as literal `argparse`
+#: `help=` text on the `hooks install|uninstall|status` subparsers (lines
+#: ~1896, 1928, 1946).
+_SANCTIONED_HOOK_CONTRACT_VOCABULARY_FILES: dict[str, str] = {
     "scripts/fleet/hooks_install.py": (
         "the installer itself -- D4 clause 2's second sanctioned home for "
         "harness knowledge; edits settings.json and names the hook events "
-        "it installs"
+        "it installs in real code, not only prose"
     ),
     "scripts/fleet/cli.py": (
         "hosts the `hooks install|uninstall|status` verbs' thin CLI "
         "translation layer, admitted by clause 2 alongside the installer "
-        "it wraps"
+        "it wraps; the verb names and settings.json appear in real "
+        "argparse wiring, not only prose"
     ),
+}
+
+#: Tier (b) -- DOCS-ONLY: files where every hit is inside a module, class,
+#: or function docstring, or a `#` comment -- verified by hand at the time
+#: this test was written, and re-verified MECHANICALLY on every run (see
+#: `TestD4ClauseOneHookContractVocabularyBoundary` below): with
+#: docstrings stripped by `ast` and the remainder run through
+#: `ast.unparse` (which also drops comments), zero tokens survive. A
+#: whole-file exemption would be too wide for these -- unlike tier (a),
+#: nothing here is SUPPOSED to use the vocabulary in code, so a future
+#: real-code use (a string literal, an identifier) must still fail.
+_DOCS_ONLY_HOOK_CONTRACT_VOCABULARY_FILES: dict[str, str] = {
     "scripts/fleet/hook_payload.py": (
         "the generic payload reader D4's own caveat names as the one "
         "place the boundary is a judgment call, not a syntactic fact -- "
-        "it documents field names generically (CHUNK-1-FINDINGS.md), "
-        "never a harness-shaped structure"
+        "it documents field names generically (CHUNK-1-FINDINGS.md) in "
+        "its docstrings only, never a harness-shaped structure in code"
     ),
     "scripts/fleet/adapter/subagent.py": (
         "docstring only -- cross-references the SubagentStart-consuming "
@@ -857,11 +879,76 @@ _ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES: dict[str, str] = {
 }
 
 
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    """Remove every module/class/function docstring from `tree`, in place.
+
+    A docstring is a bare string-constant `Expr` statement that is the
+    FIRST statement of a `Module`, `ClassDef`, `FunctionDef`, or
+    `AsyncFunctionDef` body -- the same shape `ast.get_docstring` detects.
+    A body that would become empty gets a single `ast.Pass()` instead, so
+    the tree stays syntactically valid (e.g. an abstract method whose
+    entire body was its docstring).
+
+    Args:
+        tree: a parsed module (or any AST node reachable via `ast.walk`).
+
+    Returns:
+        The same tree, mutated in place (returned for call-site clarity).
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def _source_without_docstrings_or_comments(path: Path) -> str:
+    """Parse `path`, strip its docstrings, and `ast.unparse` the rest.
+
+    `ast.unparse` never emits comments (they are not part of the AST at
+    all), so this single pass removes both docstrings and `#` comments,
+    leaving only the code a token match in the result would mean is REAL
+    -- a string literal, an identifier, an f-string fragment.
+
+    Args:
+        path: the `.py` file to read and parse.
+
+    Returns:
+        The unparsed source with docstrings and comments removed.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = _strip_docstrings(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
 class TestD4ClauseOneHookContractVocabularyBoundary:
     """TC-122 (D4 clause 1, reworded 2026-09-19 G6): every `.py` file under
     `scripts/` that mentions ANY token in `_HOOK_CONTRACT_VOCABULARY` is on
-    `_ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES`, with a one-line reason. TC-87
-    above still runs (three tokens, narrower); this is the superset."""
+    one of the two reasoned allowlists, with a one-line reason. TC-87
+    above still runs (three tokens, narrower); this is the superset.
+
+    Two tiers, not one, per PM review (2026-09-19): a whole-file exemption
+    for a file that only ever mentioned the vocabulary in a docstring
+    would silently stop protecting that file the day someone adds real
+    code using it. SANCTIONED files (tier a) are exempted whole-file,
+    because their CODE is supposed to carry this vocabulary. DOCS-ONLY
+    files (tier b) are exempted only in their docstrings/comments -- the
+    scan strips those via `ast` and still fails on anything left."""
+
+    def test_sanctioned_files_are_not_also_docs_only(self) -> None:
+        """The two allowlists must not overlap -- a file's tier is a
+        single, unambiguous fact, not a choice made per-run."""
+        overlap = set(_SANCTIONED_HOOK_CONTRACT_VOCABULARY_FILES) & set(
+            _DOCS_ONLY_HOOK_CONTRACT_VOCABULARY_FILES
+        )
+        assert not overlap, f"file(s) on both allowlists: {sorted(overlap)}"
 
     def test_every_hook_contract_vocabulary_hit_is_on_the_reasoned_allowlist(self) -> None:
         scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
@@ -870,26 +957,34 @@ class TestD4ClauseOneHookContractVocabularyBoundary:
             if "__pycache__" in path.parts:
                 continue
             rel = path.relative_to(scripts_dir.parent).as_posix()
-            if rel in _ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES:
+            if rel in _SANCTIONED_HOOK_CONTRACT_VOCABULARY_FILES:
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
+            if rel in _DOCS_ONLY_HOOK_CONTRACT_VOCABULARY_FILES:
+                text = _source_without_docstrings_or_comments(path)
+            else:
+                text = path.read_text(encoding="utf-8", errors="replace")
             hits = [token for token in _HOOK_CONTRACT_VOCABULARY if token in text]
             if hits:
                 offenders.append(f"{rel}: {hits}")
         assert not offenders, (
             "hook-contract vocabulary found outside the reasoned allowlist "
-            f"(D4 clause 1): {offenders}. Either the file belongs on "
-            "_ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES with a one-line reason, "
-            "or it is a real boundary leak."
+            f"(D4 clause 1): {offenders}. A DOCS-ONLY file's hit survives "
+            "docstring/comment stripping, so this is real code -- either "
+            "move the file to _SANCTIONED_HOOK_CONTRACT_VOCABULARY_FILES "
+            "with a citation, or it is a real boundary leak. A file on "
+            "neither allowlist needs a new, reasoned entry -- or it is a "
+            "real boundary leak."
         )
 
     def test_every_allowlist_entry_still_exists(self) -> None:
         """A stale allowlist entry (the file was renamed or deleted) must
         fail this test rather than silently stop being checked."""
         skill_root = Path(__file__).resolve().parents[2]
-        missing = [
-            rel for rel in _ALLOWED_HOOK_CONTRACT_VOCABULARY_FILES if not (skill_root / rel).is_file()
-        ]
+        all_entries = {
+            **_SANCTIONED_HOOK_CONTRACT_VOCABULARY_FILES,
+            **_DOCS_ONLY_HOOK_CONTRACT_VOCABULARY_FILES,
+        }
+        missing = [rel for rel in all_entries if not (skill_root / rel).is_file()]
         assert not missing, f"stale allowlist entries (file no longer exists): {missing}"
 
 
