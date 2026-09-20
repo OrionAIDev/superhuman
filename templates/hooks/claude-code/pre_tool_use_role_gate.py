@@ -33,6 +33,37 @@ project. **The locator is called ONLY when the verdict could deny or is
 dispatch, and a `FAULT` verdict, never pay for it and never reach the
 locator.
 
+**This is a discipline aid, not a security control (G6, 2026-09-20T03:30Z
+— supersedes any earlier text in this module, including below, that reads
+as claiming a check here resists a deliberate bypass).** In normal
+operation it catches a forgotten or edited role block. It does **not**
+resist a caller who is deliberately trying to get past it — a Phase 3.3
+preflight round found four distinct ways, each PM-reproduced, none of
+them closed here:
+
+1. A spoofed `.git` FILE (`gitdir: <hook checkout's .git>`) makes any
+   directory answer `_same_repository` as though it belonged to the
+   hook's own repository.
+2. A locator-cache entry of `{"workspace": null, "slug": null}` makes the
+   session look unresolvable, which disables this gate outright (D7.4
+   clause 3: no locator result, no scope, no deny — nothing logged
+   either).
+3. An attacker-created directory INSIDE the hook's own repository passes
+   `_same_repository` legitimately — being in the same repository is not
+   the same as being trustworthy.
+4. Inherited git environment variables (`GIT_DIR` and its siblings)
+   change what `git` itself reports for `--git-common-dir`, defeating
+   `_same_repository` without touching the filesystem at all.
+
+`_same_repository` and the locator-cache boundary check below are still
+worth keeping — cheap, and they narrow the ACCIDENTAL cases (a stray
+linked worktree, a corrupted cache entry) — but neither was ever a
+barrier against a caller who wants past them, and no text in this module
+may describe them as one. Every fault in this gate's own machinery
+already lets the dispatch through by design (D7.5); the four bypasses
+above are the same fail-soft posture applied to a deliberate attempt
+rather than an accident.
+
 **Two `roles/` directories (G6/B4, DESIGN.md D7 "Decisions locked",
 2026-09-19T18:30Z; AMENDED 2026-09-20T00:20Z — see below).** The primary
 check above always runs against `roles_dir` — the checkout THIS HOOK
@@ -78,13 +109,13 @@ unreadable or empty copy on the session side is not evidence the dispatch
 complies, so the pending deny (against the hook's own `roles_dir`) stands
 unchanged instead of being released. `workspace` here is still the
 locator's resolved value, which may come back from an agent-writable
-cache file (`_cached_locate`'s own scratchpad cache); that cache is now
+cache file (`_cached_locate`'s own scratchpad cache); that cache is
 validated at its own boundary (an absolute, existing directory and a
-`slug_is_safe` slug) before ever being trusted, but the real backstop
-against a poisoned `workspace` is `_same_repository` itself — a cache
-entry redirected at an attacker directory fails the same-repository test
-regardless, because that directory is (by construction) not part of the
-hook's own repository.
+`slug_is_safe` slug) before ever being trusted. This narrows the
+ACCIDENTAL case (a corrupted or stale cache entry); it is not a barrier
+against a deliberate one — see the discipline-aid paragraph above:
+bypasses 1, 3 and 4 defeat `_same_repository` itself, and bypass 2
+disables this gate before `_same_repository` is ever consulted.
 
 **Decision log (D7.7).** For an in-scope `NON_ROLE`/`MISMATCH`/`UNMARKED`
 verdict, one line is appended to the project's `role-gate.jsonl` via
@@ -383,10 +414,15 @@ def _same_repository(first: Path, second: Path) -> bool:
     `hooks_install.py`'s `_default_skill_root` both already rely on (a
     repository's common `.git` directory names one repository regardless of
     which linked worktree asks). This still admits the worktree-on-another-
-    branch case the second check exists for; a third-party repository
-    answers with a DIFFERENT common dir and is excluded — exactly the
-    boundary the PM's two reproductions exploited (a hostile repository can
-    never claim to be "the same repository" as the hook's own checkout).
+    branch case the second check exists for; an ORDINARY third-party
+    repository answers with a DIFFERENT common dir and is excluded — the
+    boundary the PM's two 2026-09-20T00:20Z reproductions exploited. This
+    is NOT a security barrier (G6, 2026-09-20T03:30Z — see the module
+    docstring's discipline-aid paragraph): a repository that spoofs its
+    `.git` FILE, is itself planted inside the hook's own repository, or
+    manipulates inherited git environment variables can make this
+    function answer `True` (or keep it from ever being consulted at all)
+    regardless of whether it should be trusted.
 
     Args:
         first: the hook checkout's own directory (its `roles_dir`, or any
