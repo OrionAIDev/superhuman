@@ -326,7 +326,9 @@ Rules:
 
 ## Gate handling
 
-Per DESIGN §7. All gates are appended to SUPERHUMAN.md with timestamp + decision.
+Per DESIGN §7. All gates are appended to SUPERHUMAN.md with timestamp + decision — an
+ISO-8601 UTC timestamp **to the second**, `[YYYY-MM-DDTHH:MM:SSZ]`, never a date alone
+(see format rule 5 below).
 
 ### Gate inventory (G0–G10)
 
@@ -361,6 +363,10 @@ Emit it exactly once, only after G8 sign-off, and never at any earlier gate. It 
 3. **Artifacts by path, never by paste.** Token-efficiency rule applied.
 4. Fixed-shape preamble: `header → briefing → 3-5 bullets → artifact path → decision prompt`. Use cached templates. The briefing, written for a stakeholder who hasn't seen this project recently, says what the project is, what is being decided and why it matters now; each option then says what it leads to. The briefing is presentation only and is never copied into the SUPERHUMAN.md decisions log.
 5. Every gate appended to SUPERHUMAN.md with timestamp + decision.
+   The timestamp is ISO-8601 UTC **to the second** — `[YYYY-MM-DDTHH:MM:SSZ]`, e.g.
+   `[2026-09-20T14:07:31Z] G5: chunk 3 results accepted; user decision: continue`. A date
+   alone is not enough: several gates routinely land on one day, and a date-only log cannot
+   say which gate the project is at.
 6. **Never auto-proceed past Type A.** If user doesn't respond, work stops.
 7. **Drift escalations (G6) are unconditional** — cadence switch does NOT silence them.
 8. **Archive, never delete.** If a gate decision results in removing work, affected files move to `archive/<timestamp>-<chunk>/` with WHY.md + RESTORE.md.
@@ -433,7 +439,7 @@ Per DESIGN §7 rule 9, §13.4.
 2. **Identify patterns** if 2+ similar decisions have accumulated (e.g., "user keeps adding USER-GUIDE.md", "user prefers REVISIT-DESIGN over RE-CHUNK").
 3. **Append to `## Retuning notes`** in SUPERHUMAN.md:
    ```
-   [<timestamp>] <gate>: <what PM recommended> → <what user chose>; pattern observed: <observation>; bias adjustment: <how PM will weight future similar decisions>
+   [YYYY-MM-DDTHH:MM:SSZ] <gate>: <what PM recommended> → <what user chose>; pattern observed: <observation>; bias adjustment: <how PM will weight future similar decisions>
    ```
 4. **Use the notes** on future PM dispatches as project memory loaded after the role-prompt prefix.
 5. **Promote to meta-gate** when the same override pattern repeats 3+ times (per §7 disagreement calibration).
@@ -442,9 +448,9 @@ Per DESIGN §7 rule 9, §13.4.
 
 Append-only section in SUPERHUMAN.md. Never edited; only grown. Cache-stable for old entries. Format: timestamped bullets. Example:
 
-> `[2026-05-30 14:22] G3: PM did not recommend USER-GUIDE.md; user added it → bias toward including USER-GUIDE.md for internal tools in future`
+> `[2026-05-30T14:22:09Z] G3: PM did not recommend USER-GUIDE.md; user added it → bias toward including USER-GUIDE.md for internal tools in future`
 
-> `[2026-05-30 16:05] G6 RE-CHUNK vs REVISIT-DESIGN: PM recommended RE-CHUNK; user chose REVISIT-DESIGN → user willing to spend design tokens to avoid implementation debt — bias toward REVISIT-DESIGN on similar drift`
+> `[2026-05-30T16:05:41Z] G6 RE-CHUNK vs REVISIT-DESIGN: PM recommended RE-CHUNK; user chose REVISIT-DESIGN → user willing to spend design tokens to avoid implementation debt — bias toward REVISIT-DESIGN on similar drift`
 
 ---
 

@@ -122,7 +122,7 @@ Apply these unconditionally on every Architect dispatch (per DESIGN §5):
 
 - **Foundation decisions** stated as a bulleted log entry for SUPERHUMAN.md:
   ```
-  [<timestamp>] Foundation decision: <feature> — rework if standalone would be <minimal|significant> because <reason>. Decision: <ship standalone | foundation chunk N precedes>.
+  [YYYY-MM-DDTHH:MM:SSZ] Foundation decision: <feature> — rework if standalone would be <minimal|significant> because <reason>. Decision: <ship standalone | foundation chunk N precedes>.
   ```
 - **Artifact pointers, not paste.** Reference `REQUIREMENTS.md §<section>` rather than quoting inline. Paste only when the subagent isolation requires it.
 - **ARCHITECTURE.md trigger ruling** stated explicitly at G3 even when ARCHITECTURE.md is not required: *"ARCHITECTURE.md not required — no multiple deployable units, external-API integration, or cross-process IPC."*

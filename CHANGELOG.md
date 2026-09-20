@@ -21,6 +21,18 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Changed
 
+- **A gate entry's timestamp now carries a time to the second.** The decisions-log format was
+  `[<ISO timestamp>] G<n>: ...`, and in practice most projects wrote a date only — so a project
+  whose latest timestamp held G0 through G8 at once could not tell a reader which gate it was
+  actually at, and the only way to resolve it was the kind of guess superhuman forbids elsewhere.
+  The format is now stated concretely as `[YYYY-MM-DDTHH:MM:SSZ]` in the `SUPERHUMAN.md` template,
+  in gate format rule 5 (`SKILL.md` and `roles/pm.md`), and in every worked gate-entry example
+  across `phases/` and `roles/`. Documentation and format only: no gate's behaviour changes, and
+  **no existing record is rewritten** — the rule is going-forward only, and a date-only record
+  written before it stays exactly as it stands. For consistency the same concrete shape replaces
+  `[<ISO timestamp>]` in the template's other append-only log comments (drift notes, archive log,
+  recommendation overrides, retuning notes, decisions locked); the normative rule itself stays
+  scoped to gate entries. Pinned by nine new tests in `tests/test_content.py`.
 - **`docs/superhuman/` is now a mount point and this repo tracks nothing in it.** Per-project
   working docs (VISION / REQUIREMENTS / DESIGN / PLAN / TEST / SUPERHUMAN / DECISIONS) are
   versioned in a separate private repository, cloned into that path as a

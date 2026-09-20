@@ -75,11 +75,17 @@
 ## Decisions locked
 <!-- Distinct from the append-only Decisions log below. This section records what may NOT be
      reopened (as opposed to Decisions log, which records what happened, append-only). Format:
-     [<ISO timestamp>] G<n>: <locked item, one line>. Changing a locked item requires a
+     [YYYY-MM-DDTHH:MM:SSZ] G<n>: <locked item, one line>. Changing a locked item requires a
      surfaced gate/drift event — never a silent edit. -->
 
 ## Decisions log
-<!-- Append-only. Format: [<ISO timestamp>] G<n>: <one-line summary>; user decision: <decision> -->
+<!-- Append-only. Format: [YYYY-MM-DDTHH:MM:SSZ] G<n>: <one-line summary>; user decision: <decision>
+
+     The timestamp is ISO-8601 UTC **to the second**, e.g.
+       [2026-09-20T14:07:31Z] G5: chunk 3 results accepted; user decision: continue
+     A date alone is not enough. Several gates routinely land on one day, and a date-only log
+     cannot say which gate this project is at — the reader is left to guess, and guessing "the
+     furthest gate logged" is exactly the inference superhuman forbids elsewhere. -->
 
 ## Chunk log
 <!-- Append-only table. -->
@@ -87,16 +93,16 @@
 |---|---|---|---|---|---|---|
 
 ## Drift notes
-<!-- Append-only. Format: [<ISO timestamp>] Chunk <n>: <severity> — <one-line trigger>; action: <taken> -->
+<!-- Append-only. Format: [YYYY-MM-DDTHH:MM:SSZ] Chunk <n>: <severity> — <one-line trigger>; action: <taken> -->
 
 ## Archive log
-<!-- Append-only. Format: [<ISO timestamp>] archived <chunk> to archive/<dir>/; reason: <reason> -->
+<!-- Append-only. Format: [YYYY-MM-DDTHH:MM:SSZ] archived <chunk> to archive/<dir>/; reason: <reason> -->
 
 ## Recommendation overrides
-<!-- Append-only. Format: [<ISO timestamp>] G<n>: PM recommended <X>; user chose <Y>; reason: <if given> -->
+<!-- Append-only. Format: [YYYY-MM-DDTHH:MM:SSZ] G<n>: PM recommended <X>; user chose <Y>; reason: <if given> -->
 
 ## Retuning notes
-<!-- Append-only. Format: [<ISO timestamp>] G<n>: <observation about user pattern>; bias adjustment: <going-forward note> -->
+<!-- Append-only. Format: [YYYY-MM-DDTHH:MM:SSZ] G<n>: <observation about user pattern>; bias adjustment: <going-forward note> -->
 
 ## Autonomous run config
 <!-- Present only for HITL-M or 2 runs. -->

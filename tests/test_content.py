@@ -1824,3 +1824,95 @@ def test_phase_recipes_name_the_briefing(skill_root: Path, phase_file: str) -> N
     assert "briefing" in text.lower(), (
         f"phases/{phase_file} describes a Type A gate and must name the briefing"
     )
+
+
+# --- C-TIME: gate-entry timestamps carry a time to the second ---
+
+#: Every guidance surface that either states the decisions-log entry format or
+#: shows a gate entry by example. Deliberately excludes `tests/fixtures/`,
+#: `tests/smoke/` and `CHANGELOG.md`: those hold *recorded* history, and the
+#: rule is going-forward only — no existing record is rewritten.
+_GATE_ENTRY_SURFACES = (
+    "templates/SUPERHUMAN.md.tpl",
+    "SKILL.md",
+    "roles/pm.md",
+    "roles/architect.md",
+    "roles/surrogate-user.md",
+    "phases/0-kickoff.md",
+    "phases/3-autonomous-loop.md",
+    "phases/4-acceptance.md",
+)
+
+#: A gate entry as written into `## Decisions log`: a bracketed timestamp
+#: immediately followed by `G<n>`. The capture is whatever sits in the
+#: brackets — a real timestamp, or a placeholder such as `<ISO timestamp>`.
+_GATE_ENTRY_RE = re.compile(r"\[([^\]\n]{1,40})\]\s*G\d")
+
+#: The one accepted shape: ISO-8601 UTC to the second. Both the literal
+#: placeholder (`YYYY-MM-DDTHH:MM:SSZ`, optionally angle-bracketed the way a
+#: fill-me-in slot is written) and a concrete example date satisfy it.
+_SECOND_PRECISION_RE = re.compile(
+    r"^(?:<?YYYY-MM-DDTHH:MM:SSZ>?|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$"
+)
+
+#: The Decisions-log heading line. The bare string `## Decisions log` also
+#: appears inline (backticked) in the Resume packet and in the
+#: Decisions-locked comment, so the surrounding newlines are what anchor it.
+_DECISIONS_LOG_HEADING = """
+## Decisions log
+"""
+
+
+def test_gate_entry_format_is_stated_to_the_second(skill_root: Path) -> None:
+    """The decisions-log format statement demands a time, not just a date.
+
+    A gate entry carries an ISO-8601 UTC timestamp to the second. The measured
+    failure this fixes is a project whose latest decisions-log timestamp holds
+    G0 through G8 at once, leaving a reader unable to say which gate the
+    project is at — and leaving "the furthest gate logged" as the only way out,
+    which is a guess.
+
+    The three places that *state* the format — the template comment a fresh
+    project copies, and gate format rule 5 in both SKILL.md and pm.md — must
+    each spell the shape out.
+    """
+    tpl = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    log_block = tpl.split(_DECISIONS_LOG_HEADING, 1)
+    assert len(log_block) == 2, "template missing '## Decisions log' section"
+    comment = log_block[1].split("-->", 1)[0]
+    assert "YYYY-MM-DDTHH:MM:SSZ" in comment, (
+        "the template's Decisions log format comment must give the timestamp shape "
+        "to the second, not a vague '<ISO timestamp>'"
+    )
+    assert "to the second" in comment, (
+        "the template's Decisions log comment must say the timestamp is to the second"
+    )
+
+    for rel in ("SKILL.md", "roles/pm.md"):
+        text = (skill_root / rel).read_text(encoding="utf-8")
+        assert "`[YYYY-MM-DDTHH:MM:SSZ]`" in text and "to the second" in text, (
+            f"{rel} gate format rule 5 must state the to-the-second timestamp shape"
+        )
+
+
+@pytest.mark.parametrize("rel", _GATE_ENTRY_SURFACES)
+def test_gate_entry_examples_carry_hhmmss(skill_root: Path, rel: str) -> None:
+    """No guidance surface shows a gate entry with a date-only timestamp.
+
+    A worked example is what actually gets copied, so an example that drops
+    the time reintroduces the defect the format statement just fixed. Scans
+    for `[<anything>] G<n>` and requires the bracketed part to be either the
+    literal `YYYY-MM-DDTHH:MM:SSZ` slot or a concrete second-precision UTC
+    timestamp.
+    """
+    text = (skill_root / rel).read_text(encoding="utf-8")
+    offenders = [
+        stamp
+        for stamp in _GATE_ENTRY_RE.findall(text)
+        if not _SECOND_PRECISION_RE.match(stamp.strip())
+    ]
+    assert not offenders, (
+        f"{rel} shows gate entries whose timestamp is not ISO-8601 UTC to the second: "
+        f"{offenders}. Use [YYYY-MM-DDTHH:MM:SSZ] (or a concrete example such as "
+        f"[2026-09-20T14:07:31Z])."
+    )
