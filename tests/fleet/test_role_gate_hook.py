@@ -1706,7 +1706,15 @@ class TestRoleGateDenyDeliveredUnderHardKill:
                 "hold the lock long enough to still be contended at kill time"
             )
             process.kill()
-            stdout, stderr = process.communicate(timeout=10)
+            # NOT `communicate()`: stdin was already closed above, and on
+            # POSIX `communicate()` flushes it first, raising ValueError
+            # ("I/O operation on closed file") -- which is how this test
+            # failed on Linux CI while passing on Windows. Read the pipes
+            # directly instead; the point of the test is what reached
+            # stdout before the kill.
+            process.wait(timeout=10)
+            stdout = process.stdout.read() if process.stdout is not None else ""
+            stderr = process.stderr.read() if process.stderr is not None else ""
         finally:
             holder.join(timeout=15)
             assert holder.exitcode == 0, f"lock-holder child exited with code {holder.exitcode}"
