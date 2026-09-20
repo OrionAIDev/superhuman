@@ -128,9 +128,17 @@ fi
 # ENVIRONMENT `$PYTHON` runs under, not the resolution of `$PYTHON` itself
 # -- an attacker able to plant an earlier `python`/`python3` on `$PATH`
 # still controls which binary runs, and no flag on that binary can defend
-# against itself. Closing that soundly needs a different mechanism
-# (e.g. an interpreter allowlist or hardcoded path) and is not attempted
-# here.
+# against itself. Phase 3.3 preflight round 3 (2026-09-20, "the role gate
+# is a discipline aid"): the SAME residual applies to `git`, not just the
+# interpreter -- every `subprocess.run(["git", ...])` this delivery makes
+# (locate.py's own calls, hooks_install.py's `_default_skill_root`, and
+# pre_tool_use_role_gate.py's `_git_common_dir`/`_same_repository`)
+# resolves `git` through `$PATH` exactly the same way, and a planted
+# `git` controls those results just as a planted `python` controls this
+# one -- including defeating the role gate's own same-repository check
+# (see that script's module docstring). Closing either soundly needs a
+# different mechanism (e.g. a binary allowlist or hardcoded paths) and is
+# not attempted here.
 (
   cd "$SUPERHUMAN_ROOT" \
     && "$PYTHON" -E -s -m scripts.fleet.cli observe session-start \

@@ -91,7 +91,14 @@ fi
 # inherited `PYTHONPATH` too, letting a planted module get imported into
 # this hook process. See templates/hooks/claude-code/session-start's
 # identical comment for the full citation and why `-I`/`-P` are
-# deliberately not used instead.
+# deliberately not used instead. That comment's residual-risk note is not
+# limited to `$PYTHON` either -- it applies equally to `git`, resolved
+# through the identical `$PATH`, which is directly relevant HERE: this
+# script's own pre_tool_use_role_gate.py resolves `git` through `$PATH`
+# in `_git_common_dir`/`_same_repository`, so a planted `git` defeats that
+# check the same way a planted `python` would defeat this one (see that
+# script's module docstring, "This is a discipline aid, not a security
+# control").
 printf '%s' "$payload" | "$PYTHON" -E -s \
   "$SUPERHUMAN_ROOT/templates/hooks/claude-code/pre_tool_use_role_gate.py" \
   --hook-payload - \
