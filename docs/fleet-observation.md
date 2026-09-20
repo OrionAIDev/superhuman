@@ -6,7 +6,7 @@ running the fleet CLI by hand. This doc is the operator-facing guide to turning 
 understanding what it guarantees (and does not), and reading its output correctly.
 
 It covers: enablement, the fail-soft/fail-closed boundary, the project locator, the granularity
-rule for spawned dispatches, the role-first enforcement gate, installing the deterministic hook
+rule for spawned dispatches, the role-first discipline gate, installing the deterministic hook
 ceiling, the portable/harness boundary rule, the diagnostic surfaces, and the caveats every
 operator needs before acting on a stale report — plus the honest list of what this project does
 not (yet) cover.
@@ -215,7 +215,7 @@ own hook or automation on top of `fleet observe dispatch` for a different harnes
 predicate before calling through; it depends on your harness's own dispatch-tool payload shape and
 cannot be decided generically.
 
-## The role-first enforcement gate
+## The role-first discipline gate
 
 A second, separate mechanism sits on top of the granularity rule above: a `PreToolUse` hook
 (`templates/hooks/claude-code/pre-tool-use-role-gate`) that **denies** a role-shaped dispatch tool
@@ -225,6 +225,15 @@ deliberately not a role dispatch. This exists because a role prompt that only *r
 brief — paraphrased, missing a reference, hand-edited — silently breaks the granularity rule above:
 the subagent never received its actual role contract, so nothing in this project would have caught
 it. The gate is checked before that failure mode occurs, not after.
+
+**This is a discipline aid, not a security control (G6, 2026-09-20).** It catches a forgotten or
+edited role block — the accidental case the paragraph above describes. It is not a barrier against
+a caller deliberately trying to defeat it: a Phase 3.3 preflight round found four distinct,
+PM-reproduced ways to bypass it outright (a spoofed `.git` file, a poisoned locator-cache entry, a
+directory planted inside the hook's own repository, and inherited git environment variables — see
+`templates/hooks/claude-code/pre_tool_use_role_gate.py`'s module docstring for the full list), none
+of which this project closes. Every fault in the gate's own machinery already lets the dispatch
+through by design (see below); a deliberate bypass gets the identical outcome.
 
 The gate produces one of four verdicts per candidate dispatch: `ROLE` (verbatim match — allowed,
 silently, and never itself journaled, since chunk 7's own dispatch-registration row already counts
@@ -322,7 +331,7 @@ boundary above, the installer never guesses which harness it is running under. U
 
 **What `install` registers.** All five documented `SessionStart` matchers (`startup`, `resume`,
 `clear`, `compact`, `fork`), the `SubagentStart` match-all matcher (`*`), and the `PreToolUse`
-matcher `Agent|Task` (the role-first gate above) — seven entries in total. Every entry it writes
+matcher `Agent|Task` (the role-first discipline gate above) — seven entries in total. Every entry it writes
 carries `"timeout": 10` (seconds); a Claude Code command hook's own undeclared default is 600
 seconds, so this is a deliberate, much tighter backstop, not an oversight.
 
@@ -374,7 +383,7 @@ exists to close), or `ok`. `fleet doctor` also prints the operator's measured gi
 anything older than 2.31 — the version the locator's root discovery depends on
 (`git rev-parse --path-format=absolute`); on an older git, the locator's calls fail, resolution goes
 silently dead, and this is the one surface that would tell you why. For every `ok` record it
-additionally reports the role-first gate's activity for that project (how many `NON_ROLE` and
+additionally reports the role-first discipline gate's activity for that project (how many `NON_ROLE` and
 `MISMATCH`/`UNMARKED` decisions were logged) — and reports that section as `UNKNOWN`, never as zero,
 when `role-gate.jsonl` is absent or empty: an absent log is genuinely ambiguous between "the gate is
 installed and every dispatch complied" and "the gate never ran at all," and collapsing that
@@ -426,7 +435,7 @@ This project is deliberately honest about where it does not reach, rather than p
 confident-looking surface that quietly covers less than it appears to.
 
 1. **Nested dispatches are not gated and write no row.** Neither the granularity rule's
-   `SubagentStart` hook nor the role-first `PreToolUse` gate has any way to see a dispatch issued
+   `SubagentStart` hook nor the role-first `PreToolUse` discipline gate has any way to see a dispatch issued
    from *inside* an already-running subagent — the parent-transcript lookup both rely on finds no
    matching candidate for it, which produces no row and no denial, silently.
 2. **Dispatches through other tools are not gated at all.** A `Workflow` script, a `SendMessage`
@@ -463,6 +472,14 @@ confident-looking surface that quietly covers less than it appears to.
    branch this work has not yet merged into) registers commands that resolve to files that do not
    yet exist there; `fleet hooks status` will report exactly that as its silent-disable case above,
    but only if someone runs it.
+10. **The role-first discipline gate can be deliberately bypassed; it was never designed to resist
+    that.** It is a discipline aid, catching a forgotten or edited role block — not a security
+    control. A caller willing to try can get past it outright (a spoofed `.git` file, a poisoned
+    locator-cache entry, a directory planted inside the hook's own repository, or inherited git
+    environment variables all work — see the section above and the hook's own module docstring for
+    the full list), and every fault in its own machinery already lets the dispatch through by
+    design. Treat a passing gate as evidence of an honest mistake avoided, never as proof against a
+    determined attempt.
 
 ## Manual-smoke log
 

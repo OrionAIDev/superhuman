@@ -19,7 +19,12 @@ All notable changes to this project will be documented in this file. Format adap
   `scripts/fleet/role_block.py` (`check_role_block`), also reachable via the new
   `fleet role-block check --prompt-file <path|->` CLI verb. Non-role and denied decisions are
   logged to `docs/superhuman/<slug>/fleet/role-gate.jsonl`; `fleet doctor` gains a role-gate section
-  per project, reporting `UNKNOWN` (never a false zero) when that log is absent or empty.
+  per project, reporting `UNKNOWN` (never a false zero) when that log is absent or empty. **This is
+  a discipline aid, not a security control (G6, 2026-09-20):** it catches a forgotten or edited role
+  block; a caller deliberately trying to defeat it can (a spoofed `.git` file, a poisoned
+  locator-cache entry, a directory planted inside the hook's own repository, or inherited git
+  environment variables all work), and every fault in the gate's own machinery lets the dispatch
+  through by design.
 
 ### Changed
 
