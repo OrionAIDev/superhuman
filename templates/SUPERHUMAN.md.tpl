@@ -68,7 +68,7 @@
 - **immutable constraints:** {{constraints_that_cannot_change_this_project}}
 - **decisions-locked:** see `## Decisions locked` below
 - **ruled-out paths:** {{approaches_considered_and_rejected_with_one_line_why}}
-- **current state:** see `## Chunk log` (latest row) and the last gate entry in `## Decisions log`
+- **current state:** see `## Chunk log` (latest row) and the highest-numbered gate entry in `## Decisions log`
 - **next-3-actions:** {{action_1}}; {{action_2}}; {{action_3}}
 - **evidence-pointers:** {{file_paths_that_ground_the_above}}
 
@@ -85,7 +85,14 @@
        [2026-09-20T14:07:31Z] G5: chunk 3 results accepted; user decision: continue
      A date alone is not enough. Several gates routinely land on one day, and a date-only log
      cannot say which gate this project is at — the reader is left to guess, and guessing "the
-     furthest gate logged" is exactly the inference superhuman forbids elsewhere. -->
+     furthest gate logged" is exactly the inference superhuman forbids elsewhere.
+
+     Two entries appended from one exchange never share a timestamp: the first takes the clock,
+     each one after it takes the previous entry's timestamp plus one second.
+
+     Tie-break, for a record written before that rule: the higher gate number is the later
+     entry. "Which gate is this project at" is always answered by the highest-numbered gate
+     carrying a `user decision:` field, never by the timestamp alone. -->
 
 ## Chunk log
 <!-- Append-only table. -->

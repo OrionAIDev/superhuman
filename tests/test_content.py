@@ -1862,6 +1862,14 @@ _DECISIONS_LOG_HEADING = """
 ## Decisions log
 """
 
+_RESUME_PACKET_HEADING = """
+## Resume packet
+"""
+
+_DECISIONS_LOCKED_HEADING = """
+## Decisions locked
+"""
+
 
 def test_gate_entry_format_is_stated_to_the_second(skill_root: Path) -> None:
     """The decisions-log format statement demands a time, not just a date.
@@ -1915,4 +1923,80 @@ def test_gate_entry_examples_carry_hhmmss(skill_root: Path, rel: str) -> None:
         f"{rel} shows gate entries whose timestamp is not ISO-8601 UTC to the second: "
         f"{offenders}. Use [YYYY-MM-DDTHH:MM:SSZ] (or a concrete example such as "
         f"[2026-09-20T14:07:31Z])."
+    )
+
+
+#: Every surface that must state the no-shared-timestamp rule. The combined
+#: G0+G1 confirmation is the one site that appends two gate entries from a
+#: single exchange, so `phases/0-kickoff.md` has to carry it at the point of
+#: use as well as in the two statements of format rule 5.
+_MONOTONIC_SURFACES = (
+    "templates/SUPERHUMAN.md.tpl",
+    "SKILL.md",
+    "roles/pm.md",
+    "phases/0-kickoff.md",
+)
+
+
+@pytest.mark.parametrize("rel", _MONOTONIC_SURFACES)
+def test_two_entries_from_one_exchange_never_share_a_timestamp(
+    skill_root: Path, rel: str
+) -> None:
+    """Second precision alone does not order two entries written at once.
+
+    At HITL-L the PM appends a G0 and a G1 entry from a single combined
+    confirmation. Stamped from one clock read those tie, and a tie is the same
+    unreadable record the to-the-second rule exists to prevent — the log could
+    not say whether the project is at G0 or G1 without falling back to a guess.
+    The rule is monotonic: the first entry takes the clock, each one after it
+    takes the previous entry's timestamp plus one second.
+    """
+    text = (skill_root / rel).read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    assert "plus one second" in normalized or "one second later" in normalized, (
+        f"{rel} must say a second entry appended from the same exchange takes the "
+        f"previous entry's timestamp plus one second"
+    )
+    assert "never share a timestamp" in normalized or "never the same" in normalized, (
+        f"{rel} must say two entries from one exchange never share a timestamp"
+    )
+
+
+@pytest.mark.parametrize("rel", ("templates/SUPERHUMAN.md.tpl", "SKILL.md", "roles/pm.md"))
+def test_timestamp_tie_is_broken_by_the_higher_gate_number(
+    skill_root: Path, rel: str
+) -> None:
+    """A tied timestamp is read by gate number, never by the timestamp alone.
+
+    The monotonic rule stops new ties, but every record written before it can
+    still tie, and that is the record a reader actually has in hand. The
+    ordering is not new — the HARD-GATE resume step in SKILL.md already reads
+    the *highest-numbered* gate rather than the latest-stamped one — but it
+    was stated only as a resume procedure, so the record itself never said how
+    to read it. Both statements of gate format rule 5, and the template a
+    fresh project copies, now do.
+    """
+    text = (skill_root / rel).read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    assert "higher gate number is the later" in normalized, (
+        f"{rel} must state that a tied timestamp is broken by the higher gate number"
+    )
+    assert "never by the timestamp alone" in normalized, (
+        f"{rel} must say the gate a project is at is not read from the timestamp alone"
+    )
+
+
+def test_resume_packet_points_at_the_highest_numbered_gate(skill_root: Path) -> None:
+    """The Resume packet's current-state pointer says last *by what*.
+
+    It is the first line a resuming PM reads, and it used to point at "the last
+    gate entry" — last by line order, by timestamp, or by gate number, take
+    your pick. Under a tie those disagree.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    # Anchor on headings: both strings also appear backticked inside the packet.
+    packet = text.split(_RESUME_PACKET_HEADING, 1)[1].split(_DECISIONS_LOCKED_HEADING, 1)[0]
+    assert "highest-numbered gate entry" in packet, (
+        "the Resume packet's current-state pointer must name the highest-numbered gate "
+        "entry, not an unqualified 'last' one"
     )

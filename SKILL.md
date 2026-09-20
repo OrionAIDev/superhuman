@@ -270,6 +270,15 @@ Format rules (all Type A gates):
    `[2026-09-20T14:07:31Z] G5: chunk 3 results accepted; user decision: continue`. A date
    alone is not enough: several gates routinely land on one day, and a date-only log cannot
    say which gate the project is at.
+   Two entries appended from one exchange never share a timestamp: stamp the first from the
+   clock, and give each one after it the previous entry's timestamp plus one second. The
+   combined G0+G1 confirmation at HITL-L is the case this exists for — G0 takes the
+   exchange's time, G1 takes it plus a second — so the log's last gate reads unambiguously
+   as G1.
+   If two entries do share a timestamp — any record written before that rule — the higher
+   gate number is the later entry. "Which gate is this project at" is answered by the
+   highest-numbered gate carrying a `user decision:` field, never by the timestamp alone
+   (this is the same ordering the HARD-GATE resume step already uses).
 6. Never auto-proceed past Type A when a human is the one answering it. (At HITL-L, G6/G8/G9 are answered by the PM/surrogate itself, not skipped — see "HITL levels" above; every such answer is still logged to SUPERHUMAN.md exactly like a human decision would be.)
 7. G6 is unconditional at HITL-H/M — cadence mode does not silence it. At level 2 it always fires too, just resolved by the PM/surrogate rather than paused on.
 8. Archive, never delete: if a gate decision removes work, move affected files to `archive/<YYYY-MM-DD-HHMMSS>-<chunk>/` with `WHY.md` + `RESTORE.md` (using `templates/archive-WHY.md.tpl` and `templates/archive-RESTORE.md.tpl`).

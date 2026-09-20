@@ -367,6 +367,15 @@ Emit it exactly once, only after G8 sign-off, and never at any earlier gate. It 
    `[2026-09-20T14:07:31Z] G5: chunk 3 results accepted; user decision: continue`. A date
    alone is not enough: several gates routinely land on one day, and a date-only log cannot
    say which gate the project is at.
+   Two entries appended from one exchange never share a timestamp: stamp the first from the
+   clock, and give each one after it the previous entry's timestamp plus one second. The
+   combined G0+G1 confirmation at HITL-L is the case this exists for — G0 takes the
+   exchange's time, G1 takes it plus a second — so the log's last gate reads unambiguously
+   as G1.
+   If two entries do share a timestamp — any record written before that rule — the higher
+   gate number is the later entry. "Which gate is this project at" is answered by the
+   highest-numbered gate carrying a `user decision:` field, never by the timestamp alone
+   (this is the same ordering the HARD-GATE resume step already uses).
 6. **Never auto-proceed past Type A.** If user doesn't respond, work stops.
 7. **Drift escalations (G6) are unconditional** — cadence switch does NOT silence them.
 8. **Archive, never delete.** If a gate decision results in removing work, affected files move to `archive/<timestamp>-<chunk>/` with WHY.md + RESTORE.md.
