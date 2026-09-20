@@ -1717,3 +1717,127 @@ class TestRoleGateDenyDeliveredUnderHardKill:
         )
         decision = json.loads(stdout)
         assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# --- TC-142/TC-143: the adapter names the real cause when the role file was rejected --
+
+
+def _load_adapter_module(skill_root: Path):
+    """Load `pre_tool_use_role_gate.py` by file path, not a dotted import.
+
+    Mirrors `TestCrossChunkOneRowOnRetry`'s identical rationale:
+    `templates/hooks/claude-code/` is not a valid Python package path (the
+    hyphenated directory names above it), so this module is loaded
+    directly from its file path.
+
+    Args:
+        skill_root: the superhuman skill checkout root.
+
+    Returns:
+        The loaded `pre_tool_use_role_gate` module object.
+    """
+    import importlib.util
+
+    adapter_path = _adapter_script(skill_root)
+    spec = importlib.util.spec_from_file_location("pre_tool_use_role_gate", adapter_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestRoleGateAdapterNamesRejectedRoleFileCause:
+    """TC-142/TC-143 (Minor, correctness lens — preflight item 2). A prior
+    dispatch added `RoleCheckResult.role_file_reject_reason` for a role
+    file refused on size or type (`test_role_block.py::
+    TestRoleFileRejectReason`, role_block.py preflight item 4), but
+    `_build_deny_reason` never read it — every UNMARKED verdict, including
+    this one, got the generic "opens with neither ... nor ..." text, which
+    is FALSE here: the prompt's opening content was never even compared
+    against the rejected file, the file itself was refused first. Fixed
+    by checking `role_file_reject_reason` before falling back to the
+    generic UNMARKED text (or the MISMATCH text — this field is only ever
+    set on UNMARKED, but the check runs first regardless, so it can never
+    silently swallow a MISMATCH by accident)."""
+
+    def test_oversized_role_file_names_the_real_cause_not_the_generic_text(
+        self, skill_root: Path
+    ) -> None:
+        from scripts.fleet.role_block import RoleCheckResult, Verdict
+
+        module = _load_adapter_module(skill_root)
+        roles_dir = skill_root / "roles"
+        role_file = roles_dir / "developer.md"
+        result = RoleCheckResult(
+            verdict=Verdict.UNMARKED,
+            role="developer",
+            role_file=role_file,
+            role_file_reject_reason="the role file is 2097153 bytes, over the 1048576-byte bound",
+        )
+
+        reason = module._build_deny_reason(result, roles_dir)
+
+        assert "2097153 bytes" in reason, (
+            f"the reason must name the real cause (the size bound), not the generic "
+            f"'opens with neither ... nor ...' text: {reason!r}"
+        )
+        assert "opens with neither" not in reason
+        assert str(role_file) in reason or "developer.md" in reason
+
+    def test_non_regular_role_file_names_the_real_cause(self, skill_root: Path) -> None:
+        from scripts.fleet.role_block import RoleCheckResult, Verdict
+
+        module = _load_adapter_module(skill_root)
+        roles_dir = skill_root / "roles"
+        role_file = roles_dir / "developer.md"
+        result = RoleCheckResult(
+            verdict=Verdict.UNMARKED,
+            role="developer",
+            role_file=role_file,
+            role_file_reject_reason="the role file exists but is not a regular file",
+        )
+
+        reason = module._build_deny_reason(result, roles_dir)
+
+        assert "not a regular file" in reason
+        assert "opens with neither" not in reason
+
+    def test_ordinary_unmarked_still_gets_the_generic_text(self, skill_root: Path) -> None:
+        """Regression guard: the ordinary UNMARKED path (no
+        `role_file_reject_reason`) must be unaffected by this fix."""
+        from scripts.fleet.role_block import RoleCheckResult, Verdict
+
+        module = _load_adapter_module(skill_root)
+        roles_dir = skill_root / "roles"
+        result = RoleCheckResult(verdict=Verdict.UNMARKED)
+
+        reason = module._build_deny_reason(result, roles_dir)
+
+        assert "opens with neither" in reason
+
+    def test_mismatch_still_gets_the_mismatch_text_when_no_reject_reason(
+        self, skill_root: Path
+    ) -> None:
+        """Regression guard: a MISMATCH (`role_file_reject_reason` is
+        always `None` for MISMATCH, per role_block.py's own contract)
+        must still get the first-differing-line text, not the generic
+        UNMARKED one."""
+        from scripts.fleet.role_block import RoleCheckResult, Verdict
+
+        module = _load_adapter_module(skill_root)
+        roles_dir = skill_root / "roles"
+        role_file = roles_dir / "developer.md"
+        result = RoleCheckResult(
+            verdict=Verdict.MISMATCH,
+            role="developer",
+            role_file=role_file,
+            prompt_mismatch_line="tier: cheap",
+            file_mismatch_line="tier: standard",
+            mismatch_line_number=3,
+        )
+
+        reason = module._build_deny_reason(result, roles_dir)
+
+        assert "tier: cheap" in reason
+        assert "tier: standard" in reason
+        assert "opens with neither" not in reason

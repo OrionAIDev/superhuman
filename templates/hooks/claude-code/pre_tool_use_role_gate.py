@@ -415,6 +415,18 @@ def _build_deny_reason(result: Any, roles_dir: Path) -> str:
     D7.5: "the reason text quotes the exact line to add or the file to
     paste, so complying is always one retry away."
 
+    Preflight item 2 (Minor, correctness lens): an `UNMARKED` verdict whose
+    named role file was refused on size or type
+    (`RoleCheckResult.role_file_reject_reason` — role_block.py preflight
+    item 4) is a DIFFERENT situation from the ordinary "no role block
+    matched" `UNMARKED`: the prompt's opening content may be byte-identical
+    to the role file, and the generic UNMARKED text below ("opens with
+    neither ... nor ...") is FALSE in that case — the file was refused
+    before its content was ever compared. Checked first, ahead of the
+    `MISMATCH`/generic-`UNMARKED` branches below, so a caller with this
+    field set always gets the accurate explanation instead of the generic
+    one.
+
     Args:
         result: the `RoleCheckResult` (from `scripts.fleet.role_block`)
             that produced this deny.
@@ -424,6 +436,16 @@ def _build_deny_reason(result: Any, roles_dir: Path) -> str:
     Returns:
         str: a one/two-line human-readable reason.
     """
+    if result.role_file_reject_reason is not None:
+        role_file = result.role_file if result.role_file is not None else roles_dir / f"{result.role}.md"
+        return (
+            f"This dispatch's prompt claims the {result.role!r} role, but {role_file} "
+            "itself was refused before its content was ever compared: "
+            f"{result.role_file_reject_reason}. This is not a missing or edited role "
+            "block — once the file itself is fixed, paste its full, unedited content "
+            "again as the leading block of the prompt, or open with the literal line "
+            "'superhuman-dispatch: non-role' if this is not a role dispatch."
+        )
     if result.verdict == Verdict.MISMATCH:
         role_file = result.role_file if result.role_file is not None else roles_dir / f"{result.role}.md"
         return (
@@ -435,7 +457,7 @@ def _build_deny_reason(result: Any, roles_dir: Path) -> str:
             "in the task brief, never inside the role block), or open the prompt with the "
             "literal line 'superhuman-dispatch: non-role' if this is not a role dispatch."
         )
-    # Verdict.UNMARKED
+    # Verdict.UNMARKED (ordinary -- no role_file_reject_reason)
     return (
         "This dispatch's prompt opens with neither the full, unedited content of an "
         f"existing role file under {roles_dir} nor the exact line "
