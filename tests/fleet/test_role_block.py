@@ -1156,6 +1156,9 @@ _SKILL_PROSE_SCAN_ROOTS: tuple[str, ...] = (
     "templates",
 )
 _SKILL_PROSE_SCAN_FILES: tuple[str, ...] = ("SKILL.md",)
+# The prefix is deliberately `templates/hooks/` and not `templates/hooks/claude-code/`:
+# D4 clause 2 assigns harness knowledge to `templates/hooks/<harness>/` for EVERY harness,
+# so a future second harness's hook bodies are excluded for the same reason this one is.
 _SKILL_PROSE_EXCLUDED_PATH_PREFIXES: tuple[str, ...] = ("templates/hooks/",)
 _INSTALLER_INVOCATION_VERB_RE = re.compile(r"hooks\s+(install|uninstall)")
 

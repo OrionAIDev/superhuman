@@ -250,15 +250,25 @@ the checkout the hook itself was installed from — fixed once, at install time.
 necessarily the checkout the session is actually working in: a worktree on another branch, or a
 branch that edits `roles/pm.md`, is this estate's normal working mode, so a dispatch that is
 verbatim against the session's *own* copy could otherwise still earn a would-deny verdict here. To
-close that gap, a `MISMATCH`/`UNMARKED` verdict gets one more chance: if the session's own working
-tree resolves to a project that is itself a distinct superhuman checkout (its own `roles/`, its own
-`SKILL.md` naming `superhuman`) with a `roles/` different from the hook's, the check re-runs against
-*that* `roles/` before the deny goes out. The rule is **widen-only**: a second `roles/` can turn a
-pending deny into a pass, but can never turn a pass into a deny, and a fault in this second check
-(an unreadable or empty session `roles/`) lets the dispatch through exactly like any other fault
-above — the gate never denies on a check it could not actually complete. When both checks deny, the
-deny reason and the logged decision name the session's own role file, not the hook's, since that is
-the copy the session can actually open and fix.
+close that gap, a `MISMATCH`/`UNMARKED` verdict gets one more chance — but a **narrow** one, because
+the first shape of this seam was a bypass (a preflight re-run showed any repository carrying a
+`SKILL.md` naming `superhuman` could decide the verdict, and an EMPTY `roles/` turned every deny into
+a pass). As amended on 2026-09-20 and as shipped:
+
+- The second `roles/` is consulted **only when it sits in the same git repository as the hook's own** —
+  `git rev-parse --git-common-dir` must resolve on both sides and be equal. A linked worktree on
+  another branch shares that value, which is the case this seam exists for; a third-party repository
+  never does. If git cannot answer for either side, the second check does not run at all.
+- **A fault in the second check no longer lets the dispatch through.** The pending deny stands: the
+  primary check completed successfully, so refusing is not "denying on a check the gate could not
+  complete". (A fault in the PRIMARY check still passes the dispatch through, as everywhere else.)
+- The locator cache the workspace can come from is validated before use — a cached workspace that is
+  not an absolute existing directory, or an unsafe slug, is treated as a cache miss.
+
+The rule is still **widen-only**, but only within one repository: a second `roles/` can turn a pending
+deny into a pass, and can never turn a pass into a deny. When both checks deny, the deny reason and the
+logged decision name the session's own role file, not the hook's, since that is the copy the session can
+actually open and fix.
 
 ## The D4 boundary: the portable floor and the harness ceiling
 

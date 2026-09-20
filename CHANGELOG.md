@@ -13,8 +13,9 @@ All notable changes to this project will be documented in this file. Format adap
   `.cmd`, + `pre_tool_use_role_gate.py`) is a `PreToolUse`/`Agent|Task` hook that refuses a
   main-thread dispatch which opens with neither a role file's full, unedited content nor the exact
   line `superhuman-dispatch: non-role` — verify-only, never rewrites the prompt, never emits
-  `allow`/`ask`/`defer`, and every fault (an unreadable `roles/` directory included) lets the
-  dispatch through rather than denying it. The portable predicate lives in
+  `allow`/`ask`/`defer`, and every fault in the PRIMARY check (an unreadable `roles/`
+  directory included) lets the dispatch through rather than denying it; since the 2026-09-20
+  amendment a fault in the same-repository second check leaves the pending deny standing. The portable predicate lives in
   `scripts/fleet/role_block.py` (`check_role_block`), also reachable via the new
   `fleet role-block check --prompt-file <path|->` CLI verb. Non-role and denied decisions are
   logged to `docs/superhuman/<slug>/fleet/role-gate.jsonl`; `fleet doctor` gains a role-gate section
