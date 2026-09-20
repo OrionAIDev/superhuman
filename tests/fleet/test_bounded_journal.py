@@ -78,3 +78,27 @@ def test_n_concurrent_writer_processes_lose_no_rows(tmp_path: Path) -> None:
         f"{N_WRITERS - len(lines)} row(s) under concurrent dispatch"
     )
     assert sorted(lines) == sorted(f"line-{i}" for i in range(N_WRITERS))
+
+
+def test_append_survives_a_pre_existing_non_utf8_byte(tmp_path: Path) -> None:
+    """TC-128 (Phase 3.3 preflight RE-RUN item D -- Minor): the old
+    `path.read_text(encoding="utf-8")` raised `UnicodeDecodeError` -- a
+    `ValueError`, NOT an `OSError` -- on a single non-UTF-8 byte anywhere
+    in the journal. Both current callers (`role_block.py`,
+    `observe.py`) catch only `(OSError, LockTimeoutError)`, and this
+    function's own docstring tells callers to catch exactly that pair, so
+    one bad byte killed that journal permanently and silently: every
+    future append would raise past this function uncaught.
+
+    Seeds the journal with a lone invalid UTF-8 continuation byte (`0xFF`,
+    never valid as a UTF-8 lead byte) and asserts the append still lands
+    -- no exception, and the new line is present afterward."""
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(b'{"ts": "t0", "line": "0"}\n\xff\xfe garbage not valid utf-8\n')
+
+    append_bounded_line(path, "line-1", max_lines=10)
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    assert "line-1" in text.splitlines()[-1], (
+        f"the new line must land even though the file already carried invalid UTF-8: {text!r}"
+    )

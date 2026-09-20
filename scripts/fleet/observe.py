@@ -426,7 +426,11 @@ def _write_journal(
         fleet_dir.mkdir(parents=True, exist_ok=True)
         path = _journal_path(fleet_dir)
         append_bounded_line(path, line, max_lines=_JOURNAL_MAX_LINES)
-    except (OSError, LockTimeoutError) as exc:
+    except (OSError, ValueError, LockTimeoutError) as exc:
+        # Phase 3.3 preflight RE-RUN item D: `ValueError` widened in
+        # alongside `OSError`/`LockTimeoutError` as defense in depth --
+        # see `role_block.py`'s identical comment on its own
+        # `append_bounded_line` call site.
         print(
             f"fleet observe: {event} failed ({error_class}) and the failure "
             f"journal itself could not be written: {exc}",

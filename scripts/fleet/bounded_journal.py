@@ -84,7 +84,25 @@ def append_bounded_line(path: Path, line: str, *, max_lines: int, timeout: float
     lock_path = path.with_name(path.name + ".lock")
     handle = acquire_lock(lock_path, timeout=timeout)
     try:
-        existing = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln] if path.is_file() else []
+        # Phase 3.3 preflight RE-RUN item D: plain `encoding="utf-8"` (no
+        # `errors=`) raises `UnicodeDecodeError` on a single invalid byte --
+        # a `ValueError`, NOT an `OSError` -- so one bad byte anywhere in an
+        # otherwise-healthy journal killed it permanently: both current
+        # callers catch only `(OSError, LockTimeoutError)` (this function's
+        # own `Raises:` section above), so the append would raise straight
+        # past them, uncaught, forever after. `errors="replace"` substitutes
+        # U+FFFD for each invalid byte instead of raising -- this is a
+        # best-effort DIAGNOSTIC log, not data this project parses back
+        # field-by-field (each row is written, never re-parsed, by
+        # `role_block.py`'s bounded tail; `observe.py`'s is read by a human
+        # or `fleet doctor`), so a garbled OLD line surviving as
+        # replacement-character mush is an acceptable trade against losing
+        # the journal outright.
+        existing = (
+            [ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln]
+            if path.is_file()
+            else []
+        )
         existing.append(line)
         if len(existing) > max_lines:
             existing = existing[-max_lines:]

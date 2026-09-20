@@ -479,13 +479,22 @@ def record_role_gate_decision(
         # rows: one writer's whole-file rewrite silently discards the
         # other's already-durable line.
         append_bounded_line(path, line, max_lines=_ROLE_GATE_LOG_MAX_LINES)
-    except (OSError, LockTimeoutError):
+    except (OSError, ValueError, LockTimeoutError):
         # Loudness tier 2 (mirrors observe.py's identical posture): the
         # fleet directory unwritable is often the very failure that would
         # have blocked the primary write too; there is no primary write
         # here to protect, so this degrades silently rather than adding a
         # second stderr convention this module would then have to keep in
         # sync with observe.py's.
+        #
+        # Phase 3.3 preflight RE-RUN item D: `ValueError` is widened in
+        # alongside `OSError`/`LockTimeoutError` as defense in depth --
+        # `bounded_journal.append_bounded_line` no longer raises
+        # `UnicodeDecodeError` (a `ValueError` subclass) itself (fixed at
+        # the source via `errors="replace"`), but this call site must not
+        # regress into the "one bad byte kills the journal forever" defect
+        # class if a future edit there reintroduces a `ValueError`-raising
+        # path.
         pass
 
 
