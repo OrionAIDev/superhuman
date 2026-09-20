@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 # Belt-and-suspenders, matching test_lock_os_native.py's own bootstrap:
 # tests/fleet/conftest.py already puts the skill root on sys.path for the
@@ -31,6 +34,8 @@ if str(_SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(_SKILL_ROOT))
 
 from scripts.fleet.bounded_journal import append_bounded_line  # noqa: E402
+from scripts.fleet.core.errors import LockTimeoutError  # noqa: E402
+from scripts.fleet.core.events import acquire_lock, release_lock  # noqa: E402
 
 N_WRITERS = 20
 
@@ -154,3 +159,67 @@ def test_append_never_truncates_the_journal_to_zero_on_a_kill_mid_write(tmp_path
         f"the pre-existing row must survive a kill mid-write, not be lost to a "
         f"truncate-then-rewrite: file now contains {surviving!r}"
     )
+
+
+def _hold_lock_child(lock_path_str: str, hold_seconds: float, acquired_event: object) -> None:
+    """Acquire `<journal>.lock`, signal acquisition, hold it, release.
+
+    Module-level (not a closure) so it is picklable under
+    `multiprocessing`'s `spawn` start method. Mirrors
+    `test_lock_os_native.py::_hold_lock_child` exactly -- the same
+    live-cross-process-holder shape, reused here against
+    `bounded_journal`'s own lock file rather than calling `acquire_lock`
+    from a test that has no opinion about journals.
+    """
+    handle = acquire_lock(lock_path_str, timeout=10.0, retry_interval=0.01)
+    acquired_event.set()  # type: ignore[attr-defined]
+    time.sleep(hold_seconds)
+    release_lock(handle)
+
+
+def test_default_lock_timeout_is_a_small_fraction_of_the_hook_budget(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """TC-140 (Minor, correctness lens): `_DEFAULT_LOCK_TIMEOUT_SECONDS`
+    used to equal 10.0 -- the INSTALLED HOOK's entire `"timeout": 10`
+    budget (`hooks_install.py::_TIMEOUT_SECONDS`), so lock contention on
+    this best-effort DIAGNOSTIC write alone could consume the hook's
+    whole budget, leaving nothing for its primary work. Lowered to a
+    small fraction (1.0s) so a genuinely contended lock fails fast, well
+    within the hook's overall budget -- both current callers
+    (`observe.py`, `role_block.py`) already catch `LockTimeoutError`
+    explicitly and degrade (one stderr line / a silent no-op) rather than
+    ever letting it propagate uncaught, so a faster timeout only makes
+    that documented degrade-on-timeout path trigger sooner, never changes
+    whether it triggers.
+
+    Proven with a REAL cross-process holder (mirrors
+    `test_lock_os_native.py`'s identical reasoning for why a process, not
+    a thread sharing the GIL, is required to prove genuine contention): a
+    child process holds `<journal>.lock` for longer than the new default,
+    and the parent's `append_bounded_line` call -- using the DEFAULT
+    timeout, no override -- must raise `LockTimeoutError` well within the
+    OLD 10s bound, proving the smaller default is actually in effect, not
+    merely documented.
+    """
+    tmp_dir = tmp_path_factory.mktemp("fleet-bounded-journal-timeout")
+    path = tmp_dir / "journal.jsonl"
+    lock_path = path.with_name(path.name + ".lock")
+
+    ctx = multiprocessing.get_context("spawn")
+    acquired_event = ctx.Event()
+    child = ctx.Process(target=_hold_lock_child, args=(str(lock_path), 5.0, acquired_event))
+    child.start()
+    try:
+        assert acquired_event.wait(timeout=10), "child never signaled lock acquisition"
+        start = time.monotonic()
+        with pytest.raises(LockTimeoutError):
+            append_bounded_line(path, "line", max_lines=10)
+        elapsed = time.monotonic() - start
+        assert elapsed < 5.0, (
+            f"append_bounded_line took {elapsed:.2f}s to give up on a contended lock -- "
+            "expected the new, small default timeout, not the old 10s one"
+        )
+    finally:
+        child.join(timeout=10)
+        assert child.exitcode == 0, f"holder child exited with code {child.exitcode}"

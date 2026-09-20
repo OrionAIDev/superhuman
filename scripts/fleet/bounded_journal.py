@@ -50,12 +50,29 @@ from .core.events import acquire_lock, release_lock
 
 __all__ = ["append_bounded_line"]
 
-#: Matches `core/events.py`'s own default -- see that module's
-#: `_DEFAULT_TIMEOUT`. These are best-effort diagnostic writes with a
+#: Preflight item 5 (Minor, correctness lens): this USED to match
+#: `core/events.py`'s own `_DEFAULT_TIMEOUT` (10.0s) -- but that value is
+#: also the INSTALLED HOOK's entire `"timeout": 10` budget
+#: (`hooks_install.py::_TIMEOUT_SECONDS`), so contention on this
+#: best-effort, diagnostic-only write alone could consume the hook's
+#: WHOLE budget, leaving nothing for its actual primary work. These are a
 #: trivial critical section (read a small file, append one line, write it
-#: back), so real contention is expected to clear in milliseconds; this
-#: bound only guards against a genuinely wedged holder.
-_DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+#: back), so real contention is expected to clear in milliseconds; a
+#: genuinely wedged holder should fail this fast, not linger for the
+#: hook's entire allotment. Lowered to 1.0s -- a full second is still
+#: generous against a millisecond-scale critical section, while bounding
+#: the worst case to a small fraction of the 10s hook budget rather than
+#: all of it.
+#:
+#: Both current callers already make their behaviour on a timeout
+#: explicit: `observe.journal_early_cli_failure` catches
+#: `(OSError, ValueError, LockTimeoutError)` and degrades to one
+#: `stderr`-printed line (Loudness tier 2); `role_block.record_role_gate_decision`
+#: catches the identical triple and degrades to a silent no-op (there is
+#: no primary write for it to protect). Lowering this default only makes
+#: that already-documented degrade path trigger sooner under genuine
+#: contention -- it does not change whether either caller catches it.
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 1.0
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
