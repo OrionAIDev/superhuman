@@ -1334,3 +1334,72 @@ class TestAddOwnedRefusesDestructiveShapes:
         assert str(settings_path) in str(excinfo.value)
         assert "PreToolUse" in str(excinfo.value)
         assert settings_path.read_bytes() == before_bytes
+
+
+class TestOwnershipRequiresSamePathToken:
+    """TC-137 (Minor, security lens): `_OWNED_COMMAND_RE` `.search`ed with a
+    greedy `.*` between the `/superhuman/` segment and
+    `templates/hooks/claude-code/<basename>`, so the two need not belong to
+    the same path token at all -- an unrelated command that merely
+    MENTIONS `/superhuman/` earlier (e.g. in an unrelated argument) and
+    happens to end at our conventional layout in a LATER, unrelated token
+    was misclassified as OURS. A foreign hook classified as ours would be
+    silently rewritten or removed by install()/uninstall().
+
+    Fixed by restricting the middle `.*` to path-token characters only
+    (word chars, `/`, `.`, `-`, `:`) -- no whitespace, `&`, `;`, or `|| --
+    so `/superhuman/` and `templates/hooks/claude-code/<basename>` must
+    belong to the same shell token to match."""
+
+    def test_owned_basename_rejects_superhuman_mention_in_an_unrelated_earlier_token(self) -> None:
+        foreign_command = (
+            "node /tools/vendor/run.js --ref /home/x/superhuman/notes.md && "
+            "/tools/vendor/templates/hooks/claude-code/session-start"
+        )
+        assert hooks_install._owned_basename(foreign_command) is None, (
+            "a `/superhuman/` mention in an unrelated earlier shell token must not "
+            "make a later, unrelated command classified as ours"
+        )
+
+    def test_owned_basename_still_recognises_a_worktree_rooted_command(self) -> None:
+        """Regression guard: a real worktree-rooted command -- where
+        `/superhuman/` and `templates/hooks/claude-code/<basename>` are in
+        the SAME token, separated only by ordinary path segments like
+        `.claude/worktrees/<slug>` -- must still be recognised as owned."""
+        worktree_command = (
+            "C:/Users/operator/.claude/skills/superhuman/.claude/worktrees/"
+            "some-feature-branch/templates/hooks/claude-code/session-start"
+        )
+        assert hooks_install._owned_basename(worktree_command) == "session-start"
+
+    def test_install_does_not_claim_the_look_alike_foreign_command(
+        self, temp_settings_json_clean: Path
+    ) -> None:
+        """End-to-end: install() must leave the look-alike foreign command
+        untouched rather than replacing/duplicating around it, and must
+        not remove it on a later uninstall()."""
+        before = json.loads(temp_settings_json_clean.read_text(encoding="utf-8"))
+        foreign_command = (
+            "node /tools/vendor/run.js --ref /home/x/superhuman/notes.md && "
+            "/tools/vendor/templates/hooks/claude-code/session-start"
+        )
+        before["hooks"]["SessionStart"][0]["hooks"].append({"type": "command", "command": foreign_command})
+        temp_settings_json_clean.write_text(json.dumps(before, indent=2) + "\n", encoding="utf-8")
+
+        hooks_install.install(settings_path=temp_settings_json_clean)
+        after_install = json.loads(temp_settings_json_clean.read_text(encoding="utf-8"))
+        startup_after_install = next(
+            g for g in after_install["hooks"]["SessionStart"] if g["matcher"] == "startup"
+        )["hooks"]
+        assert any(c["command"] == foreign_command for c in startup_after_install), (
+            "install() must leave the look-alike foreign command untouched"
+        )
+
+        hooks_install.uninstall(settings_path=temp_settings_json_clean)
+        after_uninstall = json.loads(temp_settings_json_clean.read_text(encoding="utf-8"))
+        startup_after_uninstall = next(
+            g for g in after_uninstall["hooks"]["SessionStart"] if g["matcher"] == "startup"
+        )["hooks"]
+        assert any(c["command"] == foreign_command for c in startup_after_uninstall), (
+            "uninstall() must not remove the look-alike foreign command"
+        )

@@ -153,8 +153,27 @@ _TIMEOUT_SECONDS: Final[int] = 10
 #: covered it; matching the path token's own end this way generalises to
 #: that shape (and any future wrapper prefix) without enumerating every
 #: possible quoting/wrapping style by hand.
+#:
+#: Preflight item 2 (Minor, security lens): the `/superhuman/` segment and
+#: the `templates/hooks/claude-code/<basename>` layout were connected by
+#: an unrestricted `.*`, so the two needed not belong to the SAME path
+#: token at all -- `"node /tools/vendor/run.js --ref /home/x/superhuman/"
+#: "notes.md && /tools/vendor/templates/hooks/claude-code/session-start"`
+#: matched (a `/superhuman/` mention in one shell argument, an unrelated
+#: tool's own conventional-layout command in a LATER, unrelated token),
+#: so a foreign hook shaped like that would be silently rewritten or
+#: removed as if it were ours. Fixed by restricting the middle `.*` to
+#: `[\w./:-]*` -- path/word characters only, no whitespace or shell
+#: metacharacters (`&`, `;`, `|`, quotes) -- so the two segments must sit
+#: in the same unbroken path token. Every real deployment shape still
+#: matches: a main checkout has them directly adjacent (empty middle); a
+#: linked worktree's extra `.claude/worktrees/<slug>/` segment is made
+#: entirely of allowed characters. The quoted/wrapped spellings TC-127
+#: covers are unaffected -- the quote/wrapper characters fall OUTSIDE
+#: this pattern's own match span (before `/superhuman/` or after the
+#: trailing lookahead), never inside the restricted middle.
 _OWNED_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
-    r"/superhuman/.*templates/hooks/claude-code/"
+    r"/superhuman/[\w./:-]*templates/hooks/claude-code/"
     r"(session-start|subagent-start|pre-tool-use-role-gate)(?:\.cmd)?(?![\w./-])"
 )
 
