@@ -322,8 +322,13 @@ def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
     it fails, before anything prompt-specific runs; (2) the `NON_ROLE_LINE`
     literal-first-line test (D7.2); (3) chunk 7's frontmatter/name test
     (`leads_with_role_block`) to decide whether the prompt is role-SHAPED
-    at all; (4) for a role-shaped prompt, the strict verbatim comparison
-    against `roles_dir/<name>.md` (D7.3).
+    at all — widened by a same-function fallback (the frontmatter names a
+    role AND some entry, regular or not, exists at `roles_dir/<name>.md`)
+    so a role file rejected by the size/type bound below is still reached
+    rather than being invisible to this test purely because it failed
+    `leads_with_role_block`'s own `is_file()` filter first; (4) for a
+    role-shaped prompt, the strict verbatim comparison against
+    `roles_dir/<name>.md` (D7.3).
 
     Args:
         prompt: the dispatching `Agent`/`Task` tool_use's `prompt` input,
@@ -350,14 +355,26 @@ def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
         if _is_non_role_line(prompt):
             return RoleCheckResult(verdict=Verdict.NON_ROLE)
 
-        if not leads_with_role_block(prompt, roles_dir):
-            return RoleCheckResult(verdict=Verdict.UNMARKED)
-
         role_name = _frontmatter_role_name(prompt)
-        if role_name is None:  # pragma: no cover - leads_with_role_block already required a name: line to match
+        role_file = roles_dir / f"{role_name}.md" if role_name is not None else None
+        # `leads_with_role_block` (dispatch_predicate.py) gates on the
+        # named role passing `Path.is_file()` at discovery time -- right
+        # for its own SubagentStart-hook registration use (chunk 7), but
+        # wrong here on its own: a role file that EXISTS on disk yet fails
+        # that regular-file check (a FIFO/socket/etc. -- exactly what the
+        # stat()-based bound a few lines down exists to name) would
+        # otherwise be invisible to "is this prompt role-shaped at all" --
+        # the stat() check would never run, and the prompt would look like
+        # ordinary UNMARKED prose instead of naming the real cause
+        # (preflight item F's intent). `role_file.exists()` is true for
+        # any entry type, regular or not, so it keeps that case reachable
+        # without weakening `leads_with_role_block`'s own `is_file()` gate
+        # for its other callers.
+        role_shaped = leads_with_role_block(prompt, roles_dir) or (
+            role_file is not None and role_file.exists()
+        )
+        if not role_shaped or role_name is None:  # role_name is None only when role_shaped is already False
             return RoleCheckResult(verdict=Verdict.UNMARKED)
-
-        role_file = roles_dir / f"{role_name}.md"
         # Phase 3.3 preflight RE-RUN item F: `stat()` first, before ever
         # calling `read_text()` -- `stat()` only reads metadata and never
         # blocks opening the file, unlike `read_text()`, which would hang
