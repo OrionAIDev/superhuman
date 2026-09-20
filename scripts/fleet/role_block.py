@@ -458,7 +458,27 @@ def record_role_gate_decision(
             fleet_dir = workspace_path / "docs" / "superhuman" / slug / "fleet"
             expected_root = (workspace_path / "docs" / "superhuman" / slug).resolve()
             if not fleet_dir.resolve().is_relative_to(expected_root):
-                return  # pragma: no cover - unreachable once slug_is_safe rejects traversal; kept as defense in depth (B5), mirroring config.py's identical resolve+is_relative_to pattern for manifest_dir
+                # Phase 3.3 preflight RE-RUN item E: this line WAS marked
+                # `# pragma: no cover - unreachable once slug_is_safe rejects
+                # traversal` -- wrong on two counts. First, `slug_is_safe`
+                # itself missed a whole class of escape (a Windows
+                # drive-relative slug, e.g. `"C:evil"` -- fixed at
+                # `path_safety.slug_is_safe`, but even THAT fix does not make
+                # this line unreachable). Second, and separately: this check
+                # is load-bearing defense in depth against a symlinked
+                # `fleet` subdirectory pointing outside the project tree,
+                # independent of slug content entirely -- `fleet_dir` and
+                # `expected_root` are built from the identical slug/workspace
+                # pair, so nothing about the SLUG can make them diverge; only
+                # the filesystem itself can (a symlink at this exact
+                # component), which is exactly the TOCTOU-shaped risk this
+                # check exists to catch. See `tests/fleet/test_role_block.py`
+                # (`TestRecordRoleGateDecision::
+                # test_refuses_when_fleet_dir_escapes_confinement`) for
+                # coverage -- a real symlink cannot be created in this
+                # project's own sandboxed test environment (no privilege),
+                # so that test simulates the divergence directly.
+                return
         fleet_dir.mkdir(parents=True, exist_ok=True)
         path = role_gate_log_path(fleet_dir)
         line = json.dumps(

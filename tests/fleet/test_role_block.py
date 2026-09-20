@@ -534,6 +534,54 @@ class TestRecordRoleGateDecisionPathSafety:
         assert after == before, "a nonexistent workspace path wrote something to disk"
         assert not workspace.exists()
 
+    def test_refuses_when_fleet_dir_escapes_confinement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-129 (Phase 3.3 preflight RE-RUN item E): the
+        `resolve()`/`is_relative_to()` confinement check (~line 461) was
+        marked `# pragma: no cover - unreachable once slug_is_safe rejects
+        traversal` -- wrong: it is load-bearing defense in depth against a
+        symlinked `fleet` subdirectory pointing outside the project tree,
+        independent of slug content (`fleet_dir` and `expected_root` are
+        built from the identical slug/workspace pair, so only the
+        FILESYSTEM, never the slug, can make them diverge). Real symlink
+        creation needs a Windows privilege this sandbox does not grant
+        (matches this suite's own environment limits -- see e.g.
+        `tests/test_profile_onboarding.py`'s symlink skip), so this
+        simulates the divergence a symlink would produce directly: the
+        `fleet`-named path component resolves outside `expected_root` even
+        though the slug itself is ordinary and already `slug_is_safe`."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        profile = tmp_path / "profile.yaml"
+        self._write_profile(profile)
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        escape_target = tmp_path / "escaped"
+        real_resolve = Path.resolve
+
+        def _fake_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+            if self.name == "fleet":
+                return escape_target
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", _fake_resolve)
+
+        record_role_gate_decision(
+            workspace,
+            "demo-slug",
+            session_id="sess-1",
+            verdict=Verdict.NON_ROLE,
+            role=None,
+            subagent_type=None,
+            mismatch_line_number=None,
+        )
+
+        assert not escape_target.exists(), (
+            "the confinement check must refuse to write when the resolved "
+            "fleet dir escapes the workspace"
+        )
+
 
 class TestReadRoleGateLog:
     def test_missing_log_returns_empty_list(self, tmp_path: Path) -> None:

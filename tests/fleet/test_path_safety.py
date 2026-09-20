@@ -39,10 +39,47 @@ class TestSlugIsSafe:
     def test_traversal_and_separator_slugs_are_unsafe(self, slug: str) -> None:
         assert slug_is_safe(slug) is False
 
-    def test_empty_slug_is_safe(self) -> None:
-        """An empty slug carries no separator or `..` segment -- callers
-        that build a path from it get a harmless no-op path component
-        (`Path` drops an empty segment), not an escape. Rejecting it is not
-        this function's job; a caller that cares about emptiness checks it
-        separately."""
-        assert slug_is_safe("") is True
+    def test_empty_slug_is_unsafe(self) -> None:
+        """TC-129 (Phase 3.3 preflight RE-RUN item E): an earlier version of
+        this function treated `""` as safe (a harmless no-op `Path`
+        segment). Reversed: a slug is meant to name one specific project,
+        and treating `""` as safe let every misconfigured caller silently
+        collapse onto the same `docs/superhuman/fleet` directory instead
+        of failing loudly."""
+        assert slug_is_safe("") is False
+
+    def test_dot_slug_is_unsafe(self) -> None:
+        """TC-129: `"."` is the identical no-real-identity shape as `""`,
+        one path segment later."""
+        assert slug_is_safe(".") is False
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "C:evil",
+            "D:evil",
+            "C:",
+            "c:evil",
+        ],
+    )
+    def test_drive_qualified_slug_is_unsafe(self, slug: str) -> None:
+        """TC-129: a Windows drive-relative/drive-qualified slug contains
+        none of `/`, `\\`, or `..`, so the original three-character check
+        missed it entirely -- but joining it onto ANY base path with
+        `pathlib` REPLACES that base path outright rather than extending
+        it: `Path("D:/ws") / "C:evil" == Path("C:evil")` (verified). A
+        caller building `<workspace>/docs/superhuman/<slug>/fleet` from
+        this slug lands completely outside the workspace, silently."""
+        assert slug_is_safe(slug) is False
+
+    def test_drive_qualified_slug_actually_escapes_a_joined_path(self) -> None:
+        """Confirms the mechanism `test_drive_qualified_slug_is_unsafe`
+        exists to reject, so the regression this guards against is
+        traceable in the test suite itself, not just in a comment."""
+        from pathlib import Path
+
+        joined = Path("D:/fake-workspace") / "docs" / "superhuman" / "C:evil" / "fleet"
+        assert not joined.is_relative_to(Path("D:/fake-workspace")), (
+            "sanity check failed: a drive-qualified slug must escape a joined path "
+            "for this to be the defect item E describes"
+        )

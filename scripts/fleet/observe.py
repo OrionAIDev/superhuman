@@ -121,10 +121,22 @@ def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
     Raises:
         _Disabled: if `slug` fails `_validate_slug` (FIX 4) — a
             path-traversal-shaped slug is rejected here, before any path is
-            built or any I/O happens.
+            built or any I/O happens. Also raised (Phase 3.3 preflight
+            RE-RUN item E) if the built path does not actually resolve
+            inside `<workspace>/docs/superhuman/<slug>/` -- defense in
+            depth against a symlinked `fleet` subdirectory pointing
+            outside the project tree, mirroring `role_block.py`'s
+            identical `resolve()`/`is_relative_to()` confinement check for
+            `record_role_gate_decision` (which this module previously had
+            no equivalent of).
     """
     _validate_slug(slug)
-    return Path(workspace) / "docs" / "superhuman" / slug / "fleet"
+    workspace_path = Path(workspace)
+    fleet_dir = workspace_path / "docs" / "superhuman" / slug / "fleet"
+    expected_root = (workspace_path / "docs" / "superhuman" / slug).resolve()
+    if not fleet_dir.resolve().is_relative_to(expected_root):
+        raise _Disabled(f"slug {slug!r} resolves outside the workspace ({workspace_path})")
+    return fleet_dir
 
 
 def _journal_path(fleet_dir: Path) -> Path:

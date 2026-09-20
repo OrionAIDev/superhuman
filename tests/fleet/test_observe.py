@@ -1431,6 +1431,56 @@ class TestObserveStatusSlugValidation:
         assert not (git_repo / "escape").exists()
         assert not (git_repo / "docs").exists()
 
+    def test_status_with_drive_qualified_slug_reports_not_configured(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-129 (Phase 3.3 preflight RE-RUN item E): `slug_is_safe`
+        missed a Windows drive-relative slug entirely -- `"C:evil"`
+        contains none of `/`, `\\`, or `..`, but joining it onto ANY base
+        path with `pathlib` silently REPLACES that base path, landing
+        `_default_fleet_dir` completely outside `git_repo`. Confirms the
+        fixed `slug_is_safe` closes this end to end through the same
+        `observe_status` entry point `TestObserveStatusSlugValidation`'s
+        sibling tests use for the `..`-traversal shape."""
+        slug = "C:evil"
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        report = observe.observe_status(git_repo, slug)
+
+        assert report.startswith("not configured:")
+        assert not Path("C:evil").exists()
+
+    def test_default_fleet_dir_refuses_when_resolved_path_escapes_confinement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TC-129: the confinement check added alongside the `slug_is_safe`
+        fix (item E: "observe.py has no equivalent confinement; add one",
+        mirroring `role_block.py`'s own `resolve()`/`is_relative_to()`
+        check) is defense in depth against a symlinked `fleet`
+        subdirectory pointing outside the workspace, independent of slug
+        content. Real symlink creation needs a Windows privilege this
+        sandbox does not grant (see this suite's module-level symlink
+        skip elsewhere), so this simulates the divergence a symlink would
+        produce: `fleet_dir.resolve()` landing outside `expected_root`
+        even though the slug itself is ordinary and already
+        `slug_is_safe`."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        escape_target = tmp_path / "escaped"
+        real_resolve = Path.resolve
+
+        def _fake_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+            if self.name == "fleet":
+                return escape_target
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", _fake_resolve)
+
+        with pytest.raises(observe._Disabled):
+            observe._default_fleet_dir(workspace, "demo-slug")
+
 
 class TestCoreUntouched:
     """TC-7: `scripts/fleet/core/*` is byte-unchanged and imports no harness module.
