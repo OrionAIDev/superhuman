@@ -677,6 +677,105 @@ class TestOwnershipTightening:
         )
 
 
+class TestOwnershipQuotedAndWrappedSpellings:
+    """TC-127 (Phase 3.3 preflight RE-RUN item C -- Major): `_OWNED_COMMAND_RE`
+    was `$`-anchored on the basename, so any spelling that put ANYTHING
+    after the basename in the command string -- a closing quote, trailing
+    whitespace, or a wrapper prefix like `bash "..."` -- was classified
+    FOREIGN. Consequence: `install()` duplicates instead of replacing, and
+    `uninstall()` orphans the entry -- the rollback path this project's own
+    rollback plan names. A quoted spelling is mandatory once the checkout
+    path contains a space (this is a public repo, so that is not a
+    hypothetical), so this is not a cosmetic edge case.
+
+    Fixed by replacing the `$`-anchor with a negative lookahead for a
+    continuing path/word character (`(?![\\w./-])`) -- the basename (plus
+    optional `.cmd`) may be followed by a quote, whitespace, another shell
+    token, or end-of-string, but NOT by more path characters. This still
+    rejects a look-alike (TC-114's own `session-start-legacy`-shaped
+    concern), verified below alongside the four required spellings.
+    """
+
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            pytest.param(lambda cmd: f'"{cmd}"', id="quoted"),
+            pytest.param(lambda cmd: f"{cmd} ", id="trailing_whitespace"),
+            pytest.param(lambda cmd: f'bash "{cmd}"', id="bash_quoted_wrapper"),
+        ],
+    )
+    def test_owned_basename_recognises_the_spelling(self, wrap) -> None:
+        base = "C:/x/superhuman/templates/hooks/claude-code/session-start"
+        assert hooks_install._owned_basename(wrap(base)) == "session-start"
+
+    def test_owned_basename_recognises_a_quoted_cmd_shim(self) -> None:
+        base = "C:/x/superhuman/templates/hooks/claude-code/session-start.cmd"
+        assert hooks_install._owned_basename(f'"{base}"') == "session-start"
+
+    def test_owned_basename_still_rejects_a_look_alike_suffix(self) -> None:
+        """The lookahead must not weaken TC-114's false-positive guard: a
+        command that merely STARTS WITH our basename but continues as a
+        different path (an unrelated tool's own naming) is still foreign."""
+        look_alike = "C:/x/superhuman/templates/hooks/claude-code/session-start-legacy"
+        assert hooks_install._owned_basename(look_alike) is None
+
+    def test_install_migrates_a_quoted_pre_existing_entry_instead_of_duplicating(
+        self, temp_settings_json: Path
+    ) -> None:
+        """A quoted pre-existing entry -- the mandatory spelling once the
+        checkout path contains a space -- is recognised as ours and
+        MIGRATED (replaced) by `install()`, never left beside a second,
+        freshly-added entry as a duplicate."""
+        before = json.loads(temp_settings_json.read_text(encoding="utf-8"))
+        startup_before = next(g for g in before["hooks"]["SessionStart"] if g["matcher"] == "startup")["hooks"]
+        for command in startup_before:
+            if command["command"].endswith("/session-start"):
+                command["command"] = f'"{command["command"]}"'
+        temp_settings_json.write_text(json.dumps(before, indent=2) + "\n", encoding="utf-8")
+
+        hooks_install.install(settings_path=temp_settings_json)
+
+        after = json.loads(temp_settings_json.read_text(encoding="utf-8"))
+        startup_after = next(g for g in after["hooks"]["SessionStart"] if g["matcher"] == "startup")["hooks"]
+        owned_after = [
+            c["command"] for c in startup_after if hooks_install._owned_basename(c["command"]) == "session-start"
+        ]
+        assert len(owned_after) == 1, (
+            f"expected the quoted entry to be migrated (replaced), not duplicated: {owned_after}"
+        )
+
+    def test_uninstall_removes_a_bash_wrapped_entry_instead_of_orphaning_it(
+        self, tmp_path: Path
+    ) -> None:
+        """A `bash "..."`-wrapped entry -- the shape a POSIX operator might
+        hand-install with -- is removed by `uninstall()`, never left
+        behind orphaned (the rollback path this project's own rollback
+        plan names)."""
+        settings_path = tmp_path / "settings.json"
+        seed = {
+            "hooks": {
+                "SubagentStart": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": 'bash "C:/x/superhuman/templates/hooks/claude-code/subagent-start"',
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        settings_path.write_text(json.dumps(seed, indent=2) + "\n", encoding="utf-8")
+
+        result = hooks_install.uninstall(settings_path=settings_path)
+
+        assert result.changed is True
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert "hooks" not in data, "the bash-wrapped entry must be removed, not orphaned"
+
+
 class TestSkillRootInsideGitDir:
     def test_refuses_when_resolved_root_is_inside_a_dot_git_directory(
         self, temp_settings_json: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

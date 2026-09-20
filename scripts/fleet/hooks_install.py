@@ -129,9 +129,33 @@ _TIMEOUT_SECONDS: Final[int] = 10
 #: writes entries a later call will no longer recognise as owned -- a
 #: pre-existing risk of that override, now made slightly more visible
 #: rather than newly introduced by this tightening.
+#:
+#: Phase 3.3 preflight RE-RUN item C (Major): the `$`-anchor above required
+#: the basename to be the LAST characters of the whole command string, so
+#: any spelling that put anything after it -- a closing quote (mandatory
+#: once the checkout path contains a space -- this is a public repo, not a
+#: hypothetical), trailing whitespace, or a `bash "..."` wrapper prefix --
+#: was classified FOREIGN. Consequence: `install()` duplicated instead of
+#: replacing, and `uninstall()` orphaned the entry -- the rollback path
+#: this project's own rollback plan names.
+#:
+#: Fixed by replacing `$` with a negative lookahead for a continuing
+#: path/word character, `(?![\w./-])`: the basename (plus optional `.cmd`)
+#: may now be followed by a quote, whitespace, another shell token, or
+#: end-of-string, but NOT by more path characters -- so the item-1
+#: false-positive guard still holds: an unrelated tool merely PREFIXED by
+#: one of our basenames (e.g. `.../session-start-legacy`) is still
+#: rejected, because the `-` immediately after `session-start` IS a
+#: member of the excluded class and blocks the lookahead. A lookahead was
+#: chosen over hand-stripping surrounding quotes because a `bash "..."`
+#: wrapper is only PARTIALLY quoted (the quote does not wrap the whole
+#: command string), so whole-string quote-stripping would not have
+#: covered it; matching the path token's own end this way generalises to
+#: that shape (and any future wrapper prefix) without enumerating every
+#: possible quoting/wrapping style by hand.
 _OWNED_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
     r"/superhuman/.*templates/hooks/claude-code/"
-    r"(session-start|subagent-start|pre-tool-use-role-gate)(?:\.cmd)?$"
+    r"(session-start|subagent-start|pre-tool-use-role-gate)(?:\.cmd)?(?![\w./-])"
 )
 
 
