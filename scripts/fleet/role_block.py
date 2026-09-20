@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -100,6 +101,15 @@ _NAME_LINE_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
 _ROLE_GATE_LOG_MAX_LINES = 500
 
 _ROLE_GATE_LOG_FILENAME = "role-gate.jsonl"
+
+#: Phase 3.3 preflight RE-RUN item F: the largest shipped role file is a
+#: few KB, so 1 MiB is comfortably generous while still bounding the
+#: worst case -- a huge file multiplies memory roughly 4x during this
+#: module's own normalisation (`_strip_bom_and_leading_ws` and
+#: `_normalize_newlines` each build a new string from the last), which
+#: degrades toward the "allow" side of NFR-9's fail-soft posture the
+#: bigger it gets.
+_MAX_ROLE_FILE_BYTES = 1 * 1024 * 1024
 
 
 class Verdict(str, Enum):
@@ -321,6 +331,27 @@ def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
             return RoleCheckResult(verdict=Verdict.UNMARKED)
 
         role_file = roles_dir / f"{role_name}.md"
+        # Phase 3.3 preflight RE-RUN item F: `stat()` first, before ever
+        # calling `read_text()` -- `stat()` only reads metadata and never
+        # blocks opening the file, unlike `read_text()`, which would hang
+        # on a non-regular file (a POSIX FIFO) until the hook's own
+        # timeout fires. A missing role file still falls through to the
+        # `read_text()` attempt below unchanged (`stat()` raises the
+        # identical `OSError` there too), preserving the existing FAULT
+        # contract for that case -- this check only intercepts a role
+        # file that EXISTS but is unsafe to read whole: not a regular
+        # file, or over `_MAX_ROLE_FILE_BYTES`. Either shape is treated
+        # as "not a role file" (`UNMARKED`), never `FAULT` -- this is the
+        # check working as designed, not an infrastructure failure.
+        try:
+            role_file_stat = role_file.stat()
+        except OSError:
+            role_file_stat = None
+        if role_file_stat is not None:
+            if not stat.S_ISREG(role_file_stat.st_mode):
+                return RoleCheckResult(verdict=Verdict.UNMARKED)
+            if role_file_stat.st_size > _MAX_ROLE_FILE_BYTES:
+                return RoleCheckResult(verdict=Verdict.UNMARKED)
         try:
             file_content = role_file.read_text(encoding="utf-8")
         except (OSError, ValueError):

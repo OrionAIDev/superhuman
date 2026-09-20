@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import stat
 from pathlib import Path
 
 import pytest
 
+from scripts.fleet import role_block
 from scripts.fleet.role_block import (
     NON_ROLE_LINE,
     Verdict,
@@ -280,6 +283,92 @@ class TestCheckRoleBlockFaultPosture:
         raises" contract, exercised via the module's own broad catch)."""
         result = check_role_block(_DEVELOPER_ROLE_CONTENT, object())  # type: ignore[arg-type]
         assert result.verdict == Verdict.FAULT
+
+
+class TestCheckRoleBlockRoleFileSizeAndTypeBound:
+    """TC-130 (Phase 3.3 preflight RE-RUN item F -- Minor): the one role
+    file a matched prompt names was read with no size or type bound. A
+    huge file multiplies memory roughly 4x during this module's own
+    normalisation, and a non-regular file (a POSIX FIFO) blocks
+    `read_text()` until the hook's own timeout -- both degrade toward
+    "allow" under NFR-9's fail-soft posture, the opposite of what a role
+    gate should do under attack. Both shapes must be treated as "not a
+    role file" (`UNMARKED`), never `FAULT` -- a `FAULT` is D7.5's "we
+    could not evaluate this, so refuse to certify" signal, but a bound
+    like this is exactly-that-evaluation working as designed, not an
+    infrastructure failure."""
+
+    def test_oversized_role_file_yields_unmarked_and_is_never_read(
+        self, roles_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        role_file = roles_dir / "developer.md"
+        role_file.write_bytes(b"x" * (role_block._MAX_ROLE_FILE_BYTES + 1))
+
+        real_read_text = Path.read_text
+
+        def _fail_if_called(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "developer.md":
+                pytest.fail(
+                    "read_text() must never be called on a role file over the size cap "
+                    "-- the whole point of the bound is to avoid loading it"
+                )
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _fail_if_called)
+
+        result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
+        assert result.verdict == Verdict.UNMARKED
+
+    def test_role_file_exactly_at_the_cap_is_still_read(
+        self, roles_dir: Path
+    ) -> None:
+        """Boundary check: the cap is inclusive -- a file of exactly
+        `_MAX_ROLE_FILE_BYTES` is still a normal read, only a file
+        STRICTLY OVER the cap is refused. Padded with non-whitespace
+        filler (never plain spaces/newlines, which `.rstrip()` would
+        strip back off before comparison, defeating the exact-size
+        setup) so the padded file provably differs from the prompt and
+        must land on a real content-based verdict, not `UNMARKED`."""
+        role_file = roles_dir / "developer.md"
+        base = _DEVELOPER_ROLE_CONTENT.encode("utf-8")
+        padding = role_block._MAX_ROLE_FILE_BYTES - len(base)
+        assert padding > 0, "fixture content must be smaller than the cap for this test to mean anything"
+        role_file.write_bytes(base + b"z" * padding)
+        assert role_file.stat().st_size == role_block._MAX_ROLE_FILE_BYTES
+
+        result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
+        assert result.verdict == Verdict.MISMATCH, (
+            "a file exactly at the cap must still be read and compared, not refused"
+        )
+
+    def test_non_regular_role_file_yields_unmarked_and_is_never_read(
+        self, roles_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Real FIFO creation needs a POSIX/Windows-privilege this sandbox
+        does not grant (matches this suite's other symlink/FIFO
+        limitations), so this simulates a non-regular `developer.md` by
+        forcing `Path.stat()`'s reported mode bit for that one file."""
+        role_file = roles_dir / "developer.md"
+        real_stat = Path.stat
+        real_read_text = Path.read_text
+
+        def _fifo_stat(self: Path, *args: object, **kwargs: object):  # noqa: ANN001
+            result = real_stat(self, *args, **kwargs)
+            if self.name == "developer.md":
+                fifo_mode = stat.S_IFIFO | stat.S_IMODE(result.st_mode)
+                return os.stat_result((fifo_mode,) + tuple(result)[1:])
+            return result
+
+        def _fail_if_called(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "developer.md":
+                pytest.fail("read_text() must never be called on a non-regular role file")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", _fifo_stat)
+        monkeypatch.setattr(Path, "read_text", _fail_if_called)
+
+        result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
+        assert result.verdict == Verdict.UNMARKED
 
 
 class TestRecordRoleGateDecision:
