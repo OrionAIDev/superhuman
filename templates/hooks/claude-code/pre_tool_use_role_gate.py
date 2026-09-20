@@ -446,7 +446,29 @@ def _build_deny_reason(result: Any, roles_dir: Path) -> str:
 
 
 def _print_deny(reason: str) -> None:
-    """Print the one sanctioned `hookSpecificOutput` deny JSON object.
+    """Print the one sanctioned `hookSpecificOutput` deny JSON object, then flush.
+
+    Preflight item 1 (Critical, PM-reproduced): a killed child process (the
+    harness's own `"timeout": 10` `PreToolUse` budget, `hooks_install.py::
+    _TIMEOUT_SECONDS`) delivers ZERO bytes of an unflushed `print()` when
+    stdout is a pipe — CPython fully block-buffers a non-tty stdout, so the
+    printed bytes sit in the interpreter's own buffer, not the OS pipe,
+    until several KB accumulate, an explicit flush happens, or the process
+    exits NORMALLY. `run()` calls `record_role_gate_decision` immediately
+    after this function returns, and that call can block for up to
+    `bounded_journal`'s `_DEFAULT_LOCK_TIMEOUT_SECONDS` (1.0s) on a
+    contended journal lock. If the harness kills this process while that
+    call is blocked, no normal interpreter shutdown ever happens, and the
+    already-decided deny — already printed — is silently lost with it.
+
+    Fixed here by flushing immediately after `print`, not by reordering
+    `run()` to record before printing: recording first only moves the same
+    loss earlier (a kill during a now-first, blocked record call would
+    lose the deny before it was ever printed at all). Flushing right after
+    print instead delivers the deny to the OS pipe, and therefore to the
+    harness, before the record call's own blocking I/O even starts — so
+    whatever happens to this process afterward, the decision already
+    reached its caller.
 
     Args:
         reason: the `permissionDecisionReason` text (see `_build_deny_reason`).
@@ -462,6 +484,7 @@ def _print_deny(reason: str) -> None:
             }
         )
     )
+    sys.stdout.flush()
 
 
 def run(

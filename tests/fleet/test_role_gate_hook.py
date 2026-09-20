@@ -17,6 +17,7 @@ wrongly blocked.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -26,6 +27,18 @@ import uuid
 from pathlib import Path
 
 import pytest
+
+# Belt-and-suspenders, matching test_bounded_journal.py's identical bootstrap:
+# tests/fleet/conftest.py already puts the skill root on sys.path for THIS
+# (parent) process, but TestRoleGateDenyDeliveredUnderHardKill's lock-holder
+# worker runs in a freshly `spawn`ed child interpreter, which re-imports this
+# module by name without ever having run conftest.py -- so the import below
+# needs its own path setup, independent of the parent process's.
+_SKILL_ROOT_FOR_MP = Path(__file__).resolve().parents[2]
+if str(_SKILL_ROOT_FOR_MP) not in sys.path:
+    sys.path.insert(0, str(_SKILL_ROOT_FOR_MP))
+
+from scripts.fleet.core.events import acquire_lock, release_lock  # noqa: E402
 
 _GIT_BASH_PATH = r"C:\Program Files\Git\bin\bash.exe"
 
@@ -1592,3 +1605,115 @@ class TestRoleGateUTF8StdinDecoding:
             f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout!r}\nSTDERR:\n{result.stderr!r}"
         )
         assert result.stdout == b""
+
+
+# --- TC-141: the deny JSON must survive a hard kill mid-record (preflight item 1) ------
+
+
+def _hold_role_gate_lock_child(lock_path_str: str, hold_seconds: float, acquired_event: object) -> None:
+    """Acquire `<role-gate.jsonl>.lock` in a SEPARATE process, signal
+    acquisition, hold it, then release.
+
+    Mirrors `test_bounded_journal.py::_hold_lock_child` exactly — a genuine
+    cross-process holder (not a same-process lock — that module's own
+    `test_lock_os_native.py` precedent explains why a thread sharing the
+    GIL cannot model real OS-lock contention). Module-level, not a
+    closure, so it is picklable under `multiprocessing`'s `spawn` start
+    method (this suite always runs on Windows, which always uses `spawn`).
+
+    Args:
+        lock_path_str: the `role-gate.jsonl.lock` path to acquire.
+        hold_seconds: how long to hold the lock before releasing it.
+        acquired_event: a `multiprocessing.Event`-like object, set once
+            the lock is actually held (so the parent never times a kill
+            off wall-clock guesswork about child startup).
+    """
+    handle = acquire_lock(lock_path_str, timeout=10.0, retry_interval=0.01)
+    acquired_event.set()  # type: ignore[attr-defined]
+    time.sleep(hold_seconds)
+    release_lock(handle)
+
+
+class TestRoleGateDenyDeliveredUnderHardKill:
+    """TC-141 (Critical, PM-reproduced — preflight item 1). `_print_deny`
+    used to print the deny JSON without flushing, and `run()` then calls
+    `record_role_gate_decision`, which can block on the bounded-journal
+    lock. Python fully block-buffers stdout when it is a pipe (exactly
+    what every real dispatch sees, since the harness captures the hook's
+    stdout) — the printed bytes sit in the interpreter's own buffer, not
+    the OS pipe, until several KB accumulate, an explicit flush happens,
+    or the interpreter shuts down NORMALLY. The harness's own 10-second
+    `PreToolUse` hook timeout kills the process HARD (SIGKILL /
+    TerminateProcess) rather than letting it exit — no normal shutdown, no
+    flush, and the already-decided, already-printed deny is silently lost,
+    letting the dispatch through unblocked.
+
+    Isolation: hold the SAME lock `record_role_gate_decision` blocks on
+    (`role-gate.jsonl.lock`) in a separate process for longer than this
+    test's kill delay, so the adapter subprocess is genuinely INSIDE the
+    lock's contended retry loop (`_DEFAULT_RETRY_INTERVAL` = 0.02s,
+    `_DEFAULT_LOCK_TIMEOUT_SECONDS` = 1.0s) at the moment it is killed —
+    not merely slow to start. A killed child that printed without
+    flushing delivers 0 bytes on stdout; the same child with an explicit
+    flush right after the print delivers the deny JSON line, even though
+    it is killed moments later while still blocked on the lock.
+    """
+
+    def test_deny_json_survives_a_hard_kill_while_blocked_recording_the_decision(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        workspace, slug, profile = enabled_project
+        lock_path = _fleet_dir(workspace, slug) / "role-gate.jsonl.lock"
+
+        ctx = multiprocessing.get_context("spawn")
+        acquired_event = ctx.Event()
+        holder = ctx.Process(
+            target=_hold_role_gate_lock_child, args=(str(lock_path), 3.0, acquired_event)
+        )
+        holder.start()
+        try:
+            assert acquired_event.wait(timeout=10), "holder never signaled lock acquisition"
+
+            payload = _pre_tool_use_payload(
+                prompt="You are the Developer for chunk 7a. Implement the role gate...\n",
+                cwd=workspace,
+            )
+            env = os.environ.copy()
+            env.pop("CLAUDE_PROJECT_DIR", None)
+            env["SUPERHUMAN_PROFILE"] = str(profile)
+
+            process = subprocess.Popen(
+                [sys.executable, str(_adapter_script(skill_root)), "--hook-payload", "-"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(workspace),
+                env=env,
+                text=True,
+                encoding="utf-8",
+            )
+            assert process.stdin is not None
+            process.stdin.write(json.dumps(payload))
+            process.stdin.close()
+
+            # Well inside the lock's own 1.0s contended-retry window
+            # (0.02s retry interval) and comfortably short of the
+            # holder's 3.0s hold -- the adapter must still be blocked on
+            # the lock, not exited, when the kill lands.
+            time.sleep(0.5)
+            assert process.poll() is None, (
+                "the adapter exited on its own before the kill -- the isolation did not "
+                "hold the lock long enough to still be contended at kill time"
+            )
+            process.kill()
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            holder.join(timeout=15)
+            assert holder.exitcode == 0, f"lock-holder child exited with code {holder.exitcode}"
+
+        assert stdout != "", (
+            "the deny JSON must reach stdout even when the process is killed while still "
+            f"blocked recording the decision -- got empty stdout (stderr: {stderr!r})"
+        )
+        decision = json.loads(stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
