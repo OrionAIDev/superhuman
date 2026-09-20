@@ -316,6 +316,29 @@ def _owned_basename(command: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _entry_owned_basename(entry: Any) -> str | None:
+    """Apply `_owned_basename` to one command-LIST entry (Phase 3.3
+    preflight RE-RUN item B), tolerating a structurally unexpected shape.
+
+    A command-list entry is normally a dict carrying a `"command"` key
+    (`{"type": "command", "command": "...", "timeout": 10}`). Reported
+    item B shape: a bare string entry in its place. A bare string (or any
+    other non-dict) can never carry the `"command"` key ownership hinges
+    on, so it is foreign by construction -- this returns `None` instead of
+    crashing on `.get`.
+
+    Args:
+        entry: one element of a group's `"hooks"` list.
+
+    Returns:
+        The matched wrapper basename, or None if `entry` is not a
+        superhuman-owned command dict.
+    """
+    if not isinstance(entry, dict):
+        return None
+    return _owned_basename(entry.get("command", ""))
+
+
 def _command_for(root: Path, basename: str) -> str:
     """Build the command string this installer writes for `basename`.
 
@@ -541,6 +564,14 @@ def _remove_owned(hooks: dict[str, Any]) -> None:
     an empty or absent `"hooks"` array -- is left exactly as found, per
     `uninstall()`'s exact-round-trip guarantee (TC-57).
 
+    Phase 3.3 preflight RE-RUN item B: also tolerates a GROUP that is not
+    itself a dict (e.g. `hooks["SomeEvent"]` being a list of bare
+    strings, not group objects) -- such a group is foreign by
+    construction (it cannot carry a `"hooks"` key), kept byte-identical,
+    same as any other shape this function has no business interpreting.
+    Individual command entries go through `_entry_owned_basename`, which
+    carries the identical tolerance for a bare-string entry.
+
     Args:
         hooks: the settings document's `"hooks"` sub-object.
     """
@@ -551,22 +582,26 @@ def _remove_owned(hooks: dict[str, Any]) -> None:
         owned_removed_from_event = False
         kept_groups = []
         for group in groups:
+            if not isinstance(group, dict):
+                # A group that isn't a dict at all (e.g. a bare string in
+                # an event's own list) can never carry a "hooks" key --
+                # foreign, keep byte-identical.
+                kept_groups.append(group)
+                continue
             commands = group.get("hooks")
             if not isinstance(commands, list):
                 # No "hooks" key, or a malformed non-list value: nothing of
                 # ours could be in here. Foreign -- keep byte-identical.
                 kept_groups.append(group)
                 continue
-            owned_in_group = [
-                command for command in commands if _owned_basename(command.get("command", "")) is not None
-            ]
+            owned_in_group = [command for command in commands if _entry_owned_basename(command) is not None]
             if not owned_in_group:
                 # Nothing of ours in this group (commands may be empty or
                 # entirely foreign) -- keep byte-identical, never drop it.
                 kept_groups.append(group)
                 continue
             owned_removed_from_event = True
-            remaining = [command for command in commands if _owned_basename(command.get("command", "")) is None]
+            remaining = [command for command in commands if _entry_owned_basename(command) is None]
             if remaining:
                 kept_groups.append({**group, "hooks": remaining})
             # else: this group held ONLY owned commands and none remain --
@@ -587,13 +622,28 @@ def _add_owned(hooks: dict[str, Any], root: Path) -> None:
     what creates the previously-absent `fork` `SessionStart` group and the
     `Agent|Task` `PreToolUse` group (TC-92, TC-96).
 
+    Phase 3.3 preflight RE-RUN item B: tolerates an expected event whose
+    EXISTING value is not a list (a foreign shape `_remove_owned` leaves
+    untouched, e.g. a list of bare strings), and an existing candidate
+    group that is not a dict, or whose own `"hooks"` value is not a list
+    (e.g. `null`) -- none of these can be searched/appended into the
+    normal way without crashing, so each is replaced with a fresh,
+    correctly-shaped container carrying only THIS call's own entry; any
+    foreign content in a differently-shaped sibling group is untouched.
+
     Args:
         hooks: the settings document's `"hooks"` sub-object.
         root: the resolved skill-checkout root to point commands at.
     """
     for hook_event, matcher, basename in _expected_entries():
         groups = hooks.setdefault(hook_event, [])
-        group = next((candidate for candidate in groups if candidate.get("matcher") == matcher), None)
+        if not isinstance(groups, list):
+            groups = []
+            hooks[hook_event] = groups
+        group = next(
+            (candidate for candidate in groups if isinstance(candidate, dict) and candidate.get("matcher") == matcher),
+            None,
+        )
         entry = {
             "type": "command",
             "command": _command_for(root, basename),
@@ -602,7 +652,11 @@ def _add_owned(hooks: dict[str, Any], root: Path) -> None:
         if group is None:
             groups.append({"matcher": matcher, "hooks": [entry]})
         else:
-            group.setdefault("hooks", []).append(entry)
+            existing_commands = group.get("hooks")
+            if isinstance(existing_commands, list):
+                existing_commands.append(entry)
+            else:
+                group["hooks"] = [entry]
 
 
 def _diff(before_text: str, after_text: str, settings_path: Path) -> str:
@@ -731,13 +785,24 @@ def install(
             directory.
         HooksInstallError: git resolution failed outright, or
             `settings_path` exists and is not valid JSON (item 4: named in
-            the error, nothing written).
+            the error, nothing written), or its top-level `"hooks"` value
+            is present but not a JSON object (Phase 3.3 preflight RE-RUN
+            item B: e.g. `"hooks": []` or `"hooks": null` -- a container
+            this function cannot safely write entries INTO without
+            clobbering whatever the operator's `"hooks"` actually held;
+            named in the error, nothing written).
         OSError: the write failed.
     """
     root, pinned = resolve_skill_root(skill_root)
 
     before_text = _read_settings_text(settings_path)
     data = _parse_settings(settings_path, before_text)
+    existing_hooks = data.get("hooks")
+    if "hooks" in data and not isinstance(existing_hooks, dict):
+        raise HooksInstallError(
+            f'{settings_path}: top-level "hooks" is not a JSON object '
+            f"(found {type(existing_hooks).__name__}) -- refusing to modify"
+        )
     hooks = data.setdefault("hooks", {})
     _remove_owned(hooks)
     _add_owned(hooks, root)
@@ -794,6 +859,13 @@ def uninstall(settings_path: Path = DEFAULT_SETTINGS_PATH) -> UninstallResult:
 def _find_owned_command(hooks: dict[str, Any], hook_event: str, matcher: str, basename: str) -> str | None:
     """Find the registered command for one expected entry, if present.
 
+    Phase 3.3 preflight RE-RUN item B: tolerates `hooks[hook_event]` not
+    being a list, a group not being a dict, and a group's `"hooks"` not
+    being a list -- each degrades to "nothing found here" rather than
+    crashing, matching `_remove_owned`'s identical tolerance for the same
+    shapes (this is a read-only counterpart, so status reporting is the
+    only thing affected, never a write).
+
     Args:
         hooks: the settings document's `"hooks"` sub-object.
         hook_event: e.g. `"SessionStart"`.
@@ -803,12 +875,18 @@ def _find_owned_command(hooks: dict[str, Any], hook_event: str, matcher: str, ba
     Returns:
         The matching command string, or None.
     """
-    for group in hooks.get(hook_event, []):
-        if group.get("matcher") != matcher:
+    groups = hooks.get(hook_event, [])
+    if not isinstance(groups, list):
+        return None
+    for group in groups:
+        if not isinstance(group, dict) or group.get("matcher") != matcher:
             continue
-        for command in group.get("hooks", []):
-            if _owned_basename(command.get("command", "")) == basename:
-                return command.get("command")
+        commands = group.get("hooks", [])
+        if not isinstance(commands, list):
+            continue
+        for command in commands:
+            if _entry_owned_basename(command) == basename:
+                return command.get("command") if isinstance(command, dict) else None
     return None
 
 
@@ -836,6 +914,13 @@ def status(settings_path: Path = DEFAULT_SETTINGS_PATH) -> InstallStatus:
     """
     data = _parse_settings(settings_path, _read_settings_text(settings_path))
     hooks = data.get("hooks", {})
+    if not isinstance(hooks, dict):
+        # Phase 3.3 preflight RE-RUN item B: a structurally foreign,
+        # non-dict "hooks" value (e.g. "hooks": [] or "hooks": null) --
+        # read-only, so this degrades to "nothing installed" rather than
+        # raising; only install() (which must WRITE into this container)
+        # refuses outright.
+        hooks = {}
 
     entries = []
     for hook_event, matcher, basename in _expected_entries():

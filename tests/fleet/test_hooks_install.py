@@ -893,6 +893,95 @@ class TestBomAndMalformedSettings:
         assert status_code == 1
 
 
+#: TC-126 (Phase 3.3 preflight RE-RUN item B -- Major): item 4 above
+#: hardened SYNTAX (malformed JSON) and a BOM, but not SHAPE --
+#: structurally valid JSON whose `"hooks"` sub-tree does not match what
+#: install()/uninstall()/status() assume. These three shapes have `"hooks"`
+#: itself not a dict -- a container `_add_owned` cannot safely write
+#: entries INTO without clobbering whatever the operator's `"hooks"`
+#: actually held, so `install()` refuses outright (a clean
+#: `HooksInstallError`, never a write); `uninstall()`/`status()` are
+#: read-only and degrade to a no-op / "nothing installed" instead.
+_MALFORMED_TOP_LEVEL_HOOKS_SHAPES: dict[str, Any] = {
+    "hooks_is_empty_list": [],
+    "hooks_is_null": None,
+    "hooks_is_not_a_dict": "not-a-dict",
+}
+
+#: These three keep `"hooks"` itself a dict, but corrupt something nested
+#: inside it -- a shape that IS gracefully handleable (the content is
+#: simply foreign/not-ours), so all three verbs complete normally rather
+#: than refusing.
+_MALFORMED_NESTED_HOOKS_SHAPES: dict[str, Any] = {
+    "event_value_is_list_of_strings": {"SomeEvent": ["not", "a", "group"]},
+    "group_hooks_is_null": {"SomeEvent": [{"matcher": "*", "hooks": None}]},
+    "command_entry_is_bare_string": {"SomeEvent": [{"matcher": "*", "hooks": ["bare-string-command"]}]},
+}
+
+
+class TestMalformedHooksShapesNeverCrash:
+    """TC-126: both `install()` and `uninstall()` crashed with a raw
+    `AttributeError`/`TypeError` on some of these shapes -- and
+    `uninstall()` is the rollback path this project's own rollback plan
+    names. Table-drives all six reported shapes through all three verbs."""
+
+    @pytest.mark.parametrize("shape_name,hooks_value", sorted(_MALFORMED_TOP_LEVEL_HOOKS_SHAPES.items()))
+    def test_install_refuses_and_writes_nothing(
+        self, tmp_path: Path, shape_name: str, hooks_value: Any
+    ) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(json.dumps({"hooks": hooks_value}, indent=2) + "\n", encoding="utf-8")
+        before_bytes = settings_path.read_bytes()
+
+        with pytest.raises(hooks_install.HooksInstallError) as excinfo:
+            hooks_install.install(settings_path=settings_path)
+        assert str(settings_path) in str(excinfo.value), f"error must name the file ({shape_name})"
+        assert settings_path.read_bytes() == before_bytes, f"a refused install must never write ({shape_name})"
+
+    @pytest.mark.parametrize("shape_name,hooks_value", sorted(_MALFORMED_TOP_LEVEL_HOOKS_SHAPES.items()))
+    def test_uninstall_never_crashes(self, tmp_path: Path, shape_name: str, hooks_value: Any) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(json.dumps({"hooks": hooks_value}, indent=2) + "\n", encoding="utf-8")
+
+        hooks_install.uninstall(settings_path=settings_path)  # must not raise
+
+    @pytest.mark.parametrize("shape_name,hooks_value", sorted(_MALFORMED_TOP_LEVEL_HOOKS_SHAPES.items()))
+    def test_status_never_crashes(self, tmp_path: Path, shape_name: str, hooks_value: Any) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(json.dumps({"hooks": hooks_value}, indent=2) + "\n", encoding="utf-8")
+
+        result = hooks_install.status(settings_path=settings_path)  # must not raise
+        assert result.installed is False, f"a malformed hooks tree can never report as installed ({shape_name})"
+
+    @pytest.mark.parametrize("shape_name,hooks_value", sorted(_MALFORMED_NESTED_HOOKS_SHAPES.items()))
+    def test_install_never_crashes_on_a_malformed_nested_shape(
+        self, tmp_path: Path, shape_name: str, hooks_value: Any
+    ) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(json.dumps({"hooks": hooks_value}, indent=2) + "\n", encoding="utf-8")
+
+        hooks_install.install(settings_path=settings_path)  # must not raise
+
+    @pytest.mark.parametrize("shape_name,hooks_value", sorted(_MALFORMED_NESTED_HOOKS_SHAPES.items()))
+    def test_uninstall_never_crashes_on_a_malformed_nested_shape(
+        self, tmp_path: Path, shape_name: str, hooks_value: Any
+    ) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(json.dumps({"hooks": hooks_value}, indent=2) + "\n", encoding="utf-8")
+
+        hooks_install.uninstall(settings_path=settings_path)  # must not raise
+
+    @pytest.mark.parametrize("shape_name,hooks_value", sorted(_MALFORMED_NESTED_HOOKS_SHAPES.items()))
+    def test_status_never_crashes_on_a_malformed_nested_shape(
+        self, tmp_path: Path, shape_name: str, hooks_value: Any
+    ) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(json.dumps({"hooks": hooks_value}, indent=2) + "\n", encoding="utf-8")
+
+        result = hooks_install.status(settings_path=settings_path)  # must not raise
+        assert result.installed is False, f"a malformed hooks tree can never report as installed ({shape_name})"
+
+
 class TestMigration:
     def test_migrates_worktree_rooted_hand_install_to_exactly_one_entry(self, temp_settings_json: Path) -> None:
         """TC-95: the seeded `startup` group already carries ONE
