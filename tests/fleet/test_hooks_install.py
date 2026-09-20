@@ -1255,3 +1255,82 @@ class TestUninstallEdgeCases:
         assert result.changed is True
         data = json.loads(settings_path.read_text(encoding="utf-8"))
         assert "hooks" not in data
+
+
+class TestAddOwnedRefusesDestructiveShapes:
+    """TC-135/TC-136 (Major, PM-reproduced -- a regression introduced by
+    this session's own item-B fix, `0fde872`'s "only superhuman-owned
+    commands are ever removed" guarantee). `_add_owned` (via `install()`)
+    used to REPLACE a foreign non-list event value with a fresh empty
+    list, and a foreign non-list `group["hooks"]` with `[entry]` -- for
+    the three events this installer actually writes to
+    (`SessionStart`/`SubagentStart`/`PreToolUse`), that silently DESTROYS
+    operator configuration with no way for `uninstall()` to restore it.
+
+    `_MALFORMED_NESTED_HOOKS_SHAPES` above never caught this because it
+    keys its fixtures on the literal string `"SomeEvent"`, which
+    `_add_owned` never touches -- only `_expected_entries()`'s three real
+    event names reach the destructive branch. These tests use the real
+    names on purpose.
+    """
+
+    def test_install_refuses_when_a_written_event_value_is_not_a_list(self, tmp_path: Path) -> None:
+        """A `SessionStart` value that is a dict (not the expected list of
+        matcher groups) holding a real, unrelated operator hook command
+        must survive install() byte-identically -- install() must refuse
+        instead of overwriting it with a fresh `[]`."""
+        settings_path = tmp_path / "settings.json"
+        seed = {"hooks": {"SessionStart": {"C:/ops/my-audit-hook.exe": "unexpected-shape"}}}
+        settings_path.write_text(json.dumps(seed, indent=2) + "\n", encoding="utf-8")
+        before_bytes = settings_path.read_bytes()
+
+        with pytest.raises(hooks_install.HooksInstallError) as excinfo:
+            hooks_install.install(settings_path=settings_path)
+        assert str(settings_path) in str(excinfo.value)
+        assert "SessionStart" in str(excinfo.value)
+        assert settings_path.read_bytes() == before_bytes, (
+            "a refused install must never write -- the operator's SessionStart "
+            "configuration must survive byte-identically"
+        )
+
+    def test_install_refuses_when_a_matched_groups_hooks_is_not_a_list(self, tmp_path: Path) -> None:
+        """A `SubagentStart` group whose matcher already equals `"*"` (the
+        one this installer targets) but whose `"hooks"` value is a dict
+        holding a real operator command must survive install()
+        byte-identically -- install() must refuse instead of overwriting
+        it with `[entry]`."""
+        settings_path = tmp_path / "settings.json"
+        seed = {
+            "hooks": {
+                "SubagentStart": [
+                    {"matcher": "*", "hooks": {"unexpected": "operator-fork-hook.exe"}}
+                ]
+            }
+        }
+        settings_path.write_text(json.dumps(seed, indent=2) + "\n", encoding="utf-8")
+        before_bytes = settings_path.read_bytes()
+
+        with pytest.raises(hooks_install.HooksInstallError) as excinfo:
+            hooks_install.install(settings_path=settings_path)
+        assert str(settings_path) in str(excinfo.value)
+        assert "SubagentStart" in str(excinfo.value)
+        assert settings_path.read_bytes() == before_bytes, (
+            "a refused install must never write -- the operator's foreign "
+            "group hooks value must survive byte-identically"
+        )
+
+    def test_install_refuses_when_a_written_events_hooks_key_is_not_a_list_for_pretooluse(
+        self, tmp_path: Path
+    ) -> None:
+        """Same defect, `PreToolUse` variant -- the third event this
+        installer writes to."""
+        settings_path = tmp_path / "settings.json"
+        seed = {"hooks": {"PreToolUse": {"not": "a-list-of-groups"}}}
+        settings_path.write_text(json.dumps(seed, indent=2) + "\n", encoding="utf-8")
+        before_bytes = settings_path.read_bytes()
+
+        with pytest.raises(hooks_install.HooksInstallError) as excinfo:
+            hooks_install.install(settings_path=settings_path)
+        assert str(settings_path) in str(excinfo.value)
+        assert "PreToolUse" in str(excinfo.value)
+        assert settings_path.read_bytes() == before_bytes

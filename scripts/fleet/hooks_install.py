@@ -612,7 +612,7 @@ def _remove_owned(hooks: dict[str, Any]) -> None:
             hooks[event] = kept_groups
 
 
-def _add_owned(hooks: dict[str, Any], root: Path) -> None:
+def _add_owned(hooks: dict[str, Any], root: Path, settings_path: Path) -> None:
     """Add this installer's own entries to `hooks`, in place.
 
     Assumes `_remove_owned` has already run against the same `hooks`
@@ -622,24 +622,48 @@ def _add_owned(hooks: dict[str, Any], root: Path) -> None:
     what creates the previously-absent `fork` `SessionStart` group and the
     `Agent|Task` `PreToolUse` group (TC-92, TC-96).
 
-    Phase 3.3 preflight RE-RUN item B: tolerates an expected event whose
-    EXISTING value is not a list (a foreign shape `_remove_owned` leaves
-    untouched, e.g. a list of bare strings), and an existing candidate
-    group that is not a dict, or whose own `"hooks"` value is not a list
-    (e.g. `null`) -- none of these can be searched/appended into the
-    normal way without crashing, so each is replaced with a fresh,
-    correctly-shaped container carrying only THIS call's own entry; any
-    foreign content in a differently-shaped sibling group is untouched.
+    Preflight RE-RUN item 1 (Major, PM-reproduced -- a regression in the
+    Phase 3.3 preflight RE-RUN item B fix this function used to carry):
+    for one of the THREE real events this installer actually writes to
+    (`SessionStart`/`SubagentStart`/`PreToolUse`, i.e. `_expected_entries()`'s
+    own event set -- unlike `_remove_owned`'s tolerance, which also covers
+    events this installer never touches at all), a foreign, non-list
+    EXISTING value -- either `hooks[hook_event]` itself, or a matched
+    group's own `"hooks"` value -- must never be silently REPLACED with a
+    fresh, empty container. `install()` writes by default and `uninstall()`
+    has no way to restore what a silent replace discarded, so this now
+    REFUSES outright (`HooksInstallError` naming the file and the event,
+    writing nothing), exactly as `install()`'s own top-level non-dict
+    `"hooks"` case already does. TC-135/TC-136 reproduce both shapes
+    against the real event names -- the `_MALFORMED_NESTED_HOOKS_SHAPES`
+    table above never exercised this branch because it keys its own
+    fixtures on the literal `"SomeEvent"`, which this function never
+    touches.
+
+    A MISSING `"hooks"` key on an existing group (`None`, not a
+    foreign non-list value) is not foreign content to protect -- there is
+    nothing there to discard -- so that shape is still filled in with a
+    fresh `[entry]` list, same as before.
 
     Args:
         hooks: the settings document's `"hooks"` sub-object.
         root: the resolved skill-checkout root to point commands at.
+        settings_path: used only to name the file in a refusal's error
+            message.
+
+    Raises:
+        HooksInstallError: an existing `hooks[hook_event]` value, or an
+            existing matched group's `"hooks"` value, is present but not a
+            JSON array -- refusing to silently discard foreign content.
     """
     for hook_event, matcher, basename in _expected_entries():
         groups = hooks.setdefault(hook_event, [])
         if not isinstance(groups, list):
-            groups = []
-            hooks[hook_event] = groups
+            raise HooksInstallError(
+                f'{settings_path}: top-level "hooks".{hook_event} is not a JSON array '
+                f"(found {type(groups).__name__}) -- refusing to modify, to avoid "
+                "silently discarding whatever foreign configuration it held"
+            )
         group = next(
             (candidate for candidate in groups if isinstance(candidate, dict) and candidate.get("matcher") == matcher),
             None,
@@ -653,10 +677,18 @@ def _add_owned(hooks: dict[str, Any], root: Path) -> None:
             groups.append({"matcher": matcher, "hooks": [entry]})
         else:
             existing_commands = group.get("hooks")
-            if isinstance(existing_commands, list):
+            if existing_commands is None:
+                group["hooks"] = [entry]
+            elif isinstance(existing_commands, list):
                 existing_commands.append(entry)
             else:
-                group["hooks"] = [entry]
+                raise HooksInstallError(
+                    f'{settings_path}: "hooks".{hook_event} group with matcher '
+                    f'{matcher!r} has a non-array "hooks" value '
+                    f"(found {type(existing_commands).__name__}) -- refusing to "
+                    "modify, to avoid silently discarding whatever foreign "
+                    "configuration it held"
+                )
 
 
 def _diff(before_text: str, after_text: str, settings_path: Path) -> str:
@@ -790,7 +822,10 @@ def install(
             item B: e.g. `"hooks": []` or `"hooks": null` -- a container
             this function cannot safely write entries INTO without
             clobbering whatever the operator's `"hooks"` actually held;
-            named in the error, nothing written).
+            named in the error, nothing written), or a `SessionStart`/
+            `SubagentStart`/`PreToolUse` event value, or a matched group's
+            `"hooks"` value, is present but not a JSON array (preflight
+            item 1: named in the error, nothing written -- see `_add_owned`).
         OSError: the write failed.
     """
     root, pinned = resolve_skill_root(skill_root)
@@ -805,7 +840,7 @@ def install(
         )
     hooks = data.setdefault("hooks", {})
     _remove_owned(hooks)
-    _add_owned(hooks, root)
+    _add_owned(hooks, root, settings_path)
     after_text = _dump_settings(data)
 
     changed = after_text != before_text
