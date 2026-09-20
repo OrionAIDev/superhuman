@@ -196,6 +196,25 @@ def _build_unrelated_capture(base: Path) -> Path:
     return cwd
 
 
+def _patch_home_to_contain(monkeypatch: pytest.MonkeyPatch, base: Path) -> None:
+    """Point `Path.home()` at `base` so a `tmp_path`-rooted fixture tree
+    sits under D1-R1's H1 home-directory ceiling on every platform.
+
+    On Windows, `%TEMP%` already lives inside the user's profile, so the
+    real `Path.home()` already contains `tmp_path` and this patch changes
+    nothing observable. On Linux, `tmp_path` lives under `/tmp`, which
+    sits OUTSIDE the real home directory -- so, unpatched, the H1 guard
+    ("strictly below `Path.home()`") would refuse the outward hop for
+    every fixture in this module that needs one, regardless of whether
+    the ladder itself is working correctly. Patching `Path.home()` to an
+    ancestor of the fixture tree makes the ceiling agree with the
+    platform's real layout for the synthetic fixture the same way it
+    already does for a real checkout under a real home directory -- it
+    does not change what property is under test.
+    """
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: base.resolve()))
+
+
 def _oracle_roots(cwd: Path) -> set[Path]:
     """Independently compute the legitimate git-derived root set for `cwd`.
 
@@ -512,7 +531,7 @@ class TestNFR4Confinement:
         ],
     )
     def test_locate_confinement_returns_only_git_derived_paths(
-        self, tmp_path: Path, layout: str
+        self, tmp_path: Path, layout: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Differential oracle: independently compute the legitimate
         candidate paths via direct `subprocess` calls to `git rev-parse`
@@ -520,7 +539,13 @@ class TestNFR4Confinement:
         Run `locate_project(cwd)` across every layout fixture; assert
         `result.workspace` is path-EQUAL (`Path.samefile` — never a mere
         `.is_relative_to()` containment check) to one of the
-        independently-computed candidates."""
+        independently-computed candidates.
+
+        `_patch_home_to_contain` keeps the `nested_inner_repo` layout's H1
+        outward hop reachable on every platform (see that helper's
+        docstring); the other layouts here resolve at H0/H0' and are
+        unaffected by it."""
+        _patch_home_to_contain(monkeypatch, tmp_path)
         base = tmp_path / layout
         base.mkdir()
         builders = {
@@ -591,11 +616,18 @@ class TestNFR4Confinement:
 
 class TestNestedInnerRepository:
     def test_locate_layout_nested_inner_repo_resolves_outward_to_outer_root(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """TC-66: `docs/superhuman/` is itself a separate git repo.
         `cwd` = the project dir. The resolved workspace must equal the
-        OUTER root (`Path.samefile`), reached via H1/L1."""
+        OUTER root (`Path.samefile`), reached via H1/L1.
+
+        `_patch_home_to_contain` keeps the outward hop this fixture needs
+        reachable on every platform (see that helper's docstring) — a
+        `tmp_path`-rooted fixture sits under `/tmp` on Linux, outside the
+        real home directory, which would otherwise trip D1-R1's H1 ceiling
+        guard before the ladder itself is ever exercised."""
+        _patch_home_to_contain(monkeypatch, tmp_path)
         cwd = _build_nested_inner_repo(tmp_path)
         outer = tmp_path / "outer"
 
@@ -607,10 +639,19 @@ class TestNestedInnerRepository:
         assert result.rung == "L1"
         assert result.hop == "H1"
 
-    def test_locate_refuses_at_the_inner_clone_root(self, tmp_path: Path) -> None:
+    def test_locate_refuses_at_the_inner_clone_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """TC-67: same fixture, `cwd` = the inner clone's own root (no
         `<slug>` component). Refuses: candidates exist at the outer root
-        but there is no positional evidence for any of them."""
+        but there is no positional evidence for any of them.
+
+        `_patch_home_to_contain` (see its docstring) keeps the outward hop
+        to the outer root reachable on every platform, so the refusal
+        reason asserted below reflects the ladder actually reaching and
+        naming those candidates, not the H1 home ceiling refusing first
+        for an unrelated, platform-specific reason."""
+        _patch_home_to_contain(monkeypatch, tmp_path)
         inner_root = _build_nested_inner_repo_multi(tmp_path)
 
         result, reason = locate_project_explain(inner_root)
@@ -663,12 +704,20 @@ class TestG6Bounds:
         assert result is None
 
     def test_locate_is_not_captured_by_an_unrelated_enclosing_repo(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """TC-71: an inner repo with zero candidates, nested inside an
         UNRELATED outer repo that has its own real candidate elsewhere,
         with `cwd` not inside it. Assert the locator does not resolve to
-        the neighbour's project."""
+        the neighbour's project.
+
+        `_patch_home_to_contain` (see its docstring) keeps the outward hop
+        to the outer, unrelated repo reachable on every platform, so the
+        refusal reason asserted below reflects the ladder actually
+        reaching and naming that repo's candidate, not the H1 home
+        ceiling refusing first for an unrelated, platform-specific
+        reason."""
+        _patch_home_to_contain(monkeypatch, tmp_path)
         cwd = _build_unrelated_capture(tmp_path)
 
         result, reason = locate_project_explain(cwd)
