@@ -1482,6 +1482,183 @@ class TestObserveStatusSlugValidation:
             observe._default_fleet_dir(workspace, "demo-slug")
 
 
+class TestSelfIgnoringManifestDir:
+    """A fleet manifest dir is local runtime state a consumer is supposed to
+    gitignore itself (`docs/fleet-observation.md` §"Gitignore your own
+    manifest directory"). `_resolve_context` now drops a self-ignoring
+    `.gitignore` (content `*`) inside a not-yet-ignored manifest dir
+    automatically, asking the OUTER workspace repo — never `fleet_dir`'s own
+    (possibly different) repo — whether it is already covered, so the
+    `superhuman-project-docs` carrier (DECISIONS.md ruling R-b), which
+    deliberately *tracks* fleet manifests, never gets a marker dropped into
+    its tracked record.
+    """
+
+    def test_marker_written_for_an_ordinary_unignored_workspace(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        workspace, slug = enabled_project
+        adapter = PortableAdapter(workspace, slug)
+
+        result = observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+
+        assert result.ok is True
+        marker = _fleet_dir(workspace, slug) / ".gitignore"
+        assert marker.is_file()
+        assert marker.read_text(encoding="utf-8") == "*\n"
+        # Prove it actually works, not just that a file landed on disk: git
+        # itself must now consider the manifest files ignored. Ask about a
+        # file inside the directory, not the directory with a trailing
+        # separator — that spelling reports *any* directory as ignored in a
+        # CRLF-`.gitignore` repo, so as a check it proves nothing.
+        proc = subprocess.run(
+            [
+                "git", "-C", str(workspace), "check-ignore", "-q",
+                str(_fleet_dir(workspace, slug) / "events.jsonl"),
+            ],
+            capture_output=True,
+        )
+        assert proc.returncode == 0
+
+    def test_marker_written_when_the_workspace_gitignore_has_crlf_line_endings(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        """Regression (2026-09-19, git 2.55.0.windows.3): a blank line in a
+        CRLF `.gitignore` parses as a lone-`\\r` pattern, and the original
+        implementation's trailing-separator pathspec matched it — so
+        `check-ignore` reported *every* directory as already ignored and no
+        marker was ever written. Found in a live consumer repo whose
+        `.gitignore` is CRLF; the feature was inert in every such repo, which
+        on Windows is the common case, while the suite stayed green.
+        """
+        workspace, slug = enabled_project
+        (workspace / ".gitignore").write_bytes(
+            b"__pycache__/\r\n*.py[cod]\r\n\r\n# operator-specific\r\nconfig.toml\r\n"
+        )
+        fleet_dir = _fleet_dir(workspace, slug)
+
+        # Precondition: nothing in this repo covers the manifest dir.
+        before = subprocess.run(
+            ["git", "-C", str(workspace), "check-ignore", "-q", str(fleet_dir / "events.jsonl")],
+            capture_output=True,
+        )
+        assert before.returncode == 1
+
+        adapter = PortableAdapter(workspace, slug)
+        result = observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+
+        assert result.ok is True
+        marker = fleet_dir / ".gitignore"
+        assert marker.is_file()
+        after = subprocess.run(
+            ["git", "-C", str(workspace), "check-ignore", "-q", str(fleet_dir / "events.jsonl")],
+            capture_output=True,
+        )
+        assert after.returncode == 0
+
+    def test_marker_not_written_when_a_leaf_pattern_covers_a_dir_that_does_not_exist_yet(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A repo that added the documented line itself, on a project's FIRST
+        run — nothing is on disk at `fleet_dir` yet.
+
+        This is what rules out the other tempting spelling of the probe. A
+        bare-directory pathspec does not match a directory-only pattern when
+        the path is absent from disk, so asking about the directory itself
+        answers "not ignored" here and writes a redundant marker into a
+        directory the repo already covers. Asking about a file inside it
+        matches through the parent and answers correctly.
+        """
+        slug = "brand-new-project"
+        (git_repo / ".gitignore").write_text("docs/superhuman/*/fleet/\n", encoding="utf-8")
+
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        project_dir = git_repo / "docs" / "superhuman" / slug
+        project_dir.mkdir(parents=True)
+        (project_dir / "SUPERHUMAN.md").write_text(
+            f"**Slug:** {slug}\n**Project-id:** fleet-demo123\n", encoding="utf-8"
+        )
+        assert not _fleet_dir(git_repo, slug).exists()
+
+        adapter = PortableAdapter(git_repo, slug)
+        observe.observe_relay(adapter, workspace=git_repo, slug=slug, writer_role="pm")
+
+        assert not (_fleet_dir(git_repo, slug) / ".gitignore").exists()
+
+    def test_marker_not_written_when_outer_repo_already_ignores_the_dir(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The `superhuman-project-docs` carrier case: the OUTER repo ignores
+        the whole `docs/superhuman/` mount point (as superhuman's own repo
+        does), so the manifest dir mounted inside it — which the carrier
+        deliberately tracks — must come out untouched. A self-ignoring
+        marker dropped there would silently destroy that tracked record.
+        """
+        slug = "demo-project"
+        (git_repo / ".gitignore").write_text("/docs/superhuman/\n", encoding="utf-8")
+
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        project_dir = git_repo / "docs" / "superhuman" / slug
+        project_dir.mkdir(parents=True)
+        (project_dir / "SUPERHUMAN.md").write_text(
+            f"**Slug:** {slug}\n**Project-id:** fleet-demo123\n", encoding="utf-8"
+        )
+
+        adapter = PortableAdapter(git_repo, slug)
+        result = observe.observe_relay(adapter, workspace=git_repo, slug=slug, writer_role="pm")
+
+        assert result.ok is True
+        marker = _fleet_dir(git_repo, slug) / ".gitignore"
+        assert not marker.exists()
+
+    def test_no_marker_and_no_raise_when_workspace_is_not_a_git_repo(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "not-a-repo"
+        slug = "demo-project"
+        workspace.mkdir()
+
+        profile = tmp_path / "profile.yaml"
+        profile.write_text("fleet:\n  enabled: true\n", encoding="utf-8")
+        monkeypatch.setenv("SUPERHUMAN_PROFILE", str(profile))
+
+        project_dir = workspace / "docs" / "superhuman" / slug
+        project_dir.mkdir(parents=True)
+        (project_dir / "SUPERHUMAN.md").write_text(
+            f"**Slug:** {slug}\n**Project-id:** fleet-demo123\n", encoding="utf-8"
+        )
+
+        adapter = PortableAdapter(workspace, slug)
+
+        # Must not raise, regardless of what the underlying write did.
+        observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+
+        marker = _fleet_dir(workspace, slug) / ".gitignore"
+        assert not marker.exists()
+
+    def test_idempotent_on_a_second_run(self, enabled_project: tuple[Path, str]) -> None:
+        workspace, slug = enabled_project
+        adapter = PortableAdapter(workspace, slug)
+
+        observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+        marker = _fleet_dir(workspace, slug) / ".gitignore"
+        assert marker.is_file()
+        first_mtime_ns = marker.stat().st_mtime_ns
+
+        second = observe.observe_relay(adapter, workspace=workspace, slug=slug, writer_role="pm")
+
+        assert second.ok is True
+        assert marker.is_file()
+        assert marker.read_text(encoding="utf-8") == "*\n"
+        assert marker.stat().st_mtime_ns == first_mtime_ns
+
+
 class TestCoreUntouched:
     """TC-7: `scripts/fleet/core/*` is byte-unchanged and imports no harness module.
 

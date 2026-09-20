@@ -3,6 +3,11 @@
 
 ## Delta Report
 
+**Briefing:** <for a stakeholder who hasn't seen this project recently, in
+plain words with no requirement IDs, file paths or code names: what the project is, what has
+drifted, and why it matters now. Presentation only — never copied into the SUPERHUMAN.md
+decisions log.>
+
 **Trigger:** <one line: what kicked this off>
 **Severity:** trivial | minor | moderate | major | critical
 **Scope of impact:** PLAN | DESIGN | REQUIREMENTS
