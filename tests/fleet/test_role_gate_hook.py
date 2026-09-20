@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -708,14 +709,23 @@ class TestRoleGateSecondRolesDirCheck:
     itself a distinct superhuman checkout. Widen-only: the second check can
     turn a pending deny into a pass, but never the reverse."""
 
-    def test_session_copy_verbatim_dispatch_is_no_longer_denied(
+    def test_session_copy_verbatim_dispatch_in_an_unrelated_repo_still_denies(
         self, skill_root: Path, session_checkout_project: tuple[Path, str, Path]
     ) -> None:
-        """RED against the pre-B4 code: the hook checkout's real
-        `roles/pm.md` differs from this session copy, so `check_role_block`
-        against `skill_root/roles` alone yields MISMATCH and denies — even
-        though this prompt is the FULL, UNEDITED content of the copy the
-        session itself actually reads. After the fix: empty stdout."""
+        """G6/B4's 2026-09-20T00:20Z amendment: this is the PM's
+        reproduction #1 (a throwaway repository carrying its own `SKILL.md`
+        naming `superhuman` and its own `roles/<name>.md`, dispatched
+        verbatim against that role file). `session_checkout_project` is a
+        repo entirely UNRELATED to `skill_root` (a fresh `git init` in
+        `tmp_path`), so it stands in exactly for the hostile-repository
+        shape PM reproduced. This test used to assert the OPPOSITE outcome
+        (empty stdout — the bypass, pre-amendment) under the name
+        `test_session_copy_verbatim_dispatch_is_no_longer_denied`; renamed
+        and flipped here because that old assertion WAS the defect PM
+        found: any repository, not just a legitimate worktree of the same
+        checkout, could widen a pending deny into a pass. After the
+        amendment, `_same_repository` refuses the second check entirely
+        (different `git-common-dir`), so the primary MISMATCH stands."""
         workspace, slug, profile = session_checkout_project
         payload = _pre_tool_use_payload(
             prompt=_SESSION_PM_CONTENT, cwd=workspace, subagent_type="pm"
@@ -729,20 +739,27 @@ class TestRoleGateSecondRolesDirCheck:
         assert result.returncode == 0, (
             f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
-        assert result.stdout == "", (
-            "a dispatch verbatim against the SESSION's own roles/pm.md was still denied "
-            f"(second check did not widen the pass): {result.stdout!r}"
-        )
-        # A widened ROLE verdict is never logged (D7.7) -- confirms this
-        # really was widened to ROLE, not silently swallowed some other way.
-        assert _role_gate_log_text(workspace, slug) == ""
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        # The reason names the HOOK checkout's own roles/pm.md (the primary
+        # check's roles_dir) -- the second check never ran at all, because
+        # `workspace` is not the same repository as `skill_root`.
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert str(skill_root / "roles" / "pm.md") in reason
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "MISMATCH"' in log
 
     def test_prompt_matching_neither_copy_still_denies(
         self, skill_root: Path, session_checkout_project: tuple[Path, str, Path]
     ) -> None:
         """A prompt that diverges from BOTH the hook's and the session's
         `roles/pm.md` must still deny — the second check only ever widens
-        a pass, it never manufactures one for a genuinely edited body."""
+        a pass, it never manufactures one for a genuinely edited body.
+        `session_checkout_project`'s repo is unrelated to `skill_root`, so
+        after the 2026-09-20T00:20Z amendment the second check never runs
+        at all (`_same_repository` refuses it) — the reason therefore
+        names the HOOK checkout's own `roles/pm.md`, not the session's, a
+        change from this test's pre-amendment assertion."""
         workspace, slug, profile = session_checkout_project
         edited = _SESSION_PM_CONTENT.replace("tier: standard", "tier: cheap", 1)
         payload = _pre_tool_use_payload(prompt=edited, cwd=workspace, subagent_type="pm")
@@ -755,10 +772,8 @@ class TestRoleGateSecondRolesDirCheck:
         assert result.returncode == 0
         decision = json.loads(result.stdout)
         assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
-        # D7.5 item 4: the reason should point at the copy the session
-        # itself reads, not the hook checkout's.
         reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
-        assert str(workspace / "roles" / "pm.md") in reason
+        assert str(skill_root / "roles" / "pm.md") in reason
         log = _role_gate_log_text(workspace, slug)
         assert '"verdict": "MISMATCH"' in log
 
@@ -813,13 +828,24 @@ class TestRoleGateSecondRolesDirCheck:
         decision = json.loads(result.stdout)
         assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-    def test_second_check_fault_gives_empty_stdout(
+    def test_second_check_fault_now_denies(
         self, skill_root: Path, git_repo: Path, tmp_path: Path
     ) -> None:
-        """The workspace IS a superhuman checkout, but its `roles/` is
-        empty — the second check FAULTs (D7.5's precondition), so the
-        original pending deny is suppressed entirely (NFR-9): the gate
-        cannot certify the deny would survive a check it could not run."""
+        """This is the PM's reproduction #2, and the 2026-09-20T00:20Z
+        amendment's item (b): a second-check `FAULT` no longer widens.
+        Renamed and flipped from `test_second_check_fault_gives_empty_stdout`,
+        which used to assert exactly the bypass PM reproduced (an empty
+        `roles/` FAULTing the second check released the pending deny — an
+        attacker-controlled repo with no role files at all got through).
+        `git_repo` here is unrelated to `skill_root`, so this now denies
+        for TWO independent reasons after the amendment: `_same_repository`
+        alone would already refuse the second check (different repo); the
+        dedicated same-repository FAULT test below
+        (`TestRoleGateSecondRolesDirCheckSameRepository.
+        test_second_check_fault_in_the_same_repository_no_longer_widens`)
+        isolates item (b) specifically, using a REAL linked worktree so the
+        second check actually runs and FAULTs rather than being skipped by
+        item (a)."""
         slug = "empty-session-roles-project"
         profile = tmp_path / "profile.yaml"
         _write_profile(profile)
@@ -839,8 +865,12 @@ class TestRoleGateSecondRolesDirCheck:
             profile_path=profile,
         )
         assert result.returncode == 0
-        assert result.stdout == ""
-        assert _role_gate_log_text(git_repo, slug) == ""
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert str(skill_root / "roles") in reason
+        log = _role_gate_log_text(git_repo, slug)
+        assert '"verdict": "UNMARKED"' in log
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-native interpreter invocation")
@@ -916,6 +946,313 @@ class TestRoleGateSecondCheckSkippedWhenSameDirectory:
         assert str(git_repo / "roles" / "pm.md") in reason
         log = _role_gate_log_text(git_repo, slug)
         assert '"verdict": "MISMATCH"' in log
+
+
+# --- TC-131/TC-132: G6/B4's 2026-09-20T00:20Z amendment -- same-repository gating -----
+
+
+def _init_superhuman_shaped_repo(repo: Path, *, pm_content: str, slug: str) -> None:
+    """Git-init `repo` as a superhuman-shaped checkout (`SKILL.md` naming
+    `superhuman`, a real `roles/pm.md`, and a `docs/superhuman/<slug>/`
+    project marker), committing everything so a linked `git worktree add`
+    checks the same content out too."""
+    _run_git(repo, "init", "-q", "-b", "trunk")
+    _run_git(repo, "config", "user.email", "test@example.invalid")
+    _run_git(repo, "config", "user.name", "Test")
+    (repo / "SKILL.md").write_text(
+        "---\nname: superhuman\ndescription: TC-131 test fixture\n---\n\n# Superhuman\n",
+        encoding="utf-8",
+    )
+    roles_dir = repo / "roles"
+    roles_dir.mkdir()
+    (roles_dir / "pm.md").write_text(pm_content, encoding="utf-8")
+    _write_project(repo, slug)
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "initial")
+
+
+def _add_worktree(repo: Path, worktree_dir: Path, branch: str) -> None:
+    """`git worktree add -b <branch> <worktree_dir> HEAD`, run for real (not
+    simulated) — TC-131's whole point is exercising `_same_repository`'s
+    `git rev-parse --git-common-dir` comparison against an ACTUAL linked
+    worktree, the shape the second `roles/` check exists for."""
+    _run_git(repo, "worktree", "add", "-q", "-b", branch, str(worktree_dir), "HEAD")
+
+
+def _remove_worktree(repo: Path, worktree_dir: Path, branch: str) -> None:
+    """Best-effort teardown for `_add_worktree` — never raises, so a
+    failure here (e.g. the worktree directory already gone) cannot mask a
+    test's own assertion failure. Only ever removes a worktree/branch this
+    same fixture created, under a fresh `tmp_path`/uuid-suffixed branch
+    name, never anything belonging to a real session."""
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_dir)],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "branch", "-D", branch],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def worktree_builder(tmp_path: Path):
+    """Yields a builder `(repo) -> worktree_dir` that creates a REAL git
+    worktree of `repo` at a fresh path under `tmp_path`, with a
+    per-invocation unique branch name, cleaning up every worktree/branch it
+    created on teardown regardless of test outcome."""
+    created: list[tuple[Path, Path, str]] = []
+    counter = [0]
+
+    def _build(repo: Path) -> Path:
+        counter[0] += 1
+        branch = f"tc131-session-{uuid.uuid4().hex[:8]}"
+        worktree_dir = tmp_path / f"session-worktree-{counter[0]}"
+        _add_worktree(repo, worktree_dir, branch)
+        created.append((repo, worktree_dir, branch))
+        return worktree_dir
+
+    yield _build
+
+    for repo, worktree_dir, branch in created:
+        _remove_worktree(repo, worktree_dir, branch)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-native interpreter invocation")
+class TestRoleGateSecondRolesDirCheckSameRepository:
+    """TC-131/TC-132 (G6/B4's 2026-09-20T00:20Z amendment). Unlike
+    `TestRoleGateSecondRolesDirCheck` above (which uses an UNRELATED
+    throwaway repo to stand in for a hostile checkout, and now proves that
+    shape denies), these tests build a REAL `git worktree add` linked
+    worktree of the SAME throwaway repo, so `_same_repository`'s
+    `git rev-parse --git-common-dir` comparison is exercised for real, not
+    simulated — proving the legitimate case (a worktree on another branch,
+    this estate's normal working mode) still passes, and that a FAULT on
+    that legitimate worktree's own `roles/` no longer widens either."""
+
+    def _run_adapter(
+        self,
+        *,
+        skill_root: Path,
+        stdin_text: str,
+        roles_dir: Path,
+        cwd: Path,
+        profile_path: Path,
+    ) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["SUPERHUMAN_PROFILE"] = str(profile_path)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(_adapter_script(skill_root)),
+                "--hook-payload",
+                "-",
+                "--roles-dir",
+                str(roles_dir),
+            ],
+            input=stdin_text,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+
+    def test_legitimate_worktree_of_the_same_repository_still_widens_to_a_pass(
+        self, skill_root: Path, tmp_path: Path, worktree_builder
+    ) -> None:
+        """The G6/B4 scenario itself: a linked worktree of the SAME
+        repository, on another branch, whose own `roles/pm.md` diverges
+        from the hook checkout's — a verbatim dispatch against the
+        WORKTREE's own copy must still be allowed (widened to ROLE)."""
+        hook_repo = tmp_path / "hook-repo"
+        hook_repo.mkdir()
+        slug = "tc131-legit-worktree"
+        hook_pm = "---\nname: pm\ntier: standard\n---\n\n# PM (hook checkout copy)\n"
+        _init_superhuman_shaped_repo(hook_repo, pm_content=hook_pm, slug=slug)
+
+        worktree_dir = worktree_builder(hook_repo)
+        session_pm = hook_pm.replace("tier: standard", "tier: cheap", 1)
+        (worktree_dir / "roles" / "pm.md").write_text(session_pm, encoding="utf-8")
+
+        project_dir = worktree_dir / "docs" / "superhuman" / slug
+        payload = _pre_tool_use_payload(prompt=session_pm, cwd=project_dir, subagent_type="pm")
+        profile = tmp_path / "profile-legit.yaml"
+        _write_profile(profile)
+
+        result = self._run_adapter(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            roles_dir=hook_repo / "roles",
+            cwd=project_dir,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert result.stdout == "", (
+            "a verbatim dispatch against a REAL linked worktree's own roles/pm.md was "
+            f"still denied: {result.stdout!r}"
+        )
+        assert _role_gate_log_text(worktree_dir, slug) == ""
+
+    def test_second_check_fault_in_the_same_repository_no_longer_widens(
+        self, skill_root: Path, tmp_path: Path, worktree_builder
+    ) -> None:
+        """Isolates amendment item (b) from item (a): the worktree IS the
+        same repository (so `_same_repository` admits it and the second
+        check genuinely runs), but its own `roles/` has been emptied out
+        (no role files at all) — the second check FAULTs, and per the
+        amendment this must NO LONGER widen: the pending deny (against the
+        hook checkout's own `roles_dir`) stands."""
+        hook_repo = tmp_path / "hook-repo-fault"
+        hook_repo.mkdir()
+        slug = "tc132-fault-worktree"
+        hook_pm = "---\nname: pm\ntier: standard\n---\n\n# PM (hook checkout copy)\n"
+        _init_superhuman_shaped_repo(hook_repo, pm_content=hook_pm, slug=slug)
+
+        worktree_dir = worktree_builder(hook_repo)
+        for md_file in (worktree_dir / "roles").glob("*.md"):
+            md_file.unlink()
+
+        unmarked_prompt = "You are the PM for this chunk. Do the thing.\n"
+        project_dir = worktree_dir / "docs" / "superhuman" / slug
+        payload = _pre_tool_use_payload(prompt=unmarked_prompt, cwd=project_dir)
+        profile = tmp_path / "profile-fault.yaml"
+        _write_profile(profile)
+
+        result = self._run_adapter(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            roles_dir=hook_repo / "roles",
+            cwd=project_dir,
+            profile_path=profile,
+        )
+        assert result.returncode == 0, (
+            f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        # Names the HOOK checkout's own roles/ -- the pending deny, not a
+        # (nonexistent) verdict against the worktree's emptied-out copy.
+        assert str(hook_repo / "roles") in reason
+        log = _role_gate_log_text(worktree_dir, slug)
+        assert '"verdict": "UNMARKED"' in log
+
+
+# --- TC-133/TC-134: G6/B4's 2026-09-20T00:20Z amendment -- locator cache boundary ------
+
+
+@pytest.mark.skipif(
+    _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+)
+class TestRoleGateLocatorCacheBoundaryValidation:
+    """TC-133/TC-134: the scratchpad locator cache (`_cached_locate`) is
+    agent-writable (its own docstring), so a poisoned entry must never be
+    trusted blindly — it is treated as an ordinary cache MISS, falling
+    through to a fresh `locate_project` call exactly as if the cache file
+    did not exist at all."""
+
+    def test_poisoned_cache_workspace_is_rejected_and_a_fresh_lookup_replaces_it(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path], tmp_path: Path
+    ) -> None:
+        """A cache entry whose `workspace` does not point at an absolute,
+        EXISTING directory (the shape the approved fix's boundary check
+        actually validates -- item 3 of the G6/B4 2026-09-20T00:20Z
+        amendment; it is a format check, not an authenticity one) must
+        never be used — the gate falls back to a fresh locator call, which
+        resolves the REAL project instead. (A well-formed-but-wrong
+        existing directory is a different, lower-severity residual this
+        chunk does not close: it cannot widen a pending deny — that path
+        is gated by `_same_repository`, a fully separate check — and
+        `record_role_gate_decision` already carries its own pre-existing
+        `slug_is_safe`/absolute-dir defense-in-depth in
+        `scripts/fleet/role_block.py`.)"""
+        workspace, slug, profile = enabled_project
+        scratchpad_dir = tmp_path / "scratchpad"
+        scratchpad_dir.mkdir()
+        # Deliberately NOT created -- exercises "not an absolute existing
+        # directory" directly, the exact condition the boundary check
+        # tests.
+        attacker_dir = tmp_path / "attacker-workspace-does-not-exist"
+        session_id = "poisoned-cache-workspace-session"
+        cache_file = scratchpad_dir / f"role-gate-locator-{session_id}.json"
+        cache_file.write_text(
+            json.dumps({"workspace": str(attacker_dir), "slug": "attacker-slug"}),
+            encoding="utf-8",
+        )
+
+        payload = _pre_tool_use_payload(
+            prompt="superhuman-dispatch: non-role\n\nResearch.\n",
+            cwd=workspace,
+            scratchpad_dir=scratchpad_dir,
+            session_id=session_id,
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        # The REAL project's log gets the row -- proving the fresh lookup
+        # (not the poisoned cache) was actually used.
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "NON_ROLE"' in log
+        # The attacker directory was never treated as a real project.
+        assert not (attacker_dir / "docs").exists()
+        # The cache file is overwritten with the FRESH, correct result --
+        # a genuine miss-and-refetch, not a silent partial trust of the
+        # poisoned entry.
+        refreshed = json.loads(cache_file.read_text(encoding="utf-8"))
+        assert Path(refreshed["workspace"]).resolve() == workspace.resolve()
+        assert refreshed["slug"] == slug
+
+    def test_poisoned_cache_traversal_slug_is_rejected(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path], tmp_path: Path
+    ) -> None:
+        """A cache entry whose `workspace` is a real, absolute, existing
+        directory (isolating the SLUG check alone) but whose `slug` is a
+        path-traversal segment must still be rejected."""
+        workspace, slug, profile = enabled_project
+        scratchpad_dir = tmp_path / "scratchpad"
+        scratchpad_dir.mkdir()
+        session_id = "poisoned-cache-slug-session"
+        cache_file = scratchpad_dir / f"role-gate-locator-{session_id}.json"
+        cache_file.write_text(
+            json.dumps({"workspace": str(workspace), "slug": "../../evil"}),
+            encoding="utf-8",
+        )
+
+        payload = _pre_tool_use_payload(
+            prompt="superhuman-dispatch: non-role\n\nResearch.\n",
+            cwd=workspace,
+            scratchpad_dir=scratchpad_dir,
+            session_id=session_id,
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root,
+            stdin_text=json.dumps(payload),
+            cwd=workspace,
+            profile_path=profile,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "NON_ROLE"' in log
+        refreshed = json.loads(cache_file.read_text(encoding="utf-8"))
+        assert refreshed["slug"] == slug
 
 
 # --- TC-91: cross-chunk interaction with chunk 7's SubagentStart filter ---------------

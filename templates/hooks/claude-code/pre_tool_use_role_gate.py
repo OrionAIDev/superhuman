@@ -34,33 +34,57 @@ dispatch, and a `FAULT` verdict, never pay for it and never reach the
 locator.
 
 **Two `roles/` directories (G6/B4, DESIGN.md D7 "Decisions locked",
-2026-09-19T18:30Z).** The primary check above always runs against
-`roles_dir` — the checkout THIS HOOK ITSELF runs from, fixed once at
-install time (`--roles-dir`, default `_SKILL_ROOT / "roles"`). That is not
-necessarily the checkout the SESSION is actually working from: a worktree
-on another branch, or a branch that edits `roles/pm.md`, is this estate's
-normal working mode, so a dispatch that is verbatim against the session's
-own copy can still earn a would-deny verdict here. When the primary
-verdict is `MISMATCH`/`UNMARKED` and the locator-resolved `workspace` is
-ITSELF a distinct superhuman checkout (`workspace/roles/` a directory,
-`workspace/SKILL.md` present with frontmatter `name: superhuman`, and its
-`roles/` resolving to a different directory than `roles_dir`), `run`
-re-runs `check_role_block` against `workspace/roles/` before committing to
-the deny. The locked invariant: **a second `roles/` can only WIDEN a pass,
-never cause a deny.** `ROLE`/`NON_ROLE` from the second check always
-overrides the pending deny (print nothing, log per the verdict); a `FAULT`
-there lets the dispatch through too — the gate cannot certify a deny it
-could not actually verify against the copy the session reads (NFR-9
-extends to this seam); only `MISMATCH`/`UNMARKED` on BOTH checks lets the
-original deny stand, and then the deny reason and the logged fields name
-the SESSION's own role file (the copy it actually reads), not the hook's.
-`workspace` here is the locator's resolved value, which may come back from
-an agent-writable cache file (`_cached_locate`'s own scratchpad cache)
-rather than a fresh git call — acceptable specifically because this seam
-is widen-only: an agent that tampered with the cache to redirect
-`workspace` could only ever manufacture a PASS it would already be
-entitled to by pasting the real role file verbatim, never a deny it would
-not otherwise have earned.
+2026-09-19T18:30Z; AMENDED 2026-09-20T00:20Z — see below).** The primary
+check above always runs against `roles_dir` — the checkout THIS HOOK
+ITSELF runs from, fixed once at install time (`--roles-dir`, default
+`_SKILL_ROOT / "roles"`). That is not necessarily the checkout the SESSION
+is actually working from: a worktree on another branch, or a branch that
+edits `roles/pm.md`, is this estate's normal working mode, so a dispatch
+that is verbatim against the session's own copy can still earn a
+would-deny verdict here. When the primary verdict is `MISMATCH`/`UNMARKED`
+and the locator-resolved `workspace` is ITSELF a distinct superhuman
+checkout (`workspace/roles/` a directory, `workspace/SKILL.md` present
+with frontmatter `name: superhuman`, and its `roles/` resolving to a
+different directory than `roles_dir`) **AND `workspace` belongs to the
+SAME git repository as `roles_dir`** (`_same_repository`: equal
+`git rev-parse --path-format=absolute --git-common-dir` from each side),
+`run` re-runs `check_role_block` against `workspace/roles/` before
+committing to the deny. The locked invariant: **a second `roles/` can only
+WIDEN a pass, never cause a deny.** `ROLE`/`NON_ROLE` from the second check
+overrides the pending deny (print nothing, log per the verdict); only
+`MISMATCH`/`UNMARKED` on BOTH checks lets the original deny stand, and
+then the deny reason and the logged fields name the SESSION's own role
+file (the copy it actually reads), not the hook's.
+
+**2026-09-20T00:20Z amendment (G6/B4 preflight re-run, roadmap#217).** The
+PM reproduced two ways the pre-amendment seam let ANY repository disable
+this gate entirely: (1) a throwaway repo carrying its own `SKILL.md`
+(`name: superhuman`) and its own `roles/<name>.md`, dispatched verbatim
+against that role file, was wrongly ALLOWED — the second check never
+verified `workspace` had anything to do with the hook's own checkout;
+(2) the same shape with an EMPTY `roles/` FAULTed the second check, and a
+second-check FAULT used to release the pending deny unconditionally — so
+an attacker-controlled repo with no role files at all also bypassed the
+gate. Two changes close this: **(a) same-repository gating** —
+`_same_repository` above is now a mandatory THIRD condition (alongside
+`_is_superhuman_checkout` and `_resolved_paths_differ`) before the second
+check ever runs at all, so a repository unrelated to the hook's own
+checkout is never consulted, full stop; if git cannot answer
+`--git-common-dir` for either side, `_same_repository` returns `False`
+(refuse), never `True` (NFR-9's "under-reach is safe, over-reach is not"
+extends here). **(b) a second-check FAULT no longer widens** — NFR-9 is
+already satisfied by the PRIMARY check having completed successfully; an
+unreadable or empty copy on the session side is not evidence the dispatch
+complies, so the pending deny (against the hook's own `roles_dir`) stands
+unchanged instead of being released. `workspace` here is still the
+locator's resolved value, which may come back from an agent-writable
+cache file (`_cached_locate`'s own scratchpad cache); that cache is now
+validated at its own boundary (an absolute, existing directory and a
+`slug_is_safe` slug) before ever being trusted, but the real backstop
+against a poisoned `workspace` is `_same_repository` itself — a cache
+entry redirected at an attacker directory fails the same-repository test
+regardless, because that directory is (by construction) not part of the
+hook's own repository.
 
 **Decision log (D7.7).** For an in-scope `NON_ROLE`/`MISMATCH`/`UNMARKED`
 verdict, one line is appended to the project's `role-gate.jsonl` via
@@ -81,6 +105,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -95,6 +120,7 @@ if str(_SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(_SKILL_ROOT))
 
 from scripts.fleet.locate import LocateResult, locate_project  # noqa: E402
+from scripts.fleet.path_safety import slug_is_safe  # noqa: E402
 from scripts.fleet.role_block import (  # noqa: E402
     Verdict,
     check_role_block,
@@ -181,7 +207,11 @@ def _cached_locate(
         LocateResult | _CachedLocation | None: the resolved location
         (freshly computed, or read back from the cache), or `None` if
         resolution refuses. Never raises: any cache I/O failure is treated
-        as a cache miss, falling back to a fresh `locate_project` call.
+        as a cache miss, falling back to a fresh `locate_project` call. A
+        cached `workspace`/`slug` pair is used only after passing the
+        boundary check (an absolute, existing directory; a `slug_is_safe`
+        slug) — G6/B4's 2026-09-20T00:20Z amendment; see the call site
+        below for what an entry that fails this check falls back to.
     """
     if not scratchpad_dir or not session_id:
         return locate_project(cwd)
@@ -197,8 +227,26 @@ def _cached_locate(
                 workspace = cached["workspace"]
                 slug = cached["slug"]
                 if isinstance(workspace, str) and isinstance(slug, str):
-                    return _CachedLocation(Path(workspace), slug)
-                return None  # a cached "unresolvable" outcome
+                    workspace_path = Path(workspace)
+                    if (
+                        workspace_path.is_absolute()
+                        and workspace_path.is_dir()
+                        and slug_is_safe(slug)
+                    ):
+                        return _CachedLocation(workspace_path, slug)
+                    # G6/B4 (2026-09-20T00:20Z amendment): this cache file
+                    # lives in the agent-writable scratchpad, so a
+                    # `workspace`/`slug` pair that fails this boundary
+                    # check (not an absolute existing directory, or an
+                    # unsafe slug — e.g. a path-traversal segment) is
+                    # treated exactly like an ordinary cache MISS below,
+                    # never trusted and never returned. This is distinct
+                    # from the legitimate "cached unresolvable" sentinel
+                    # just below (non-string `workspace`/`slug`), which
+                    # already means "a fresh lookup previously refused" —
+                    # that outcome is still honoured as-is.
+                else:
+                    return None  # a cached "unresolvable" outcome
     except (OSError, ValueError):
         pass  # treat any unreadable/corrupt cache entry as a miss
 
@@ -273,6 +321,92 @@ def _resolved_paths_differ(first: Path, second: Path) -> bool:
         return first.resolve() != second.resolve()
     except OSError:
         return True
+
+
+#: Timeout for `_git_common_dir`'s own `git rev-parse --git-common-dir`
+#: calls. This seam runs on the deny path only (after `check_role_block`
+#: has already produced a would-deny verdict against `roles_dir`), so it
+#: is bounded the same way `scripts/fleet/locate.py`'s own git calls are
+#: (`_GIT_TIMEOUT_SECONDS`, 0.25s) rather than `hooks_install.py`'s 10s
+#: one-shot install-time budget — this is a per-dispatch hot path, not a
+#: one-time resolve.
+_SAME_REPO_GIT_TIMEOUT_SECONDS = 0.25
+
+
+def _git_common_dir(cwd: Path) -> Path | None:
+    """Return `git rev-parse --path-format=absolute --git-common-dir` from `cwd`.
+
+    Mirrors `scripts/fleet/hooks_install.py`'s `_default_skill_root`
+    subprocess form (`-C`, `--path-format=absolute`, stdout decoded
+    explicitly as UTF-8 — never `subprocess.run(..., text=True)`, which
+    decodes with the process's locale-preferred encoding, e.g. cp1252 on
+    Windows) but degrades to `None` instead of raising: `_same_repository`
+    below must be able to say "git could not answer" without that turning
+    into an exception this module's own `except Exception` would otherwise
+    have to catch anyway — naming the refusal explicitly here keeps the
+    call site's "both sides must answer" contract legible.
+
+    Args:
+        cwd: directory to run the command in.
+
+    Returns:
+        Path | None: the repository's common `.git` directory (NOT its
+        parent — callers compare this value directly; they do not derive a
+        working-tree root from it), or `None` if `cwd` is not inside a git
+        working tree, git is unavailable, the call fails or times out, or
+        its stdout is not valid UTF-8.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            timeout=_SAME_REPO_GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        text = completed.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return Path(text) if text else None
+
+
+def _same_repository(first: Path, second: Path) -> bool:
+    """Return whether `first` and `second` sit in the SAME git repository.
+
+    G6/B4's 2026-09-20T00:20Z amendment: the second `roles/` check must be
+    admitted only when the session's workspace is a linked worktree (or the
+    main checkout) of the IDENTICAL repository the hook itself runs from —
+    comparing each side's `git rev-parse --git-common-dir` is the same
+    identity test `scripts/fleet/locate.py`'s own H0' step and
+    `hooks_install.py`'s `_default_skill_root` both already rely on (a
+    repository's common `.git` directory names one repository regardless of
+    which linked worktree asks). This still admits the worktree-on-another-
+    branch case the second check exists for; a third-party repository
+    answers with a DIFFERENT common dir and is excluded — exactly the
+    boundary the PM's two reproductions exploited (a hostile repository can
+    never claim to be "the same repository" as the hook's own checkout).
+
+    Args:
+        first: the hook checkout's own directory (its `roles_dir`, or any
+            directory inside the hook's checkout).
+        second: the session workspace's directory to compare against.
+
+    Returns:
+        bool: `True` iff both sides resolve a `--git-common-dir` AND the
+        two values are equal. `False` whenever EITHER side's git call
+        fails — "git cannot answer for either side" refuses the second
+        check (this predicate's sole caller never consults the second
+        `roles/` on a `False` result), never assumed `True`.
+    """
+    first_common = _git_common_dir(first)
+    if first_common is None:
+        return False
+    second_common = _git_common_dir(second)
+    if second_common is None:
+        return False
+    return first_common == second_common
 
 
 def _build_deny_reason(result: Any, roles_dir: Path) -> str:
@@ -439,17 +573,22 @@ def run(
 
     assert result.verdict in _DENYING_VERDICTS  # MISMATCH, UNMARKED
 
-    # G6/B4 (2026-09-19T18:30Z): one more chance against the SESSION's own
-    # roles/, when `workspace` (see the module docstring on its
-    # agent-writable-cache provenance and why that is safe here) is itself
-    # a distinct superhuman checkout differing from the hook's own
-    # `roles_dir`. Widen-only: ROLE/NON_ROLE below always overrides this
-    # pending deny; only MISMATCH/UNMARKED on both checks lets it stand.
+    # G6/B4 (2026-09-19T18:30Z, AMENDED 2026-09-20T00:20Z): one more chance
+    # against the SESSION's own roles/, when `workspace` is itself a
+    # distinct superhuman checkout differing from the hook's own
+    # `roles_dir` AND belongs to the SAME git repository as `roles_dir`
+    # (`_same_repository` — the 2026-09-20T00:20Z amendment; see the
+    # module docstring for the two bypasses this closes). Widen-only:
+    # ROLE/NON_ROLE below overrides this pending deny; MISMATCH/UNMARKED
+    # on both checks, OR the second check never running at all (different
+    # repository, or a FAULT there — no longer a widen), lets it stand.
     effective_result = result
     effective_roles_dir = roles_dir
     session_roles_dir = workspace / "roles"
-    if _is_superhuman_checkout(workspace) and _resolved_paths_differ(
-        roles_dir, session_roles_dir
+    if (
+        _is_superhuman_checkout(workspace)
+        and _resolved_paths_differ(roles_dir, session_roles_dir)
+        and _same_repository(roles_dir, workspace)
     ):
         second_result = check_role_block(prompt, session_roles_dir)
         if second_result.verdict == Verdict.ROLE:
@@ -467,19 +606,19 @@ def run(
                 mismatch_line_number=None,
             )
             return
-        if second_result.verdict == Verdict.FAULT:
-            # The gate cannot certify the pending deny would survive a
-            # check it could not actually run against the session's own
-            # copy (NFR-9 extends to this seam) — let the dispatch
-            # through, log nothing (a fault is never a decision).
-            return
-        assert second_result.verdict in _DENYING_VERDICTS  # MISMATCH, UNMARKED
-        # Both copies deny: the original deny stands, but D7.5 item 4 —
-        # the reason (and the logged fields) name the copy the SESSION
-        # itself reads, not the hook checkout's, so the file this names is
-        # always one the session can actually open and fix.
-        effective_result = second_result
-        effective_roles_dir = session_roles_dir
+        if second_result.verdict in _DENYING_VERDICTS:  # MISMATCH, UNMARKED
+            # Both copies deny: the original deny stands, but D7.5 item 4 —
+            # the reason (and the logged fields) name the copy the SESSION
+            # itself reads, not the hook checkout's, so the file this names
+            # is always one the session can actually open and fix.
+            effective_result = second_result
+            effective_roles_dir = session_roles_dir
+        # else: Verdict.FAULT. 2026-09-20T00:20Z amendment — a second-check
+        # FAULT no longer widens. NFR-9 is already satisfied by the PRIMARY
+        # check having completed successfully; an unreadable/empty copy on
+        # the session side is not evidence the dispatch complies, so
+        # `effective_result`/`effective_roles_dir` are left untouched and
+        # the pending deny (against the hook's own `roles_dir`) stands.
 
     reason = _build_deny_reason(effective_result, effective_roles_dir)
     _print_deny(reason)
