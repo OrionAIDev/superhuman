@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# templates/hooks/claude-code/session-start — the deterministic SessionStart
+# hook for fleet session observation (fleet-deterministic-seams Chunk 6).
+# Supersedes templates/hooks/SessionStart, which hardcoded a
+# fill-in-your-project-slug placeholder and used an unsound cwd lookup.
+#
+# Installed via `fleet hooks install` (Chunk 8) into a harness's
+# SessionStart hook config (e.g. Claude Code's `~/.claude/settings.json`,
+# matchers startup|resume|clear|compact|fork). Never installed
+# automatically by this skill on its own — `templates/hooks/` ships
+# templates, not live hooks.
+#
+# Purpose: give the launch flip and plain session observation a
+# DETERMINISTIC ceiling that fires WITHOUT depending on a prompt ever
+# being read. This wrapper calls the SAME entry point the portable prose
+# floor calls -- `python -m scripts.fleet.cli observe session-start` --
+# so the hook and the floor can never diverge (FR-15; D4's boundary rule:
+# no parallel or divergent invocation may exist anywhere in this script).
+#
+# Best-effort by construction (NFR-1): this script's own exit status is
+# NEVER allowed to reach the harness as non-zero. `observe session-start`
+# itself always exits 0 (see scripts/fleet/observe.py's module docstring
+# -- it is fail-soft), and everything below additionally traps so an
+# interpreter failure or a moved skill root can never propagate.
+#
+# stdout is left ALONE deliberately -- nothing below redirects it. At
+# SessionStart, whatever `observe session-start` prints to stdout becomes
+# session context, reaching both a human and the model (DESIGN.md D6: the
+# ONE line `identity_unresolved` prints depends on exactly this). Only
+# stderr is discarded, so an unrelated diagnostic never reaches that
+# context.
+trap 'exit 0' EXIT
+
+# --- workspace/session identity: read from the harness's stdin JSON, ------
+# --- never from this process's own working directory ----------------------
+#
+# FR-16: the hook subprocess's own OS working directory is UNDOCUMENTED
+# and is not the session's workspace -- this is the exact defect
+# (fleet-wiring Phase 1.1) this rewrite exists to fix. `observe
+# session-start --hook-payload -` reads the session's real `cwd` straight
+# out of the JSON on stdin. Nothing in this script calls `pwd` for that
+# purpose, or for any purpose.
+
+# --- locate the superhuman skill checkout (no SLUG placeholder) -----------
+#
+# This script itself lives at templates/hooks/claude-code/session-start
+# inside the skill checkout, so its own path is a reliable anchor for the
+# skill root regardless of where the harness's config points at it from --
+# unlike the workspace under observation, this path is fixed at install
+# time. Preflight B1: this used to also be overridable via $SUPERHUMAN_ROOT
+# for a non-standard layout -- NO LONGER. A committed project settings.json
+# can set env vars this hook subprocess inherits, so honouring an override
+# here let a malicious repo point this wrapper at attacker-chosen code (see
+# the $CLAUDE_PROJECT_DIR comment below for the full finding). Derived
+# ONLY from this script's own path now, unconditionally.
+SUPERHUMAN_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+# --- resolve a Python interpreter that actually RUNS (ARCHITECTURE.md §6.3) -
+#
+# Each candidate is EXECUTED, not merely tested for existence or the
+# executable bit. On Windows, a `python` found on PATH can be the
+# Microsoft Store "app execution alias" -- a stub that exists, is
+# executable, and exits 49 with an advert instead of running Python;
+# `command -v python` happily reports it as found. Mirrors
+# scripts/autonomous-precondition.sh's identical guard.
+PYTHON=""
+for candidate in \
+  "$(command -v python3 2>/dev/null || true)" \
+  "$(command -v python 2>/dev/null || true)"
+do
+  [ -n "$candidate" ] || continue
+  if "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+    PYTHON="$candidate"
+    break
+  fi
+done
+[ -z "$PYTHON" ] && exit 0
+
+# --- CLAUDE_PROJECT_DIR: the preferred anchor, payload cwd is the fallback -
+#
+# ARCHITECTURE.md Addendum §A / CHUNK-1-FINDINGS.md finding 8:
+# $CLAUDE_PROJECT_DIR is set by the harness (measured 17/17 captures) and
+# stable for the session's lifetime, unlike the payload's `cwd`, which
+# drifts as the shell moves. Preflight B1 correction: an earlier version of
+# this comment claimed "a repository cannot set an environment variable in
+# the process that invokes it" to justify trusting this var -- that claim
+# is FALSE. The Claude Code settings reference documents the committed
+# project settings file as carrying "the environment variables the project
+# needs", and a hook subprocess inherits its parent's environment, so a
+# malicious repo's settings.json CAN set this one too. It stays admissible
+# as a locator input anyway, for a DIFFERENT reason: it is only ever a
+# STARTING POINT the locator still validates via `git rev-parse` (NFR-4
+# confinement is unweakened) -- unlike $SUPERHUMAN_ROOT below, which used
+# to be read from the environment and let an attacker-chosen root select
+# WHICH CODE RUNS outright (verified: code from an attacker-controlled root
+# executed, and since this script deliberately leaves stdout alone, that
+# output became session context -- a direct prompt-injection channel).
+# $SUPERHUMAN_ROOT is no longer read from the environment at all (B1).
+# Passed through to the portable CLI generically as `--anchor`;
+# `scripts/fleet/cli.py` names no harness (D4).
+ANCHOR_ARGS=()
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  ANCHOR_ARGS=(--anchor "$CLAUDE_PROJECT_DIR")
+fi
+
+# --- -E -s: never trust the caller's Python environment (Phase 3.3 --------
+# --- preflight RE-RUN item A) -----------------------------------------------
+#
+# This process still inherits the CALLER's full environment (only
+# $SUPERHUMAN_ROOT and, above, $CLAUDE_PROJECT_DIR are ever read
+# selectively) -- so a plain `"$PYTHON" -m ...` here honours an inherited
+# `PYTHONPATH` too, letting a planted module get imported into this hook
+# process. Confirmed: a `yaml.py` on `PYTHONPATH` was imported and printed
+# into this script's own (deliberately unredirected) stdout, which becomes
+# session context. `-E` makes Python "Ignore all PYTHON* environment
+# variables, e.g. PYTHONPATH and PYTHONHOME, that might be set"
+# (https://docs.python.org/3/using/cmdline.html#cmdoption-E, checked
+# 2026-09-19). `-s` additionally excludes the user site-packages directory
+# from `sys.path` (a `pip install --user` plant), which `-E` does not
+# cover. `-I`/`-P` are NOT used: `-P` (and `-I`, which implies it) also
+# stops `python -m module` from prepending the current working directory
+# to `sys.path` (https://docs.python.org/3/using/cmdline.html#cmdoption-P),
+# which is exactly what lets `-m scripts.fleet.cli` resolve after the `cd
+# "$SUPERHUMAN_ROOT"` below -- adopting either would trade one fault for
+# another (the module failing to import at all).
+#
+# Residual risk, stated rather than silently accepted: this hardens the
+# ENVIRONMENT `$PYTHON` runs under, not the resolution of `$PYTHON` itself
+# -- an attacker able to plant an earlier `python`/`python3` on `$PATH`
+# still controls which binary runs, and no flag on that binary can defend
+# against itself. Phase 3.3 preflight round 3 (2026-09-20, "the role gate
+# is a discipline aid"): the SAME residual applies to `git`, not just the
+# interpreter -- every `subprocess.run(["git", ...])` this delivery makes
+# (locate.py's own calls, hooks_install.py's `_default_skill_root`, and
+# pre_tool_use_role_gate.py's `_git_common_dir`/`_same_repository`)
+# resolves `git` through `$PATH` exactly the same way, and a planted
+# `git` controls those results just as a planted `python` controls this
+# one -- including defeating the role gate's own same-repository check
+# (see that script's module docstring). Closing either soundly needs a
+# different mechanism (e.g. a binary allowlist or hardcoded paths) and is
+# not attempted here.
+(
+  cd "$SUPERHUMAN_ROOT" \
+    && "$PYTHON" -E -s -m scripts.fleet.cli observe session-start \
+      --hook-payload - \
+      --harness claude \
+      "${ANCHOR_ARGS[@]}"
+) 2>/dev/null
+
+exit 0

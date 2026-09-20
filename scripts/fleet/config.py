@@ -30,7 +30,11 @@ _DEFAULT_OBSERVE_DEADLINE_SECONDS = 5.0
 #: Per-subprocess git timeout for the façade's own adapter calls (PLAN.md
 #: Chunk 1's carried budget correction — NOT DESIGN's stale 0.4s figure).
 #: `collect_git_facts` makes up to 7 calls in the worst case; 7 * 0.25 =
-#: 1.75s, inside the 2.0s git-stage ceiling.
+#: 1.75s, inside the 2.0s git-stage ceiling. NOT `FleetConfig.
+#: git_timeout_seconds`'s dataclass default (see PM ruling R11 below) —
+#: this remains the figure `observe.py`'s own bounded façade calls are
+#: sized around, unrelated to whether an operator's profile sets an
+#: adapter-level override.
 _DEFAULT_GIT_TIMEOUT_SECONDS = 0.25
 
 #: Per-attempt manifest-lock timeout for the façade's own write calls.
@@ -55,7 +59,21 @@ class FleetConfig:
             (`<workspace>/docs/superhuman/<slug>/fleet`).
         observe_deadline_seconds: the wall-clock ceiling for one observe
             call (W-NFR-7).
-        git_timeout_seconds: the façade's own per-subprocess git timeout.
+        git_timeout_seconds: an operator's deliberate per-adapter git
+            timeout override, or `None` when the profile's `fleet:` block
+            omits the key entirely (chunk 9, PM ruling R11). `None` is NOT
+            "the default value" — it is "no value was given" — so a
+            consumer (`cli._build_adapter`) can tell "the operator wrote
+            `git_timeout_seconds: 0.25`" apart from "the operator wrote
+            nothing", which comparing against a concrete float (this
+            field's PREVIOUS shape) could never express: both resolved to
+            the identical number, so whichever number was chosen as "the
+            default" became silently unforwardable the moment an operator
+            picked that exact value on purpose. A caller that needs a
+            concrete number when this is `None` applies
+            `_DEFAULT_GIT_TIMEOUT_SECONDS` (or its own default) itself, at
+            its own point of use — this field only ever answers "did the
+            profile set one", never "what should I use if not".
         lock_timeout_seconds: the façade's own per-attempt manifest-lock
             timeout.
     """
@@ -64,7 +82,7 @@ class FleetConfig:
     reason: str
     manifest_dir: Path | None = None
     observe_deadline_seconds: float = _DEFAULT_OBSERVE_DEADLINE_SECONDS
-    git_timeout_seconds: float = _DEFAULT_GIT_TIMEOUT_SECONDS
+    git_timeout_seconds: float | None = None
     lock_timeout_seconds: float = _DEFAULT_LOCK_TIMEOUT_SECONDS
 
 
@@ -94,6 +112,30 @@ def _positive_float(value: Any, default: float) -> float:
     if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
         return float(value)
     return default
+
+
+def _positive_float_or_none(value: Any) -> float | None:
+    """Return `value` as a `float` if it is a positive, non-bool number,
+    else `None` (chunk 9, PM ruling R11).
+
+    Unlike `_positive_float`, this never falls back to a concrete default
+    — there is no "default" to fall back to here, only "was a usable
+    value given". A key that is absent (`fleet_cfg.get(...)` already
+    returns `None`) and a key that is present but malformed (e.g. a bool,
+    a negative number, a string) both mean the same thing to a consumer
+    deciding whether to forward an override: nothing usable was
+    deliberately specified, so don't override.
+
+    Args:
+        value: the raw YAML value to interpret (or `None` if absent).
+
+    Returns:
+        float | None: `value` coerced to `float` when it is a positive,
+        non-bool number; `None` otherwise.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
 
 
 def resolve_fleet_config(
@@ -192,9 +234,7 @@ def resolve_fleet_config(
         observe_deadline_seconds=_positive_float(
             fleet_cfg.get("observe_deadline_seconds"), _DEFAULT_OBSERVE_DEADLINE_SECONDS
         ),
-        git_timeout_seconds=_positive_float(
-            fleet_cfg.get("git_timeout_seconds"), _DEFAULT_GIT_TIMEOUT_SECONDS
-        ),
+        git_timeout_seconds=_positive_float_or_none(fleet_cfg.get("git_timeout_seconds")),
         lock_timeout_seconds=_positive_float(
             fleet_cfg.get("lock_timeout_seconds"), _DEFAULT_LOCK_TIMEOUT_SECONDS
         ),

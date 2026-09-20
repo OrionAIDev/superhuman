@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -1724,6 +1725,43 @@ def test_kickoff_interpreter_resolution_is_array_safe(skill_root: Path) -> None:
         f"interpreter-resolution snippet failed `bash -n`: {result.stderr}"
     )
 
+
+def test_role_gate_floor_content_states_role_first_and_the_literal_line(skill_root: Path) -> None:
+    """TC-88 (DESIGN.md D7.9, chunk 7a): the floor documents role-first
+    dispatch and the exact non-role-line literal, in all three sanctioned
+    locations (D7.6), and the prose literal equals
+    `scripts.fleet.role_block.NON_ROLE_LINE` byte-for-byte rather than a
+    re-typed copy that could silently drift from the code.
+    """
+    sys.path.insert(0, str(skill_root))
+    from scripts.fleet.role_block import NON_ROLE_LINE
+
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    pm_text = (skill_root / "roles" / "pm.md").read_text(encoding="utf-8")
+    phase3_text = (skill_root / "phases" / "3-implementation.md").read_text(encoding="utf-8")
+
+    non_role_marker = f"`{NON_ROLE_LINE}`"
+    for label, text in (("SKILL.md", skill_text), ("roles/pm.md", pm_text)):
+        assert non_role_marker in text, (
+            f"{label} must state the literal non-role-dispatch line "
+            f"{non_role_marker}, byte-identical to role_block.NON_ROLE_LINE"
+        )
+        # Normalize whitespace (soft-wrapped markdown lines) before checking
+        # for a multi-word phrase that could otherwise straddle a line break.
+        normalized = " ".join(text.split())
+        assert "task brief" in normalized, (
+            f"{label} must state that per-dispatch overrides go in the task brief, "
+            "never inside the role block"
+        )
+        assert "own message" in normalized, (
+            f"{label} must advise sending role dispatches in their own message "
+            "(D7.8: a mixed message yields no attributable row)"
+        )
+
+    assert "roles/developer.md" in phase3_text and "full, unedited content" in phase3_text, (
+        "phases/3-implementation.md step 2's Developer dispatch input list must gain "
+        "roles/developer.md's full, unedited content first (the root-cause fix, D7.6)"
+    )
 
 # --- Gate-question briefing (Type A gates open with a plain-language briefing) ---
 

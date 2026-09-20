@@ -46,19 +46,19 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
 **Spirit of the rule:** Superhuman exists because LLMs (yes, including the one reading this) rationalize skipping discipline for "simple" tasks. The framework adds ~30 seconds of user interaction per gate; that's the price of consistency and the SUPERHUMAN.md audit trail. Always worth it.
 </HARD-GATE>
 
-## Fleet observation — launch flip (non-gating)
+## Fleet observation — session-start floor (non-gating)
 
-If the invoking prompt carries a `FLEET-HANDOFF-ID:` line (fleet-wiring Chunk 3, Decision E — a
-prior session's `handoff-emit` embeds this line, along with its own self-register instruction,
-next to the id), attempt `python -m scripts.fleet.cli observe launch --workspace <project-root> --slug <slug>
---handoff-id <the id from that line>` as your first action, before Phase 0's HARD-GATE step 1.
-This is purely observational, exactly like `## Handoff prompt emission` below: it never blocks or
-gates any phase, it is idempotent (a repeat call on an already-launched row is a no-op, not an
-error), and it is inert when there is no `FLEET-HANDOFF-ID:` line to find — a normal `superhuman`
-invocation with no pending handoff attempts nothing and produces no output. Any failure (fleet
-disabled, an unavailable manifest write, a fuzzy match too ambiguous to guess, or any other fault)
-is logged and kickoff proceeds unaffected — this step never determines whether Phase 0 or a resume
-proceeds.
+As your first action on every superhuman invocation, before Phase 0's HARD-GATE step 1, attempt
+`python -m scripts.fleet.cli observe session-start --workspace <project-root> --slug <slug>`,
+adding `--handoff-id <the id from that line>` when the invoking prompt carries a
+`FLEET-HANDOFF-ID:` line (fleet-wiring Chunk 3, Decision E — a prior session's `handoff-emit`
+embeds this line, along with its own self-register instruction, next to the id). This is purely
+observational, exactly like `## Handoff prompt emission` below: it never blocks or gates any
+phase, it is idempotent (a repeat call on an already-registered session is a no-op, not an
+error), and with no `FLEET-HANDOFF-ID:` line to find it still registers the session — it simply
+attempts no id-anchored launch flip, rather than attempting nothing at all. Any failure (fleet
+disabled, an unavailable manifest write, or any other fault) is logged and kickoff proceeds
+unaffected — this step never determines whether Phase 0 or a resume proceeds.
 
 Run it from the superhuman **skill root** — the checkout holding this `SKILL.md`. There is no bare
 `fleet` executable to find: superhuman is a skill loaded by path, not an installed Python
@@ -156,7 +156,7 @@ blocked PM always surfaces to a human, even at level 2. See `phases/3-autonomous
 - **Honest concern surfacing.** Report `DONE_WITH_CONCERNS` rather than hiding doubts. One honest flag is worth ten silent failures.
 - **Artifacts by path, never by paste.** Present artifact content by path (e.g., `docs/superhuman/<slug>/REQUIREMENTS.md`). Paste inline only when isolation forces it (e.g., a single critical snippet for a gate decision).
 - **Append-mostly authoring.** REQUIREMENTS, DESIGN, PLAN, and SUPERHUMAN grow by timestamped appends. Full rewrites only when structure must change; prefix everything with a timestamp.
-- **Cache-stable prompt ordering.** Every subagent dispatch assembles: `role prompt → declared references → declared conventions → cached artifact slice → task brief`. Never reorder this prefix. Task-specific content goes at the end. Before dispatching a role's subagent, read `roles/<role>.md` and pass its full content as the leading block of the subagent prompt (the role prompt → declared references → declared conventions → cached artifact slice → task brief order).
+- **Cache-stable prompt ordering.** Every subagent dispatch assembles: `role prompt → declared references → declared conventions → cached artifact slice → task brief`. Never reorder this prefix. Task-specific content goes at the end. Before dispatching a role's subagent, read `roles/<role>.md` and pass its full content as the leading block of the subagent prompt (the role prompt → declared references → declared conventions → cached artifact slice → task brief order). A dispatch that is not a role dispatch opens with the exact line `superhuman-dispatch: non-role` instead of a role file's content; per-dispatch overrides (e.g. a tier change) go in the task brief, never inside the role block. Send role dispatches in their own message — a message mixing a role dispatch with a non-role dispatch of the same `subagent_type` is not attributable to either one (chunk 7a, D7.8).
 - **Model-tier routing.** Use cheapest model per role. Reserve most-capable for PM, Architect, code-quality reviewer. Standard tier for integration Developer, QA, Business Expert. Cheap/fast for Tester, mechanical Developer chunks, docs-sync, convention checks. See `adaptation/dispatch.md` for tier table.
 - **Dispatch symbols.** Use `<dispatch:*>` symbolic names throughout — never raw platform tool names. See `adaptation/dispatch.md` for the full mapping. Read that file at session start to prime working memory.
 - **Autonomous phase progression.** Only Type A gates (G0/G1/G2/G3/G4/G6/G7/G8/G9/G10) pause for user input. After a Type B gate (G5 one-liner in on-divergence cadence mode) or a Type C gate that degraded to B, the PM MUST immediately continue without waiting for a user prompt: if more chunks remain in PLAN.md → dispatch the next Developer; if all chunks complete → proceed to Phase 3.2 (docs sync). Never stop after a non-pausing gate and wait for the user to type "continue", "status?", or similar — that pattern erodes the user's trust that the framework is actually orchestrating. If you genuinely need the user's input mid-flow (mid-Phase 3, before G7), surface it as an explicit Type A gate (G6, G9, or G10), not as an implicit pause.

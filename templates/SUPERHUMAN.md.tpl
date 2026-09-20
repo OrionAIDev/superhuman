@@ -2,9 +2,10 @@
 
 **Slug:** {{project_slug}}
 **Project-id:** {{project_id}}
-<!-- Minted once at project init (e.g. a uuid4 or a stable hash of repo-remote + slug). The
-     stable grouping key for every fleet-manifest event this project's sessions write — never
-     re-minted, never derived from the slug string (a slug rename must not orphan history).
+<!-- Minted once at project init by `python -m scripts.fleet.cli project mint`
+     (random uuid4().hex[:16]). The stable grouping key for every fleet-manifest event this
+     project's sessions write — never re-minted, never derived from the slug string or from
+     a repo remote (a slug rename or repo move must not orphan history).
      See scripts/fleet/core/schema.py and docs/superhuman/session-tracking/DESIGN.md
      "Decision F". -->
 **Started:** {{iso_date}}

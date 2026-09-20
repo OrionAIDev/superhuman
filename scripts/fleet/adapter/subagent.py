@@ -88,7 +88,9 @@ class SubagentAdapter(SessionAdapter):
 
     Attributes:
         workspace: the *dispatching* project's working tree root — the
-            subagent has no working tree of its own to report on.
+            subagent has no working tree of its own to report on. NOT
+            necessarily where this dispatch's own facts should be read from
+            (see `git_facts_root`).
         slug: the owning superhuman project's slug (used to namespace node ids).
     """
 
@@ -99,6 +101,7 @@ class SubagentAdapter(SessionAdapter):
         *,
         local_id: str,
         git_timeout: float | None = None,
+        git_facts_root: Path | str | None = None,
     ) -> None:
         """Initialize a SubagentAdapter.
 
@@ -114,11 +117,30 @@ class SubagentAdapter(SessionAdapter):
                 `git_facts()` (additive passthrough, fleet-wiring Chunk 1).
                 `None` (the default) uses `collect_git_facts`'s own default
                 (30.0s).
+            git_facts_root: the directory `git_facts()` actually queries for
+                branch/commit/dirty state. Defaults to `workspace` when
+                omitted -- byte-identical to every caller before this
+                parameter existed. Mirrors `ClaudeAdapter`'s identically-named
+                parameter and exists for the identical reason: a `--hook-
+                payload` consumer (`SubagentStart`, `cli._cmd_observe_
+                dispatch`) resolves the dispatching PM's own working tree
+                (possibly a linked worktree) BEFORE `locate.locate_project`
+                hops outward to find the project's `SUPERHUMAN.md`, and that
+                outward-hopped `workspace` can be a different repository's
+                worth of git state -- reporting `workspace`'s branch there
+                answers a different question (chunk-6's measured defect,
+                reproduced for this adapter at chunk 7: `cli._build_adapter`
+                computed `args.git_facts_root` correctly but only forwarded
+                it to `ClaudeAdapter`, silently dropping it for `--harness
+                subagent`).
         """
         self.workspace = Path(workspace)
         self.slug = slug
         self._local_id = local_id
         self._git_timeout = git_timeout
+        self._git_facts_root = (
+            Path(git_facts_root) if git_facts_root is not None else self.workspace
+        )
 
     def current_session(self) -> SessionInfo:
         """Return this dispatch unit's identity, enriched with the dispatching workspace's git facts.
@@ -162,18 +184,24 @@ class SubagentAdapter(SessionAdapter):
         return [self.current_session()]
 
     def git_facts(self) -> GitFacts:
-        """Return real git plumbing facts for `self.workspace` — the dispatching workspace.
+        """Return real git plumbing facts for `self._git_facts_root`.
 
         Returns:
-            GitFacts: as `adapter.portable.collect_git_facts(self.workspace)`
-            — identical mechanism to `PortableAdapter`/`ClaudeAdapter`, since
-            a dispatch has no working tree distinct from the one it was
-            dispatched from. Honors this adapter's `git_timeout` override if
-            one was given at construction.
+            GitFacts: as `adapter.portable.collect_git_facts(self._git_facts_root)`
+            — identical mechanism to `PortableAdapter`/`ClaudeAdapter`.
+            `self._git_facts_root` defaults to `self.workspace` when no
+            override was given at construction, so this is byte-identical to
+            querying `self.workspace` directly for every caller that predates
+            `git_facts_root` — see the constructor's `git_facts_root`
+            parameter for why the two differ whenever a `--hook-payload`
+            consumer resolved a dispatching working tree distinct from the
+            (possibly outward-hopped) project `workspace`. Honors this
+            adapter's `git_timeout` override if one was given at
+            construction.
         """
         if self._git_timeout is None:
-            return collect_git_facts(self.workspace)
-        return collect_git_facts(self.workspace, git_timeout=self._git_timeout)
+            return collect_git_facts(self._git_facts_root)
+        return collect_git_facts(self._git_facts_root, git_timeout=self._git_timeout)
 
     def emit_prompt(self, text: str, handoff_id: str) -> str:
         """Append the literal handoff-id marker line to `text`.

@@ -147,6 +147,70 @@ class TestSubagentAdapterGitFacts:
         assert facts.branch is None
 
 
+# --------------------------------------------------------------------------- #
+# `git_facts_root`: `workspace` (the dispatching PM's working tree) and the
+# dispatched-from session's own working tree can be DIFFERENT repositories'
+# worth of git state. Mirrors
+# `tests/fleet/test_adapter_claude.py::TestClaudeAdapterGitFactsRoot` and
+# `tests/fleet/test_adapter_portable.py::TestPortableAdapterGitFactsRoot` —
+# chunk 7 fix: `cli._build_adapter` computed `args.git_facts_root` correctly
+# but only forwarded it to `ClaudeAdapter`, silently dropping it for
+# `--harness subagent` (this adapter — the harness `SubagentStart`'s
+# production hook, `templates/hooks/claude-code/subagent-start`, always
+# dispatches with).
+# --------------------------------------------------------------------------- #
+
+
+class TestSubagentAdapterGitFactsRoot:
+    def test_default_git_facts_root_is_workspace_byte_identical_behaviour(
+        self, git_repo: Path
+    ) -> None:
+        """No `git_facts_root` given: behaviour is unchanged from before this
+        parameter existed -- `git_facts()` queries `workspace` itself.
+        """
+        adapter = SubagentAdapter(git_repo, "demo-slug", local_id="developer-5-1")
+        assert adapter._git_facts_root == adapter.workspace
+        assert adapter.git_facts().branch == "trunk"
+
+    def test_git_facts_root_overrides_workspace_for_branch_detection(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression this parameter exists for: a dispatch observed from
+        a linked worktree gets ITS OWN branch, not `workspace`'s (the
+        outward-hopped main checkout).
+        """
+        main = tmp_path / "main"
+        main.mkdir()
+        _run(main, "init", "-q", "-b", "main-checkout-branch")
+        _run(main, "config", "user.email", "test@example.invalid")
+        _run(main, "config", "user.name", "Test")
+        (main / "f.txt").write_text("x", encoding="utf-8")
+        _run(main, "add", "f.txt")
+        _run(main, "commit", "-q", "-m", "init")
+
+        linked = tmp_path / "linked"
+        _run(main, "worktree", "add", str(linked), "-b", "the-session-own-branch")
+
+        adapter = SubagentAdapter(
+            workspace=main,
+            slug="demo-slug",
+            local_id="developer-5-1",
+            git_facts_root=linked,
+        )
+        info = adapter.current_session()
+
+        assert info.workspace == str(main), (
+            "workspace field must stay the D1-resolved main checkout -- "
+            "unaffected by this fix, still what namespaces the node id"
+        )
+        assert info.branch == "the-session-own-branch", (
+            "branch must come from git_facts_root (the dispatching session's "
+            "own worktree), never from workspace (the outward-hopped main "
+            "checkout)"
+        )
+        assert info.branch != "main-checkout-branch"
+
+
 class TestSubagentAdapterEmitPrompt:
     def test_emit_prompt_embeds_literal_handoff_id_line(self, git_repo: Path) -> None:
         adapter = SubagentAdapter(git_repo, "demo-slug", local_id="developer-5-1")

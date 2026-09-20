@@ -2,6 +2,12 @@
 
 This file is the ONLY place that knows about platform-specific tool names. When porting superhuman to a different harness (e.g., Claude Code → OpenClaw), edit only this file.
 
+> **Every `<dispatch:agent>` call carries `conventions/subagent-constraints.md` verbatim**, in the
+> `declared conventions` position. A subagent inherits its parent's TOOLS but not its parent's
+> ENVIRONMENT — the harness preamble about worktrees, shared stash stacks and forbidden operations
+> reaches the orchestrator and stops there. Restating it per-brief from memory failed on
+> 2026-09-09 and lost nothing only by luck; that file records the incident and the block to paste.
+
 > For the *patterns* these symbols compose into — direct dispatch, sequential pipeline, parallel
 > fan-out with merge, research isolation — and the anti-patterns to avoid, see
 > `references/orchestration-patterns.md`. This file resolves the symbols; that catalog governs how
@@ -11,7 +17,7 @@ This file is the ONLY place that knows about platform-specific tool names. When 
 
 | Symbol | What it does | Claude Code | OpenClaw (TBD; port-time fill-in) |
 |---|---|---|---|
-| `<dispatch:agent>` | Run a subagent with a focused prompt and isolated context | `Agent` (subagent_type: `general-purpose` by default; `claude` for high-capability roles like PM/Architect/code-quality reviewer) | `sessions_spawn(runtime="subagent", model=..., task=...)` — agentId must be one the instance permits (often only `main`); convey the role via the prompt, never a role-named agentId; always pass an explicit working `model`. See "OpenClaw `sessions_spawn` constraints" below. |
+| `<dispatch:agent>` | Run a subagent with a focused prompt and isolated context | `Agent` (subagent_type: `general-purpose` by default; `claude` for high-capability roles like PM/Architect/code-quality reviewer). When `templates/hooks/claude-code/pre-tool-use-role-gate` is installed (chunk 7a, optional), a dispatch that opens with neither a role file's full, unedited content nor the literal `superhuman-dispatch: non-role` line is refused before the subagent starts -- a discipline aid catching a forgotten or edited role block, not a security control; a caller deliberately trying to defeat it can (see `docs/fleet-observation.md`'s role-first discipline gate section). | `sessions_spawn(runtime="subagent", model=..., task=...)` — agentId must be one the instance permits (often only `main`); convey the role via the prompt, never a role-named agentId; always pass an explicit working `model`. See "OpenClaw `sessions_spawn` constraints" below. |
 | `<dispatch:ask>` | Present a multiple-choice gate to the user | `AskUserQuestion` | (no direct equivalent — degrade to assistant chat message with numbered options; user replies via chat reply) |
 | `<dispatch:read>` | Read a file by path | `Read` | `read(path="...")` |
 | `<dispatch:write>` | Write a file (full content) | `Write` | `apply_patch` with `*** Add File: <path>` (multi-file patch format) |

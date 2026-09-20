@@ -67,9 +67,20 @@ def format_handoff_line(handoff_id: str) -> str:
 #: loose script either. The skill root is deliberately called out as distinct
 #: from `--workspace`: the launched session is normally working in some other
 #: repo entirely, and `-m` resolves against the current directory.
+#: Preflight B7 (Phase 3.3): PM ruling R7 (chunk 9) migrated SKILL.md's
+#: session-start floor step from `observe launch` to `observe
+#: session-start`, but FR-15's floor has TWO carriers — SKILL.md's own
+#: prose, and this instruction, embedded in every adapter's handoff prompt
+#: (Chunk 3, Decision E). R7 named only SKILL.md; this string still said
+#: `observe launch` until B7, pointing every launched session at a
+#: superseded invocation. Migrated here to the identical verb AND flag
+#: shape SKILL.md's floor step uses (`--workspace`/`--slug`/
+#: `--handoff-id`) — `observe session-start` accepts all three (it
+#: supersets the old `observe launch` signature), so no other change to
+#: this string is needed.
 _LAUNCH_INSTRUCTION = (
     "If this project uses fleet session observation, run "
-    "`python -m scripts.fleet.cli observe launch "
+    "`python -m scripts.fleet.cli observe session-start "
     "--workspace <this project's root> --slug <this project's slug> "
     "--handoff-id <the id above>` as your first action (see SKILL.md's "
     "first-action step). Run it from the superhuman skill root — the checkout "

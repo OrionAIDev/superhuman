@@ -39,6 +39,8 @@ from typing import Any, Callable, TypeVar
 from . import config as fleet_config
 from . import project as fleet_project
 from .adapter.base import SessionAdapter
+from .bounded_journal import append_bounded_line
+from .path_safety import slug_is_safe
 from .core.errors import LockTimeoutError, OwnershipError, SessionIdentityUnresolved, ValidationError
 from .handoff import emit as handoff_emit_impl
 from .handoff import extract_handoff_id
@@ -87,6 +89,13 @@ def _validate_slug(slug: str) -> None:
     call in this module passes through, so one check here covers all of
     them.
 
+    The character check itself lives in `path_safety.slug_is_safe` (moved
+    there at preflight B5, which found `role_block.py`'s own
+    `record_role_gate_decision` builds the identical shape of path from the
+    identical shape of untrusted input and had never inherited this guard —
+    a shared, public helper replaces what would otherwise be two
+    independently-maintained copies of one check).
+
     Raises the existing `_Disabled` sentinel rather than a new exception
     type: every caller of `_default_fleet_dir` already has a "fleet is
     disabled/unconfigured for this workspace" branch, so an invalid slug is
@@ -101,7 +110,7 @@ def _validate_slug(slug: str) -> None:
     Raises:
         _Disabled: if `slug` contains `/`, `\\`, or a `..` segment.
     """
-    if "/" in slug or "\\" in slug or ".." in slug:
+    if not slug_is_safe(slug):
         raise _Disabled(
             f"invalid slug {slug!r}: path separators and '..' are not permitted"
         )
@@ -126,10 +135,22 @@ def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
     Raises:
         _Disabled: if `slug` fails `_validate_slug` (FIX 4) — a
             path-traversal-shaped slug is rejected here, before any path is
-            built or any I/O happens.
+            built or any I/O happens. Also raised (Phase 3.3 preflight
+            RE-RUN item E) if the built path does not actually resolve
+            inside `<workspace>/docs/superhuman/<slug>/` -- defense in
+            depth against a symlinked `fleet` subdirectory pointing
+            outside the project tree, mirroring `role_block.py`'s
+            identical `resolve()`/`is_relative_to()` confinement check for
+            `record_role_gate_decision` (which this module previously had
+            no equivalent of).
     """
     _validate_slug(slug)
-    return Path(workspace) / "docs" / "superhuman" / slug / "fleet"
+    workspace_path = Path(workspace)
+    fleet_dir = workspace_path / "docs" / "superhuman" / slug / "fleet"
+    expected_root = (workspace_path / "docs" / "superhuman" / slug).resolve()
+    if not fleet_dir.resolve().is_relative_to(expected_root):
+        raise _Disabled(f"slug {slug!r} resolves outside the workspace ({workspace_path})")
+    return fleet_dir
 
 
 def _journal_path(fleet_dir: Path) -> Path:
@@ -163,6 +184,13 @@ class ObserveResult:
         prompt_text: for `observe_handoff_emit` only — the deliverable
             prompt text (the emitted prompt on success, the untouched draft
             on any failure or when disabled). `None` for every other verb.
+        error_class: additive (Chunk 3, D6, FR-13) — `"identity_unresolved"`
+            when a project resolved but its `SUPERHUMAN.md` carries no
+            `**Project-id:**` line; `""` (the default) otherwise, including
+            every pre-Chunk-3 verb's outcomes, which never populate this
+            field. `cli.py` — never this module — turns a non-empty value
+            into a stdout line (this module's loudness tiers reserve stdout
+            entirely for its CLI callers).
     """
 
     ok: bool
@@ -170,6 +198,7 @@ class ObserveResult:
     reason: str = ""
     node_id: str | None = None
     prompt_text: str | None = None
+    error_class: str = ""
 
 
 class _Disabled(Exception):
@@ -520,7 +549,13 @@ def _write_journal(
     failure — the fleet directory unwritable, which is often the very
     failure that caused the primary write to fail too — this emits exactly
     one `fleet observe:`-prefixed stderr line and gives up (DESIGN's
-    Loudness tier 2), never retried, never a second line.
+    Loudness tier 2), never retried, never a second line. Phase 3.3
+    preflight: the read-modify-write bounded-tail append is delegated to
+    `bounded_journal.append_bounded_line`, which holds an OS-native
+    advisory lock for the whole critical section -- without it, two hook
+    processes racing to append here lose rows under parallel dispatch (one
+    writer's whole-file rewrite silently discards the other's
+    already-durable line).
     """
     line = json.dumps(
         {
@@ -536,14 +571,12 @@ def _write_journal(
     try:
         fleet_dir.mkdir(parents=True, exist_ok=True)
         path = _journal_path(fleet_dir)
-        existing: list[str] = []
-        if path.is_file():
-            existing = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln]
-        existing.append(line)
-        if len(existing) > _JOURNAL_MAX_LINES:
-            existing = existing[-_JOURNAL_MAX_LINES:]
-        path.write_text("\n".join(existing) + "\n", encoding="utf-8")
-    except OSError as exc:
+        append_bounded_line(path, line, max_lines=_JOURNAL_MAX_LINES)
+    except (OSError, ValueError, LockTimeoutError) as exc:
+        # Phase 3.3 preflight RE-RUN item D: `ValueError` widened in
+        # alongside `OSError`/`LockTimeoutError` as defense in depth --
+        # see `role_block.py`'s identical comment on its own
+        # `append_bounded_line` call site.
         print(
             f"fleet observe: {event} failed ({error_class}) and the failure "
             f"journal itself could not be written: {exc}",
@@ -896,6 +929,118 @@ def observe_launch(
     return ObserveResult(
         ok=False, node_id=register_outcome.node_id, reason=register_outcome.status
     )
+
+
+def observe_session_start(
+    adapter: SessionAdapter,
+    *,
+    workspace: Path | str,
+    slug: str,
+    handoff_id: str | None = None,
+    prompt_text: str | None = None,
+    writer_role: str = "pm",
+) -> ObserveResult:
+    """Fail-soft wrapper closing FR-5 — a session start with no verb to call (D2).
+
+    A fifth `observe` verb: optionally attempt an **id-anchored** launch
+    flip (never fuzzy — D2a), then idempotently register the session with
+    `origination="observed"`. `origination` is not in `core/schema.py`'s
+    validated vocabulary (only `cli.py`'s `--origination` choices), so this
+    is purely additive — no `core/` change.
+
+    **D2a — this NEVER performs a fuzzy `(cwd, branch)` launch flip.** A
+    flip is an assertion (it asserts a launch happened), not coverage;
+    automating the guess would manufacture a new commission exposure. The
+    flip below is attempted **only** when `handoff_id` is given directly or
+    recoverable from `prompt_text` via `extract_handoff_id` — both are
+    explicit, id-anchored signals. Reusing `observe_launch` for that
+    attempt is what guarantees this: `observe_launch`'s own fuzzy
+    `(cwd, branch)` fallback only fires when its resolved handoff id is
+    `None`, which never happens on the path this function takes into it. If
+    no explicit id is given, or the id-anchored flip finds no match, this
+    falls through to an ordinary registration — never touching
+    `adapter.git_facts()` at all.
+
+    Reuses `_observe_register` (already the module's sole write-and-broad-
+    catch helper — see the module docstring) for the plain registration
+    path rather than adding a second `except Exception` block (NFR-3): this
+    function's only new control flow is orchestration around two existing
+    entry points (`_observe_register`, `observe_launch`), plus one
+    additional, purely additive, read-only re-check of
+    `fleet_project.read_project_identity` to populate `error_class` — a
+    field `_observe_register`'s pre-Chunk-3 callers never set.
+
+    Args:
+        adapter: the `SessionAdapter` this session self-registers through
+            (`adapter.current_session()`, matching `observe_relay`'s
+            self-registration shape — never `enumerate_sessions()`). FR-17:
+            the harness's own session id flows through here (via the
+            adapter's construction, e.g. `ClaudeAdapter(current_session_id=
+            ...)`), never a fuzzy cwd/branch match.
+        workspace: the project's working tree root.
+        slug: the superhuman project slug.
+        handoff_id: an explicit, id-anchored handoff to attempt flipping
+            first (D2a's sole sanctioned flip trigger).
+        prompt_text: this session's own prompt text, grepped for an
+            embedded `FLEET-HANDOFF-ID` line via `handoff.extract_handoff_id`
+            when `handoff_id` is not given directly. `None` — the common
+            case at a bare `SessionStart` (CHUNK-1-FINDINGS.md: the
+            transcript is frequently unreadable at this point) — never
+            triggers a fuzzy match either; it is simply "no explicit id
+            recoverable".
+        writer_role: a role name, never a model/vendor string (NFR-6).
+
+    Returns:
+        ObserveResult: the flip's result if an explicit id resolved it;
+        otherwise an ordinary `origination="observed"` registration result.
+        `error_class == "identity_unresolved"` when the project resolves
+        but its `SUPERHUMAN.md` has no `**Project-id:**` line — never an
+        exception either way.
+    """
+    resolved_handoff_id = handoff_id
+    if resolved_handoff_id is None and prompt_text is not None:
+        resolved_handoff_id = extract_handoff_id(prompt_text)
+
+    if resolved_handoff_id is not None:
+        flip_result = observe_launch(
+            adapter,
+            workspace=workspace,
+            slug=slug,
+            handoff_id=resolved_handoff_id,
+            writer_role=writer_role,
+        )
+        if flip_result.ok:
+            return flip_result
+        # No matching handoff (or a disabled/identity-unresolved workspace,
+        # which the plain registration below will reach the identical
+        # conclusion about) — D2a forbids ever falling back to a fuzzy
+        # (cwd, branch) guess here, so fall through to an ordinary
+        # registration exactly as if no handoff_id had been supplied.
+
+    result = _observe_register(
+        event="session-start",
+        adapter=adapter,
+        workspace=workspace,
+        slug=slug,
+        origination="observed",
+        target_session_id=None,
+        writer_role=writer_role,
+    )
+    if (
+        not result.ok
+        and not result.disabled
+        and not result.error_class
+        and fleet_config.resolve_fleet_config(workspace).enabled
+        and fleet_project.read_project_identity(workspace, slug) is None
+    ):
+        return ObserveResult(
+            ok=result.ok,
+            disabled=result.disabled,
+            reason=result.reason,
+            node_id=result.node_id,
+            error_class="identity_unresolved",
+        )
+    return result
 
 
 def journal_early_cli_failure(

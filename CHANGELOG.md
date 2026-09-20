@@ -18,6 +18,22 @@ All notable changes to this project will be documented in this file. Format adap
 - `tests/test_content.py::test_published_specs_are_tracked` — pins the positive half of the
   publication invariant. Its sibling `test_no_per_project_docs_are_tracked` asserts an emptiness,
   and an emptiness assertion keeps passing when the paths silently move out from under it.
+- **The role gate (chunk 7a, optional).** `templates/hooks/claude-code/pre-tool-use-role-gate` (+
+  `.cmd`, + `pre_tool_use_role_gate.py`) is a `PreToolUse`/`Agent|Task` hook that refuses a
+  main-thread dispatch which opens with neither a role file's full, unedited content nor the exact
+  line `superhuman-dispatch: non-role` — verify-only, never rewrites the prompt, never emits
+  `allow`/`ask`/`defer`, and every fault in the PRIMARY check (an unreadable `roles/`
+  directory included) lets the dispatch through rather than denying it; since the 2026-09-20
+  amendment a fault in the same-repository second check leaves the pending deny standing. The portable predicate lives in
+  `scripts/fleet/role_block.py` (`check_role_block`), also reachable via the new
+  `fleet role-block check --prompt-file <path|->` CLI verb. Non-role and denied decisions are
+  logged to `docs/superhuman/<slug>/fleet/role-gate.jsonl`; `fleet doctor` gains a role-gate section
+  per project, reporting `UNKNOWN` (never a false zero) when that log is absent or empty. **This is
+  a discipline aid, not a security control (G6, 2026-09-20):** it catches a forgotten or edited role
+  block; a caller deliberately trying to defeat it can (a spoofed `.git` file, a poisoned
+  locator-cache entry, a directory planted inside the hook's own repository, or inherited git
+  environment variables all work), and every fault in the gate's own machinery lets the dispatch
+  through by design.
 
 ### Changed
 

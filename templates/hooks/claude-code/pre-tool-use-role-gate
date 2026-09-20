@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# templates/hooks/claude-code/pre-tool-use-role-gate — the deterministic
+# PreToolUse hook for chunk 7a's role gate (DESIGN.md D7, fleet-
+# deterministic-seams). Makes the role block impossible to forget: a
+# dispatch that opens with neither a role file's full, unedited content
+# nor the exact line `superhuman-dispatch: non-role` is refused before the
+# subagent starts (FR-20).
+#
+# Installed via `fleet hooks install` (Chunk 8) into a harness's PreToolUse
+# hook config, matcher `Agent|Task`. Never installed automatically by this
+# skill on its own — `templates/hooks/` ships templates, not live hooks.
+#
+# **VERIFY-ONLY (G3-narrow, SUPERHUMAN.md "Decisions locked").** This hook
+# never rewrites a prompt (no `updatedInput`) and never emits `allow`,
+# `ask`, or `defer` — its only output is silence, or exactly one JSON
+# object with `permissionDecision: "deny"`.
+#
+# **NFR-9 is the load-bearing requirement of this whole file: this script's
+# own exit status is NEVER allowed to reach the harness as non-zero.**
+# Unlike `SubagentStart` (chunk 7's `subagent-start`, where exit 2 blocks
+# subagent creation), a `PreToolUse` hook exiting non-zero is not
+# documented to auto-deny — but this hook's OWN posture is fail-soft by
+# design regardless (D7.5: "every fault lets the dispatch through"), so it
+# traps to exit 0 on every path exactly like every other hook template in
+# this directory, rather than relying on an unverified harness default.
+#
+# All of the deny-decision logic — the payload shape, the verbatim
+# comparison, the `hookSpecificOutput` JSON — lives in
+# `pre_tool_use_role_gate.py`, beside this script (D7.6: harness-shaped
+# parsing stays under `templates/hooks/claude-code/`, never in
+# `scripts/fleet/`). This wrapper's only job is best-effort process
+# plumbing: find an interpreter that actually runs, locate the skill root,
+# and get the payload to that script unmodified.
+#
+# stdout is left ALONE deliberately, exactly like session-start's stance:
+# whatever `pre_tool_use_role_gate.py` prints (nothing, or one deny JSON
+# object) becomes this hook's own stdout, which Claude Code reads as the
+# `PreToolUse` decision. Only stderr is discarded.
+trap 'exit 0' EXIT
+
+# --- capture stdin ONCE ------------------------------------------------------
+payload="$(cat 2>/dev/null || true)"
+
+# --- locate the superhuman skill checkout (no SLUG placeholder) -----------
+#
+# Same rationale as templates/hooks/claude-code/subagent-start's identical
+# comment: this script's own path is a reliable anchor for the skill root
+# regardless of where the harness's config points at it from. Preflight
+# B1: this used to also be overridable via $SUPERHUMAN_ROOT for a
+# non-standard layout -- NO LONGER. A committed project settings.json can
+# set env vars this hook subprocess inherits, so honouring an override
+# here let a malicious repo point this wrapper at attacker-chosen code (see
+# session-start's identical $CLAUDE_PROJECT_DIR comment for the full
+# finding). Derived ONLY from this script's own path now, unconditionally.
+SUPERHUMAN_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+# --- resolve a Python interpreter that actually RUNS (ARCHITECTURE.md §6.3) -
+#
+# Each candidate is EXECUTED, not merely tested for existence or the
+# executable bit -- see session-start's identical comment for why (the
+# Microsoft Store "app execution alias" stub).
+PYTHON=""
+for candidate in \
+  "$(command -v python3 2>/dev/null || true)" \
+  "$(command -v python 2>/dev/null || true)"
+do
+  [ -n "$candidate" ] || continue
+  if "$candidate" -c "import sys; sys.exit(0)" >/dev/null 2>&1; then
+    PYTHON="$candidate"
+    break
+  fi
+done
+[ -z "$PYTHON" ] && exit 0
+
+# --- CLAUDE_PROJECT_DIR: the preferred anchor, payload cwd is the fallback -
+#
+# Same rationale as session-start/subagent-start's identical comment.
+# Passed through to pre_tool_use_role_gate.py generically as `--anchor`;
+# no harness name enters that script's own locator usage beyond this one
+# environment-variable read, which lives here in the harness-specific
+# wrapper, not in scripts/fleet/ (D4).
+ANCHOR_ARGS=()
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+  ANCHOR_ARGS=(--anchor "$CLAUDE_PROJECT_DIR")
+fi
+
+# -E -s: never trust the caller's Python environment (Phase 3.3 preflight
+# RE-RUN item A) -- this process still inherits the CALLER's full
+# environment (only $SUPERHUMAN_ROOT and $CLAUDE_PROJECT_DIR above are
+# ever read selectively), so a plain `"$PYTHON" ...` here honours an
+# inherited `PYTHONPATH` too, letting a planted module get imported into
+# this hook process. See templates/hooks/claude-code/session-start's
+# identical comment for the full citation and why `-I`/`-P` are
+# deliberately not used instead. That comment's residual-risk note is not
+# limited to `$PYTHON` either -- it applies equally to `git`, resolved
+# through the identical `$PATH`, which is directly relevant HERE: this
+# script's own pre_tool_use_role_gate.py resolves `git` through `$PATH`
+# in `_git_common_dir`/`_same_repository`, so a planted `git` defeats that
+# check the same way a planted `python` would defeat this one (see that
+# script's module docstring, "This is a discipline aid, not a security
+# control").
+printf '%s' "$payload" | "$PYTHON" -E -s \
+  "$SUPERHUMAN_ROOT/templates/hooks/claude-code/pre_tool_use_role_gate.py" \
+  --hook-payload - \
+  "${ANCHOR_ARGS[@]}" \
+  2>/dev/null
+
+exit 0

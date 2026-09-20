@@ -26,7 +26,13 @@ from typing import Any
 from uuid import uuid4
 
 from .. import superhuman_profile
+from . import config as fleet_config
+from . import doctor as fleet_doctor
+from . import hook_payload as fleet_hook_payload
+from . import hooks_install as fleet_hooks_install
 from . import observe as fleet_observe
+from . import project_id as fleet_project_id
+from . import role_block as fleet_role_block
 from .adapter.base import SessionAdapter, SessionInfo
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
@@ -53,12 +59,18 @@ from .handoff import emit as handoff_emit
 from .handoff import extract_handoff_id
 from .handoff import self_register as handoff_self_register
 from .handoff import stale_report
+from .locate import locate_project
 from .view import render_status_table, write_fleet_md
 
 #: `fleet --version` output. Not tied to `VERSION` at the skill root — this
 #: is the manifest CLI's own schema-facing version, matching `schema_version`
 #: in `core/schema.py` (both are v1 for Phase 1).
 CLI_VERSION = "0.1.0 (schema v1)"
+
+#: This file lives at <skill_root>/scripts/fleet/cli.py — used only as the
+#: default `--roles-dir` for `role-block check` (chunk 7a), matching
+#: `pre_tool_use_role_gate.py`'s identical `_SKILL_ROOT` derivation.
+_SKILL_ROOT = Path(__file__).resolve().parents[2]
 
 #: Registrar-level bounded retry defaults for lock contention (on top of
 #: `core.events.append`'s own internal timeout/retry). A second, short-lived
@@ -320,6 +332,51 @@ def _default_fleet_dir(workspace: Path, slug: str) -> Path:
     return workspace / "docs" / "superhuman" / slug / "fleet"
 
 
+def _resolved_git_timeout_override(workspace: Path | str) -> float | None:
+    """Resolve the `git_timeout=` override `_build_adapter` should forward
+    to the adapter it constructs (chunk 9, PM rulings R10 and R11).
+
+    `FleetConfig.git_timeout_seconds` (config.py) was declared,
+    documented, and parsed but consumed by NOTHING -- no adapter
+    construction site threaded it into `git_timeout=`, so an operator who
+    set `fleet.git_timeout_seconds:` in their profile got silence, not
+    effect (R10). This closes that gap at `_build_adapter`, its ONE
+    construction choke point.
+
+    A direct passthrough, deliberately: R11 corrected R10's first attempt,
+    which forwarded `cfg.git_timeout_seconds` only when it DIFFERED from a
+    package-default constant -- a VALUE comparison. That made an operator
+    who wrote `git_timeout_seconds: 0.25` (config.py's own documented
+    default, and therefore one of the likeliest values someone being
+    explicit would pick) indistinguishable from one who never set the key
+    at all, so their deliberate 0.25 was silently discarded in favor of
+    the adapter's 30s default -- 120x what they asked for. The defect
+    R10 exists to close reappeared in miniature, on one specific value
+    instead of every value.
+
+    R11's fix moves the distinction to where it belongs: `FleetConfig.
+    git_timeout_seconds` is now `None` unless the profile's `fleet:`
+    block sets a genuinely usable (positive, non-bool) number -- a
+    PRESENCE signal, not a value one one caller here can misread. `None`
+    is also each adapter constructor's own default for `git_timeout`, so
+    this passthrough is a byte-identical no-op for anyone who has not set
+    the key, and forwards ANY deliberately-set value verbatim, including
+    one that happens to equal the package default.
+
+    Args:
+        workspace: the working tree to resolve fleet configuration for.
+
+    Returns:
+        float | None: the profile's `git_timeout_seconds` if the operator
+        set one; `None` otherwise (absent key, a malformed value, fleet
+        disabled, or no profile at all -- `resolve_fleet_config` never
+        raises and every one of those cases already resolves to `None`
+        at the config layer, per its own docstring).
+    """
+    cfg = fleet_config.resolve_fleet_config(workspace)
+    return cfg.git_timeout_seconds
+
+
 def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
     """Construct the `SessionAdapter` selected by `args.harness`.
 
@@ -337,6 +394,7 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             `adapter/subagent.py`'s module docstring), so the PM-minted
             dispatch id must be supplied explicitly.
     """
+    git_timeout = _resolved_git_timeout_override(args.workspace)
     if args.harness == "claude":
         sessions = None
         if args.sessions_json is not None:
@@ -347,6 +405,16 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             current_session_id=args.session_id,
             sessions=sessions,
             session_relay_script=args.session_relay_script,
+            # Always a real attribute now (`_add_harness_arguments` registers
+            # `--git-facts-root` on every observe subcommand) -- direct access,
+            # not a getattr fallback that would hide the attribute's existence
+            # from a reader.
+            git_facts_root=args.git_facts_root,
+            # Chunk 9, PM ruling R10: `None` (the overwhelming common case --
+            # see `_resolved_git_timeout_override`) is this constructor's own
+            # default too, so this line is a byte-identical no-op for every
+            # caller who has not set `fleet.git_timeout_seconds`.
+            git_timeout=git_timeout,
         )
     if args.harness == "subagent":
         if not args.local_id:
@@ -354,8 +422,29 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
                 "--harness subagent requires --local-id (the PM-minted dispatch id) "
                 "— there is no fabricated fallback for a dispatch's identity"
             )
-        return SubagentAdapter(args.workspace, args.slug, local_id=args.local_id)
-    return PortableAdapter(args.workspace, args.slug, local_id=args.local_id)
+        return SubagentAdapter(
+            args.workspace,
+            args.slug,
+            local_id=args.local_id,
+            # Chunk 7 fix: this was computed onto `args` by every
+            # --hook-payload consumer (`_cmd_observe_dispatch`'s own
+            # docstring/comment) but silently dropped here — only
+            # ClaudeAdapter received it above. `SubagentStart`'s production
+            # hook always dispatches `--harness subagent` (see
+            # templates/hooks/claude-code/subagent-start), so this was the
+            # live path the defect was measured on, not a theoretical gap.
+            git_facts_root=args.git_facts_root,
+            git_timeout=git_timeout,
+        )
+    return PortableAdapter(
+        args.workspace,
+        args.slug,
+        local_id=args.local_id,
+        # Same fix, same rationale, for this CLI's own default harness
+        # (`--harness` defaults to "portable" — see `_add_harness_arguments`).
+        git_facts_root=args.git_facts_root,
+        git_timeout=git_timeout,
+    )
 
 
 def _cmd_register(args: argparse.Namespace) -> int:
@@ -892,6 +981,264 @@ def _cmd_gen_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_locate(args: argparse.Namespace) -> int:
+    """Handle `fleet locate` (PLAN.md Chunk 2, FR-4, D1).
+
+    Prints the resolved slug on a resolvable `--cwd`, prints nothing on an
+    ambiguous/unresolvable one — never a traceback, never a nonzero exit
+    (`locate_project` never raises; see `locate.py`'s module docstring).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0`.
+    """
+    result = locate_project(args.cwd)
+    if result is not None:
+        print(result.slug)
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Handle `fleet doctor` (PLAN.md Chunk 3, D6, FR-10, FR-13).
+
+    Read-only estate-health scan: for every `SUPERHUMAN.md` found under the
+    given `--scan` roots, report whether a hook could write to it right now
+    and, if not, why (`scripts.fleet.doctor.scan`'s four states). Also
+    reports the operator's git version and flags anything below the 2.31
+    floor `locate.py`'s root discovery depends on. Never a fail-closed
+    assertion — this diagnoses, it never edits a record or writes a
+    manifest row.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` — a read-only scan has nothing to reject.
+    """
+    report = fleet_doctor.scan(args.scan)
+
+    print(f"scanned roots: {', '.join(str(root) for root in report.roots)}")
+
+    git = report.git_version
+    if git.ok:
+        print(f"git version: {git.raw or '(unknown)'}")
+    else:
+        floor = ".".join(str(part) for part in fleet_doctor.MIN_GIT_VERSION)
+        print(
+            f"git version: {git.raw or '(could not be determined)'} -- BELOW the "
+            f"{floor} floor locate.py's root discovery depends on "
+            "(`git rev-parse --path-format=absolute`); observation may be silently "
+            "dead on this machine"
+        )
+
+    if not report.records:
+        print("no project records found under the scanned roots")
+        return 0
+
+    for record in sorted(report.records, key=lambda r: (str(r.root), r.slug)):
+        print(f"{record.root}  {record.slug}  {record.state}  ({record.detail})")
+        if record.role_gate is not None:
+            gate = record.role_gate
+            if gate.state == "unknown":
+                print(f"    role gate: UNKNOWN — {gate.detail}")
+            else:
+                print(f"    role gate: {gate.detail}")
+    return 0
+
+
+def _cmd_project_mint(args: argparse.Namespace) -> int:
+    """Handle `fleet project mint` (PLAN.md Chunk 4, D3, FR-11).
+
+    Mints a random 16-hex `**Project-id:**` for a record that lacks one; a
+    no-op (never a re-mint) on a record that already has one. Always exits
+    0 — minting is a write helper, not the fail-closed assertion (`check`
+    is that).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0`.
+    """
+    project_id = fleet_project_id.mint_project_id(args.workspace, args.slug)
+    print(project_id)
+    return 0
+
+
+def _cmd_project_check(args: argparse.Namespace) -> int:
+    """Handle `fleet project check` (PLAN.md Chunk 4, D3, FR-12).
+
+    The fail-closed assertion D3 calls for: exits non-zero when the record
+    has no `**Project-id:**`, deliberately outside `observe.py`'s
+    fail-soft posture (this is an assertion, not observation).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` when the id is present (also printed to stdout); `1`
+        when it is absent.
+    """
+    project_id = fleet_project_id.check_project_id(args.workspace, args.slug)
+    if project_id is None:
+        print(
+            f"no **Project-id:** found for slug {args.slug!r} under {args.workspace} "
+            "-- run `python -m scripts.fleet.cli project mint` to assign one",
+            file=sys.stderr,
+        )
+        return 1
+    print(project_id)
+    return 0
+
+
+def _cmd_role_block_check(args: argparse.Namespace) -> int:
+    """Handle `fleet role-block check` (chunk 7a's fail-closed assertion, D7.6).
+
+    Reads `--prompt-file` (or stdin, for `-`) and runs it through the SAME
+    `check_role_block` function the `PreToolUse` adapter
+    (`pre_tool_use_role_gate.py`) calls (TC-87 asserts this) — exits 0 for
+    `ROLE`/`NON_ROLE` and 1 for anything else (`MISMATCH`, `UNMARKED`, or
+    `FAULT`). Unlike the hook's own fail-SOFT posture (NFR-9: a fault must
+    never turn into a denial), this is a manual, fail-CLOSED assertion tool
+    in the mould of `fleet project check` — a `FAULT` here (e.g. an
+    unreadable `roles/` directory) cannot certify compliance, so it exits
+    non-zero exactly like a genuine mismatch would.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` for `ROLE`/`NON_ROLE`; `1` otherwise.
+    """
+    if str(args.prompt_file) == "-":
+        try:
+            # Read raw bytes and decode as UTF-8 explicitly -- a verbatim
+            # role dispatch piped in from a real harness arrives as UTF-8
+            # bytes (RFC 8259 §8.1
+            # <https://www.rfc-editor.org/rfc/rfc8259#section-8.1>), but
+            # `sys.stdin.read()` decodes with the process's
+            # locale-preferred encoding, which on Windows is the
+            # console/ANSI code page (e.g. cp1252), not UTF-8 -- corrupting
+            # every role file's em dash and falsely reporting MISMATCH.
+            prompt = sys.stdin.buffer.read().decode("utf-8")
+        except UnicodeDecodeError:
+            # Unlike the hook's fail-SOFT posture (NFR-9), this is a
+            # manual/CI fail-CLOSED assertion tool (see the docstring
+            # above): a fault cannot certify compliance, so it prints the
+            # `FAULT` verdict -- one line, matching the normal path's own
+            # `print(result.verdict.value)` -- and exits 1, exactly like a
+            # genuine MISMATCH/UNMARKED would.
+            print(fleet_role_block.Verdict.FAULT.value)
+            return 1
+    else:
+        try:
+            prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            # `ValueError` covers `UnicodeDecodeError` on a non-UTF-8 file.
+            print(f"fleet role-block check: could not read --prompt-file: {exc}", file=sys.stderr)
+            return 1
+
+    result = fleet_role_block.check_role_block(prompt, args.roles_dir)
+    print(result.verdict.value)
+    return 0 if result.verdict in (fleet_role_block.Verdict.ROLE, fleet_role_block.Verdict.NON_ROLE) else 1
+
+
+def _cmd_hooks_install(args: argparse.Namespace) -> int:
+    """Handle `fleet hooks install` (Chunk 8, FR-9, A3).
+
+    All logic lives in `hooks_install.install`; this only translates CLI
+    args to the module API and prints a result. `--harness` is required
+    with a single choice (D4: no auto-detection) since `hooks_install.py`
+    is the one module in `scripts/` DESIGN.md names as harness-specific.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success (including a no-op `--dry-run`); `1` if the
+        resolved skill root is a linked git worktree or git resolution
+        failed outright.
+    """
+    try:
+        result = fleet_hooks_install.install(
+            args.settings_path, skill_root=args.skill_root, dry_run=args.dry_run
+        )
+    except fleet_hooks_install.HooksInstallError as exc:
+        print(f"fleet hooks install: {exc}", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        if result.changed:
+            print(result.diff, end="")
+        else:
+            print("fleet hooks install --dry-run: already up to date; nothing to write")
+        return 0
+
+    print(f"installed (root: {result.root})" if result.changed else f"already installed (root: {result.root})")
+    if result.worktree_pinned:
+        print(
+            "WARNING: --skill-root points inside a linked git worktree "
+            "(worktree-pinned) -- this install breaks if that worktree is reaped",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_hooks_uninstall(args: argparse.Namespace) -> int:
+    """Handle `fleet hooks uninstall` (Chunk 8, FR-9).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success -- removing an already-absent entry is a
+        no-op, not an error; `1` if `settings_path` exists and is not
+        valid JSON (Phase 3.3 preflight item 4 -- named in the printed
+        error rather than a raw traceback).
+    """
+    try:
+        result = fleet_hooks_install.uninstall(args.settings_path)
+    except fleet_hooks_install.HooksInstallError as exc:
+        print(f"fleet hooks uninstall: {exc}", file=sys.stderr)
+        return 1
+    print("uninstalled" if result.changed else "already not installed")
+    return 0
+
+
+def _cmd_hooks_status(args: argparse.Namespace) -> int:
+    """Handle `fleet hooks status` (Chunk 8, FR-9).
+
+    Also reports D7.8's silent-disable case (a registered command whose
+    path no longer exists) and whether a registered command is
+    worktree-pinned.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` on success -- a status report otherwise has nothing to
+        reject; `1` if `settings_path` exists and is not valid JSON
+        (Phase 3.3 preflight item 4 -- named in the printed error rather
+        than a raw traceback).
+    """
+    try:
+        result = fleet_hooks_install.status(args.settings_path)
+    except fleet_hooks_install.HooksInstallError as exc:
+        print(f"fleet hooks status: {exc}", file=sys.stderr)
+        return 1
+    for entry in result.entries:
+        line = f"{entry.hook_event}/{entry.matcher}: {'installed' if entry.present else 'NOT installed'}"
+        if entry.present and not entry.command_path_exists:
+            line += " -- command path does NOT exist (silently disabled)"
+        if entry.present and entry.worktree_pinned:
+            line += " -- WORKTREE-PINNED"
+        print(line)
+    print("installed" if result.installed else "not installed")
+    return 0
+
+
 def _safe_build_adapter_for_observe(
     args: argparse.Namespace, *, event: str
 ) -> SessionAdapter | None:
@@ -936,12 +1283,30 @@ def _safe_build_adapter_for_observe(
 
 
 def _cmd_observe_dispatch(args: argparse.Namespace) -> int:
-    """Handle `fleet observe dispatch` (fleet-wiring Chunk 1, W-FR-1).
+    """Handle `fleet observe dispatch` (fleet-wiring Chunk 1, W-FR-1; chunk 7
+    adds `--hook-payload`/`--anchor`, FR-7/FR-17).
 
-    Fail-soft wrapper over `observe.observe_dispatch` — see `observe.py`'s
-    module docstring for the fail-soft/fail-closed boundary this crosses.
-    Prints nothing on the normal path (DESIGN's Loudness tiers: `observe`
-    subcommands other than `handoff-emit`/`status` carry no stdout payload).
+    `--hook-payload <file|->` (D2b, mirroring `_cmd_observe_session_start`)
+    is mutually exclusive in effect with `--workspace`/`--slug`/
+    `--dispatch-id`: when given, `--workspace`/`--slug` are derived from the
+    payload's `cwd` via `locate.locate_project`, and the payload's `agent_id`
+    (CHUNK-1-FINDINGS.md finding 1 — the per-dispatch identifier) is used as
+    both `--dispatch-id` and `--local-id` unless the caller already supplied
+    one explicitly. A malformed/absent payload or a locator refusal both
+    mean "nothing to do here": exit 0, having written nothing, exactly like
+    every other `observe` outcome.
+
+    `--anchor <dir>` behaves identically to `_cmd_observe_session_start`'s
+    (Chunk 6, ARCHITECTURE.md Addendum §A): tried BEFORE the payload's `cwd`
+    when given and non-empty. `templates/hooks/claude-code/subagent-start`
+    passes `$CLAUDE_PROJECT_DIR` here. When `--anchor` is absent (the
+    default), behavior is byte-identical to before this option existed.
+
+    Whichever of `--anchor`/payload `cwd` actually resolved the project is
+    threaded through as `args.git_facts_root` (chunk 6 G6 addendum, carried
+    to this verb per PLAN.md chunk 7's PM ruling 5) — see
+    `_cmd_observe_session_start`'s identical comment for why this must never
+    be silently left at the `workspace` default.
 
     Args:
         args: parsed CLI arguments.
@@ -950,14 +1315,56 @@ def _cmd_observe_dispatch(args: argparse.Namespace) -> int:
         int: always `0` — `observe.py` never raises and never signals
         failure through the exit code (Decision A).
     """
+    workspace = args.workspace
+    slug = args.slug
+    dispatch_id = args.dispatch_id
+
+    if args.hook_payload is not None:
+        payload = fleet_hook_payload.read_hook_payload(args.hook_payload)
+        if payload is None:
+            return 0
+        location = None
+        resolved_from = None
+        if getattr(args, "anchor", None):
+            location = locate_project(args.anchor)
+            if location is not None:
+                resolved_from = args.anchor
+        if location is None:
+            location = locate_project(payload.cwd)
+            if location is not None:
+                resolved_from = payload.cwd
+        if location is None:
+            return 0
+        workspace = location.workspace
+        slug = location.slug
+        # `resolved_from` is the session's OWN working tree, before D1's
+        # outward hop to `workspace` -- see `_cmd_observe_session_start`'s
+        # identical comment for the chunk-6 branch-attribution defect this
+        # threading avoids reintroducing here.
+        args.git_facts_root = resolved_from
+        if dispatch_id is None:
+            dispatch_id = payload.agent_id
+        if args.local_id is None:
+            args.local_id = payload.agent_id
+
+    if workspace is None or slug is None or dispatch_id is None:
+        print(
+            "fleet observe dispatch: --workspace/--slug/--dispatch-id are required "
+            "unless --hook-payload resolves them",
+            file=sys.stderr,
+        )
+        return 0
+    args.workspace = workspace
+    args.slug = slug
+
     adapter = _safe_build_adapter_for_observe(args, event="dispatch")
     if adapter is None:
         return 0
     fleet_observe.observe_dispatch(
         adapter,
-        workspace=args.workspace,
-        slug=args.slug,
-        dispatch_id=args.dispatch_id,
+        workspace=workspace,
+        slug=slug,
+        dispatch_id=dispatch_id,
         writer_role=args.writer_role,
     )
     return 0
@@ -1090,6 +1497,129 @@ def _cmd_observe_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_observe_session_start(args: argparse.Namespace) -> int:
+    """Handle `fleet observe session-start` (PLAN.md Chunk 3, FR-5/FR-13/FR-17/D2a/D6).
+
+    `--hook-payload <file|->` (D2b) is mutually exclusive in effect with
+    `--workspace`/`--slug`: when given, `--workspace`/`--slug` are derived
+    from the payload's `cwd` via `locate.locate_project`, and the harness's
+    own `session_id` (FR-17) is threaded through as `--session-id`
+    (`--harness claude`) / `--local-id` (`--harness portable`/`subagent`) —
+    whichever the selected harness actually consumes — unless the caller
+    already supplied one explicitly. A malformed/absent payload or a
+    locator refusal both mean "nothing to do here": exit 0, having written
+    nothing, exactly like every other `observe` outcome (D2b).
+
+    `--anchor <dir>` (Chunk 6, ARCHITECTURE.md Addendum §A) is tried BEFORE
+    the payload's `cwd` when given and non-empty: `templates/hooks/claude-code/
+    session-start` passes `$CLAUDE_PROJECT_DIR` here, since it names the
+    session's outer root and is stable for the session's lifetime, whereas
+    `cwd` drifts as the shell moves. This option is deliberately named
+    generically (D4: no harness name in `scripts/fleet/**`) — the harness
+    knowledge that it should be `$CLAUDE_PROJECT_DIR` lives only in the
+    template. `--anchor` is harness-SUPPLIED (an environment variable only
+    the harness process can set), never repo-authored, which is exactly why
+    it is admissible as a locator input where a repo-authored string is not
+    (NFR-4). NFR-4 confinement itself is unweakened by this: the anchor is
+    only a starting point, and `locate_project` still derives the returned
+    workspace via `git rev-parse` — no path construction happens here. When
+    `--anchor` is absent (the default, `None`), behavior is byte-identical
+    to before this option existed: only `payload.cwd` is ever tried.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: always `0` (see `_cmd_observe_dispatch`).
+    """
+    workspace = args.workspace
+    slug = args.slug
+
+    if args.hook_payload is not None:
+        payload = fleet_hook_payload.read_hook_payload(args.hook_payload)
+        if payload is None:
+            return 0
+        location = None
+        resolved_from = None
+        if getattr(args, "anchor", None):
+            location = locate_project(args.anchor)
+            if location is not None:
+                resolved_from = args.anchor
+        if location is None:
+            location = locate_project(payload.cwd)
+            if location is not None:
+                resolved_from = payload.cwd
+        if location is None:
+            return 0
+        workspace = location.workspace
+        slug = location.slug
+        # `resolved_from` is whichever of --anchor/payload.cwd actually
+        # located this project -- the session's OWN working tree, before
+        # D1's outward hop to `workspace`. Chunk-6-review defect: with no
+        # git_facts_root, ClaudeAdapter's git_facts() queried `workspace`
+        # itself for branch/commit state, so a session in a linked worktree
+        # got the MAIN CHECKOUT's currently-checked-out branch recorded as
+        # its own -- a real value answering a different question, and
+        # non-deterministic besides (that checkout's branch can change from
+        # unrelated activity in another session). Measured in production:
+        # a fleet-deterministic-seams-worktree session's row recorded
+        # branch="fix/242-arm-guards-everywhere", the MAIN checkout's branch
+        # at that moment. `git -C <dir>` auto-discovers the enclosing
+        # worktree from any subdirectory, so `resolved_from` need not be an
+        # exact repo root.
+        args.git_facts_root = resolved_from
+        if args.session_id is None:
+            args.session_id = payload.session_id
+        if args.local_id is None:
+            args.local_id = payload.session_id
+
+    if workspace is None or slug is None:
+        print(
+            "fleet observe session-start: --workspace/--slug are required unless "
+            "--hook-payload resolves them",
+            file=sys.stderr,
+        )
+        return 0
+    args.workspace = workspace
+    args.slug = slug
+
+    adapter = _safe_build_adapter_for_observe(args, event="session-start")
+    if adapter is None:
+        return 0
+
+    prompt_text: str | None = None
+    if args.prompt_file is not None:
+        try:
+            prompt_text = args.prompt_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(
+                f"fleet observe session-start: could not read --prompt-file "
+                f"{args.prompt_file}, continuing without an id-anchored flip: {exc}",
+                file=sys.stderr,
+            )
+
+    result = fleet_observe.observe_session_start(
+        adapter,
+        workspace=workspace,
+        slug=slug,
+        handoff_id=args.handoff_id,
+        prompt_text=prompt_text,
+        writer_role=args.writer_role,
+    )
+    if result.error_class == "identity_unresolved":
+        # D6: the ONE line `observe.py` itself never prints (its loudness
+        # tiers reserve stdout entirely for CLI callers). At SessionStart
+        # this stdout becomes session context, reaching a human and the
+        # model — the whole point of FR-13.
+        print(
+            f"fleet observe session-start: project {slug!r} resolved at {workspace} but "
+            "its SUPERHUMAN.md has no **Project-id:** line, so nothing was recorded -- "
+            "run `fleet project mint` (or `fleet doctor --scan <root>...` for the "
+            "estate-wide picture)"
+        )
+    return 0
+
+
 def _cmd_observe_status(args: argparse.Namespace) -> int:
     """Handle `fleet observe status` (fleet-wiring Chunk 1, W-FR-8).
 
@@ -1178,6 +1708,18 @@ def build_parser() -> argparse.ArgumentParser:
         "current process id); --harness subagent: the PM-minted dispatch id (required)",
     )
     register_parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "--harness claude only: see the identical flag on the `observe` "
+            "subcommands (_add_harness_arguments). `register` has no "
+            "--hook-payload of its own, so this stays at its default here; "
+            "registered anyway so `_build_adapter` never sees a Namespace "
+            "missing the attribute regardless of which subcommand built it."
+        ),
+    )
+    register_parser.add_argument(
         "--fleet-dir",
         type=Path,
         default=None,
@@ -1198,8 +1740,212 @@ def build_parser() -> argparse.ArgumentParser:
     _add_query_subparsers(subparsers)
     _add_view_subparsers(subparsers)
     _add_observe_subparsers(subparsers)
+    _add_locate_subparser(subparsers)
+    _add_doctor_subparser(subparsers)
+    _add_project_subparsers(subparsers)
+    _add_role_block_subparsers(subparsers)
+    _add_hooks_subparsers(subparsers)
 
     return parser
+
+
+def _add_locate_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `locate` subcommand (PLAN.md Chunk 2, D1).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    locate_parser = subparsers.add_parser(
+        "locate",
+        help="Resolve --cwd to its (workspace, slug) superhuman project (D1). "
+        "Prints the slug or nothing; always exits 0.",
+    )
+    locate_parser.add_argument(
+        "--cwd",
+        type=Path,
+        default=Path.cwd(),
+        help="the directory to resolve from (default: the process cwd)",
+    )
+    locate_parser.set_defaults(func=_cmd_locate)
+
+
+def _add_doctor_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `doctor` subcommand (PLAN.md Chunk 3, D6, FR-10, FR-13).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Read-only estate-health scan: which project records can write right now, "
+        "and why not (D6, FR-10, FR-13). Always exits 0.",
+    )
+    doctor_parser.add_argument(
+        "--scan",
+        nargs="+",
+        required=True,
+        type=Path,
+        metavar="ROOT",
+        help="one or more roots to scan under (each expected to be a git repository "
+        "root; shell glob expansion, e.g. ~/dev/*, is expected to already have turned "
+        "a wildcard into one argument per repository)",
+    )
+    doctor_parser.set_defaults(func=_cmd_doctor)
+
+
+def _add_project_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `project mint|check` subcommands (PLAN.md Chunk 4, D3, FR-11/FR-12).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    project_parser = subparsers.add_parser(
+        "project",
+        help="Project-id minting and fail-closed validation (D3, FR-11/FR-12).",
+    )
+    project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
+
+    mint_parser = project_subparsers.add_parser(
+        "mint",
+        help="Mint a random 16-hex Project-id if the record lacks one; a no-op "
+        "(never a re-mint) if it already has one. Always exits 0.",
+    )
+    mint_parser.add_argument(
+        "--workspace", required=True, type=Path, help="the working tree root"
+    )
+    mint_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    mint_parser.set_defaults(func=_cmd_project_mint)
+
+    check_parser = project_subparsers.add_parser(
+        "check",
+        help="Fail-closed assertion (FR-12): exits non-zero when the record has "
+        "no **Project-id:**, 0 when it does.",
+    )
+    check_parser.add_argument(
+        "--workspace", required=True, type=Path, help="the working tree root"
+    )
+    check_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    check_parser.set_defaults(func=_cmd_project_check)
+
+
+def _add_role_block_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `role-block check` subcommand (chunk 7a, D7.6, FR-20).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    role_block_parser = subparsers.add_parser(
+        "role-block",
+        help="Chunk 7a's role-block predicate, exposed as a manual/CI-usable "
+        "verb (D7.6).",
+    )
+    role_block_subparsers = role_block_parser.add_subparsers(
+        dest="role_block_command", required=True
+    )
+
+    check_parser = role_block_subparsers.add_parser(
+        "check",
+        help="Fail-closed assertion: exits 0 for ROLE/NON_ROLE, 1 otherwise "
+        "(MISMATCH/UNMARKED/FAULT). Prints one verdict line.",
+    )
+    check_parser.add_argument(
+        "--prompt-file",
+        required=True,
+        help="path to the prompt text to check, or '-' for stdin",
+    )
+    check_parser.add_argument(
+        "--roles-dir",
+        type=Path,
+        default=_SKILL_ROOT / "roles",
+        help="the directory holding roles/*.md (default: this skill's own roles/)",
+    )
+    check_parser.set_defaults(func=_cmd_role_block_check)
+
+
+def _add_hooks_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `hooks install|uninstall|status` subcommands (Chunk 8, FR-9, A3).
+
+    All logic lives in `scripts/fleet/hooks_install.py`; this is thin verb
+    wiring only, per the PM's file-list ruling (PLAN.md Chunk 8).
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    hooks_parser = subparsers.add_parser(
+        "hooks",
+        help="Idempotently register/remove/report superhuman's own harness hook "
+        "entries in a settings file (Chunk 8, FR-9, A3).",
+    )
+    hooks_subparsers = hooks_parser.add_subparsers(dest="hooks_command", required=True)
+
+    install_parser = hooks_subparsers.add_parser(
+        "install",
+        help="Register every superhuman hook entry, replacing any prior "
+        "superhuman-owned entry rather than duplicating it (R5).",
+    )
+    install_parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("claude-code",),
+        help="the target harness; no auto-detection (D4)",
+    )
+    install_parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=fleet_hooks_install.DEFAULT_SETTINGS_PATH,
+        help="the settings.json to modify (default: ~/.claude/settings.json)",
+    )
+    install_parser.add_argument(
+        "--skill-root",
+        type=Path,
+        default=None,
+        help="explicit operator override for the root registered commands point "
+        "at (default: auto-resolve the main checkout via git; refuses if that "
+        "resolves inside a linked worktree -- R1)",
+    )
+    install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the diff and write nothing",
+    )
+    install_parser.set_defaults(func=_cmd_hooks_install)
+
+    uninstall_parser = hooks_subparsers.add_parser(
+        "uninstall",
+        help="Remove every superhuman-owned hook entry, restoring the prior "
+        "state exactly.",
+    )
+    uninstall_parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("claude-code",),
+        help="the target harness; no auto-detection (D4)",
+    )
+    uninstall_parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=fleet_hooks_install.DEFAULT_SETTINGS_PATH,
+        help="the settings.json to modify (default: ~/.claude/settings.json)",
+    )
+    uninstall_parser.set_defaults(func=_cmd_hooks_uninstall)
+
+    status_parser = hooks_subparsers.add_parser(
+        "status",
+        help="Report whether each superhuman hook entry is installed.",
+    )
+    status_parser.add_argument(
+        "--harness",
+        required=True,
+        choices=("claude-code",),
+        help="the target harness; no auto-detection (D4)",
+    )
+    status_parser.add_argument(
+        "--settings-path",
+        type=Path,
+        default=fleet_hooks_install.DEFAULT_SETTINGS_PATH,
+        help="the settings.json to inspect (default: ~/.claude/settings.json)",
+    )
+    status_parser.set_defaults(func=_cmd_hooks_status)
 
 
 def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1226,6 +1972,33 @@ def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
         "--session-relay-script", type=Path, default=None, help="--harness claude only"
     )
     parser.add_argument("--local-id", default=None, help="--harness portable or subagent only (required for subagent)")
+    parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "--harness claude/portable/subagent (chunk 7 fix: all three, not "
+            "just claude): directory git_facts() actually queries for "
+            "branch/commit state, when it must differ from --workspace "
+            "(chunk-6 branch-attribution defect). Not meant to be typed by a "
+            "human -- a --hook-payload consumer sets this programmatically "
+            "on `args` before adapter construction, threading through "
+            "whichever of --anchor/payload.cwd actually resolved the "
+            "project (the session's own working tree, BEFORE D1's outward "
+            "hop). Registered here, not left as an ad-hoc Namespace "
+            "attribute, so every future --hook-payload verb inherits a "
+            "visible default=None rather than a getattr fallback nothing "
+            "signals the existence of. Any new payload-consuming verb MUST "
+            "set this explicitly or it silently inherits the stale-"
+            "workspace default; and `_build_adapter` MUST forward it to "
+            "whichever adapter class `--harness` selects, not only "
+            "ClaudeAdapter (the chunk-7 defect this comment now documents) "
+            "-- see test_every_hook_payload_verb_threads_git_facts_root and "
+            "test_every_hook_payload_verb_and_harness_builds_an_adapter_"
+            "that_uses_git_facts_root in tests/fleet/test_observe_session.py, "
+            "which fail red for either omission."
+        ),
+    )
 
 
 def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
@@ -1251,10 +2024,32 @@ def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
     dispatch_parser = observe_subparsers.add_parser(
         "dispatch", help="Observe a spawned role dispatch (W-FR-1). Always exits 0."
     )
-    dispatch_parser.add_argument("--workspace", required=True, type=Path)
-    dispatch_parser.add_argument("--slug", required=True, help="the superhuman project slug")
     dispatch_parser.add_argument(
-        "--dispatch-id", required=True, help="the PM-minted id identifying the dispatch unit"
+        "--workspace", type=Path, default=None, help="required unless --hook-payload resolves it"
+    )
+    dispatch_parser.add_argument(
+        "--slug", default=None, help="the superhuman project slug (see --workspace)"
+    )
+    dispatch_parser.add_argument(
+        "--dispatch-id",
+        default=None,
+        help="the PM-minted id identifying the dispatch unit; required unless "
+        "--hook-payload resolves it from the payload's agent_id (chunk 7, FR-7)",
+    )
+    dispatch_parser.add_argument(
+        "--hook-payload",
+        default=None,
+        help="read a harness hook JSON payload from this file, or '-' for stdin (D2b); "
+        "derives --workspace/--slug via the locator from the payload's cwd, and uses the "
+        "payload's agent_id as --dispatch-id/--local-id (chunk 7, FR-7/FR-17)",
+    )
+    dispatch_parser.add_argument(
+        "--anchor",
+        default=None,
+        help="with --hook-payload: try locating the project from THIS directory first, "
+        "falling back to the payload's cwd only if it does not resolve (ARCHITECTURE.md "
+        "Addendum §A) — a harness-supplied starting point (e.g. $CLAUDE_PROJECT_DIR), "
+        "never a repo-authored one; omitting this flag leaves behavior unchanged",
     )
     dispatch_parser.add_argument(
         "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
@@ -1324,6 +2119,50 @@ def _add_observe_subparsers(subparsers: argparse._SubParsersAction) -> None:
     _add_harness_arguments(launch_parser)
     launch_parser.set_defaults(func=_cmd_observe_launch)
 
+    session_start_parser = observe_subparsers.add_parser(
+        "session-start",
+        help="Observe a plain session start with no pending handoff (FR-5, D2a). "
+        "Always exits 0.",
+    )
+    session_start_parser.add_argument(
+        "--workspace", type=Path, default=None, help="required unless --hook-payload resolves it"
+    )
+    session_start_parser.add_argument(
+        "--slug", default=None, help="the superhuman project slug (see --workspace)"
+    )
+    session_start_parser.add_argument(
+        "--hook-payload",
+        default=None,
+        help="read a harness hook JSON payload from this file, or '-' for stdin (D2b); "
+        "derives --workspace/--slug via the locator from the payload's cwd, and threads "
+        "the harness's own session id through (FR-17)",
+    )
+    session_start_parser.add_argument(
+        "--anchor",
+        default=None,
+        help="with --hook-payload: try locating the project from THIS directory first, "
+        "falling back to the payload's cwd only if it does not resolve (ARCHITECTURE.md "
+        "Addendum §A) — a harness-supplied starting point (e.g. $CLAUDE_PROJECT_DIR), "
+        "never a repo-authored one; omitting this flag leaves behavior unchanged",
+    )
+    session_start_parser.add_argument(
+        "--handoff-id",
+        default=None,
+        help="an explicit, id-anchored handoff to attempt flipping first "
+        "(D2a: never a fuzzy cwd/branch match)",
+    )
+    session_start_parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help="grep this file's FLEET-HANDOFF-ID line when --handoff-id is not given directly",
+    )
+    session_start_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    _add_harness_arguments(session_start_parser)
+    session_start_parser.set_defaults(func=_cmd_observe_session_start)
+
     status_parser = observe_subparsers.add_parser(
         "status", help="Report enablement/activity for a workspace (W-FR-8). Always exits 0."
     )
@@ -1384,6 +2223,19 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--session-relay-script", type=Path, default=None, help="--harness claude only"
     )
     emit_parser.add_argument("--local-id", default=None, help="--harness portable or subagent only (required for subagent)")
+    emit_parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "see the identical flag on `register` (_build_adapter needs "
+            "every one of its callers' parsers to register this, chunk 7 "
+            "fix — `emit` has no --hook-payload of its own, so this stays "
+            "at its default here; registered anyway so `_build_adapter` "
+            "never sees a Namespace missing the attribute regardless of "
+            "which subcommand built it)."
+        ),
+    )
     emit_parser.add_argument(
         "--fleet-dir",
         type=Path,
@@ -1498,6 +2350,19 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--session-relay-script", type=Path, default=None, help="--harness claude only"
     )
     self_register_parser.add_argument("--local-id", default=None, help="--harness portable or subagent only (required for subagent)")
+    self_register_parser.add_argument(
+        "--git-facts-root",
+        type=Path,
+        default=None,
+        help=(
+            "see the identical flag on `register` (_build_adapter needs "
+            "every one of its callers' parsers to register this, chunk 7 "
+            "fix — `self-register` has no --hook-payload of its own, so "
+            "this stays at its default here; registered anyway so "
+            "`_build_adapter` never sees a Namespace missing the attribute "
+            "regardless of which subcommand built it)."
+        ),
+    )
     self_register_parser.add_argument(
         "--fleet-dir",
         type=Path,

@@ -368,8 +368,29 @@ def find_profile(cwd: Path) -> Path | None:
     project and match the user-level profile as though it were project-local,
     because the home directory is an ancestor of most checkouts — collapsing
     tiers 2 and 3 into one and making ``explain`` misreport which rule fired.
-    The walk therefore stops at the enclosing git repository root, or at the
-    home directory when the location is not a repository.
+    The walk therefore stops at the enclosing repository's MAIN checkout
+    root, or at the home directory when the location is not a repository.
+
+    The ceiling is resolved via ``git rev-parse --path-format=absolute
+    --git-common-dir``'s parent, never ``--show-toplevel`` (chunk 9,
+    roadmap#217 routed-in defect). ``--git-common-dir`` names the ``.git``
+    directory SHARED by a repository and every one of its linked
+    worktrees; from a linked worktree it still resolves to the MAIN
+    checkout's ``.git``, never the worktree's own. ``--show-toplevel``,
+    by contrast, returns whichever working tree ``cwd`` is actually in —
+    the worktree's own root when run from one. Since a linked worktree in
+    this project's own real layout is filesystem-nested under its main
+    checkout (``<main>/.claude/worktrees/<name>``), a ``--show-toplevel``
+    ceiling stopped the walk at the worktree's own root on its very first
+    iteration and could never reach a project-local ``.superhuman/
+    profile.yaml`` living in the main checkout above it — the same "one
+    location answering two questions" shape as the locator's own D1-R1
+    fix, ``hooks_install.py::_default_skill_root``, and
+    ``tests/repo_artifacts.py::main_checkout_root``. For an ordinary,
+    non-worktree repository ``--git-common-dir``'s parent equals
+    ``--show-toplevel`` exactly (there is only one working tree), so this
+    is a strict generalization, not a behavior change, for every caller
+    outside a linked worktree.
 
     Args:
         cwd: Directory to start the upward walk from.
@@ -382,8 +403,12 @@ def find_profile(cwd: Path) -> Path | None:
         return Path(override)
 
     home = Path.home()
-    toplevel = _git(cwd, "rev-parse", "--show-toplevel") if cwd.is_dir() else None
-    ceiling = Path(toplevel) if toplevel else None
+    common_dir = (
+        _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if cwd.is_dir()
+        else None
+    )
+    ceiling = Path(common_dir).parent if common_dir else None
 
     for directory in [cwd, *cwd.parents]:
         if directory == home:
@@ -656,6 +681,18 @@ def _git(root: Path, *args: str) -> str | None:
 
     Returns:
         Stdout with surrounding whitespace removed, or ``None``.
+
+        ``encoding="utf-8"`` is explicit (chunk 9, roadmap#217 decoding-
+        locale class -- the same defect fixed for hook stdin at 5894617,
+        here on git's own stdout): git's plumbing output is UTF-8
+        regardless of platform, but ``subprocess.run(..., text=True)``
+        with no ``encoding=`` decodes using the process's locale-
+        preferred encoding -- cp1252 on Windows, not UTF-8 -- silently
+        mangling a non-ASCII path/branch byte instead of raising.
+        ``errors="strict"`` (the default) plus the added
+        ``UnicodeDecodeError`` catch route that mangling into this
+        function's EXISTING fail-soft ``None`` outcome rather than
+        returning silently-wrong text.
     """
     try:
         out = subprocess.run(
@@ -663,10 +700,11 @@ def _git(root: Path, *args: str) -> str | None:
             cwd=root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
     return out.stdout.strip() if out.returncode == 0 else None
 
@@ -2146,7 +2184,21 @@ def cmd_models_set(args: argparse.Namespace) -> int:
         )
     if args.answers_json_file is not None:
         if args.answers_json_file == "-":
-            raw_json = sys.stdin.read()
+            try:
+                # Read raw bytes and decode as UTF-8 explicitly rather
+                # than `sys.stdin.read()` (chunk 9, roadmap#217 decoding-
+                # locale class -- the same defect fixed for hook stdin at
+                # 5894617): a text-mode read decodes with the process's
+                # locale-preferred encoding -- cp1252 on Windows, not
+                # UTF-8 -- while JSON is UTF-8 by its own encoding rule
+                # (RFC 8259 SS8.1). `errors="strict"` (the default):
+                # unlike a hook's fail-SOFT posture, this CLI command is
+                # fail-CLOSED (see the Raises section above), so a
+                # non-UTF-8 payload must surface as `ProfileError`, never
+                # silently mangle a tier/alias name.
+                raw_json = sys.stdin.buffer.read().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ProfileError(f"--answers-json-file -: {exc}") from exc
         else:
             try:
                 raw_json = Path(args.answers_json_file).read_text(encoding="utf-8")

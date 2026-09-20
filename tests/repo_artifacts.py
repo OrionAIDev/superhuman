@@ -61,20 +61,37 @@ def main_checkout_root(repo_root: Path) -> Path | None:
 
     Returns:
         The main checkout's working-tree root, or ``None`` when git is
-        unavailable, errors, or says nothing useful.
+        unavailable, errors, says nothing useful, or its output could not
+        be decoded.
+
+    ``encoding="utf-8"`` is explicit (chunk 9 PM follow-up (b), roadmap#217
+    decoding-locale class): this call returns a PATH, which -- unlike
+    ``doctor.py``'s ASCII-only ``git --version`` -- can genuinely contain
+    non-ASCII bytes, so it is a live instance of the same defect fixed
+    elsewhere this chunk (``locate.py``, the adapters,
+    ``superhuman_profile.py``): ``subprocess.run(..., text=True)`` with no
+    ``encoding=`` decodes git's (always UTF-8) stdout using the process's
+    locale-preferred encoding -- cp1252 on Windows, not UTF-8 -- silently
+    mangling a non-ASCII path segment instead of raising.
+    ``errors="strict"`` (the default) plus the added ``UnicodeDecodeError``
+    catch route that mangling into this function's EXISTING fail-soft
+    ``None`` outcome (a decode failure is exactly the "git said nothing
+    useful" case its own docstring already documents) rather than
+    returning a silently-wrong path.
     """
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=10,
             check=True,
         ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        # No git, not a repository, or a hung invocation. Callers fall back to
-        # the in-tree path, so this degrades to the previous behaviour rather
-        # than to a wrong answer.
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        # No git, not a repository, a hung invocation, or undecodable
+        # output. Callers fall back to the in-tree path, so this degrades
+        # to the previous behaviour rather than to a wrong answer.
         return None
     return (repo_root / out).parent if out else None
 

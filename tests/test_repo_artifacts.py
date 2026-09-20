@@ -18,7 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from publication_patterns import TOKENS_FILE, locate_tokens_file  # noqa: E402
-from repo_artifacts import locate_ignored_artifact  # noqa: E402
+from repo_artifacts import locate_ignored_artifact, main_checkout_root  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Where a gitignored artifact is found (roadmap#242, instance 2)
@@ -204,3 +204,38 @@ def test_locate_generalises_beyond_the_token_list(main_checkout: Path) -> None:
     assert not (worktree / relpath).exists()
 
     assert locate_ignored_artifact(worktree, relpath) == shared
+
+
+def test_main_checkout_root_resolves_from_a_non_ascii_worktree_path(
+    tmp_path: Path,
+) -> None:
+    """Chunk 9 PM follow-up (b): `main_checkout_root`'s
+    `subprocess.run(..., text=True)` had no explicit `encoding=`, so on
+    Windows git's (always UTF-8) `--git-common-dir` output was decoded
+    with the process's locale-preferred encoding -- cp1252, not UTF-8.
+    Unlike `doctor.py`'s ASCII-only `git --version`, this call returns a
+    PATH, which can genuinely carry non-ASCII bytes -- e.g. the main
+    checkout's directory name itself, exactly like this test's `main`
+    fixture directory below. A worktree resolving its own main checkout's
+    root is the load-bearing operation every function in this module
+    (and the publication guard behind it) depends on.
+    """
+    main = tmp_path / "main-\u00e9\u2192"
+    main.mkdir()
+    _git("init", "-b", "main", cwd=main)
+    _git("config", "user.email", "guard-test@example.com", cwd=main)
+    _git("config", "user.name", "guard test", cwd=main)
+    (main / "README.md").write_text("placeholder\n", encoding="utf-8")
+    _git("add", "README.md", cwd=main)
+    _git("commit", "-m", "initial", cwd=main)
+
+    worktree = tmp_path / "linked"
+    _git("worktree", "add", "-b", "side", str(worktree), cwd=main)
+
+    resolved = main_checkout_root(worktree)
+
+    assert resolved == main, (
+        f"main_checkout_root from a linked worktree under a non-ASCII main "
+        f"checkout path resolved {resolved!r}, expected {main!r} -- see "
+        "this test's docstring for the byte-level cause"
+    )
