@@ -102,3 +102,55 @@ def test_append_survives_a_pre_existing_non_utf8_byte(tmp_path: Path) -> None:
     assert "line-1" in text.splitlines()[-1], (
         f"the new line must land even though the file already carried invalid UTF-8: {text!r}"
     )
+
+
+def test_append_never_truncates_the_journal_to_zero_on_a_kill_mid_write(tmp_path: Path, monkeypatch) -> None:
+    """TC-138 (Minor, correctness lens): the module docstring claims
+    "Atomically append", but the OLD implementation called
+    `path.write_text(...)` directly on the real journal file -- which
+    TRUNCATES the file the instant it opens in write mode, before any new
+    content lands. A kill between that truncation and the full rewrite
+    completing (the hook's own 10s timeout can do this) loses the ENTIRE
+    bounded tail, not just the newest line -- the opposite of what
+    "Atomically append" promises. Fix: write to a temp file and
+    `os.replace()` onto the path (mirrors `hooks_install.py::_atomic_write`'s
+    pattern -- see that function's own docstring for the citations this
+    module's fix follows), inside the existing lock, so `path` itself is
+    never opened in truncating write mode at all.
+
+    Simulates the truncation window directly: monkeypatches
+    `Path.write_text` -- the OLD implementation's own vulnerable call --
+    to truncate the target file and then raise, exactly modelling a
+    process killed between `open(mode="w")` and the write completing.
+    Against the OLD implementation this reproduces total data loss (the
+    file comes back empty); against the FIXED implementation
+    `path.write_text` is never called on the real journal file at all, so
+    this patch has no effect and the append lands normally.
+    """
+    from pathlib import Path as _Path
+
+    path = tmp_path / "journal.jsonl"
+    path.write_text("prior-line\n", encoding="utf-8")
+
+    real_write_text = _Path.write_text
+
+    def _truncate_then_raise(self: _Path, data: str, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if self == path:
+            # Models open(mode="w"): the file truncates to zero bytes the
+            # instant it opens, before any content is actually written.
+            self.write_bytes(b"")
+            raise OSError("simulated crash mid-write, after truncation")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "write_text", _truncate_then_raise)
+
+    try:
+        append_bounded_line(path, "new-line", max_lines=10)
+    except OSError:
+        pass
+
+    surviving = path.read_text(encoding="utf-8")
+    assert "prior-line" in surviving, (
+        f"the pre-existing row must survive a kill mid-write, not be lost to a "
+        f"truncate-then-rewrite: file now contains {surviving!r}"
+    )

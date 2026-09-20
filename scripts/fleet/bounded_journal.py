@@ -42,6 +42,8 @@ with no correctness benefit.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 from .core.events import acquire_lock, release_lock
@@ -56,13 +58,61 @@ __all__ = ["append_bounded_line"]
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically: never truncate-in-place.
+
+    Preflight item 3 (Minor, correctness lens): this module's own
+    docstring says "Atomically append", but the original implementation
+    called `path.write_text(...)` directly -- which truncates the file
+    the instant it opens in write mode, before any new content lands. A
+    kill between that truncation and the rewrite completing (the hook's
+    own 10s timeout can do this) loses the ENTIRE bounded tail, not just
+    the newest line -- exactly the D7.7 decision log this primitive backs.
+
+    Mirrors `hooks_install.py::_atomic_write`'s pattern -- temp file in
+    the SAME directory, then `os.replace()`, so a crash between the two
+    leaves `path` exactly as it was, never observed half-written or
+    truncated. Reimplemented locally rather than imported: `hooks_install`
+    is this codebase's one deliberate harness-specific module (D4), and
+    this primitive is shared by two harness-agnostic callers
+    (`observe.py`, `role_block.py`), so it must not gain a dependency on
+    the harness-specific module.
+
+    Args:
+        path: the real destination path (the journal file).
+        text: the full new file content.
+
+    Raises:
+        OSError: the write or replace failed; `path` itself is unmodified
+            either way -- `os.replace` is atomic on both POSIX and Windows
+            for a same-volume rename.
+    """
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    replaced = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        replaced = True
+    finally:
+        if not replaced:
+            tmp_path.unlink(missing_ok=True)
+
+
 def append_bounded_line(path: Path, line: str, *, max_lines: int, timeout: float = _DEFAULT_LOCK_TIMEOUT_SECONDS) -> None:
     """Atomically append one line to `path`, trimming to the last `max_lines`.
 
     The read, append, trim, and rewrite all happen while holding the
     exclusive lock anchored at `<path>.lock`, so two callers racing to
     append never interleave their read-modify-write cycles -- the failure
-    mode this function exists to close.
+    mode this function exists to close. The rewrite itself also never
+    truncates `path` in place (preflight item 3): it goes through
+    `_atomic_write_text`'s temp-file-then-`os.replace()` pattern, so a
+    kill mid-write leaves the file exactly as it was before this call,
+    never observed half-written or empty.
 
     Args:
         path: the journal file to append to. Its parent directory must
@@ -106,6 +156,6 @@ def append_bounded_line(path: Path, line: str, *, max_lines: int, timeout: float
         existing.append(line)
         if len(existing) > max_lines:
             existing = existing[-max_lines:]
-        path.write_text("\n".join(existing) + "\n", encoding="utf-8")
+        _atomic_write_text(path, "\n".join(existing) + "\n")
     finally:
         release_lock(handle)
