@@ -95,8 +95,19 @@ fi
 # A role dispatch registers; a research fan-out (or a payload/transcript
 # this filter cannot make sense of) does not -- the filter's own broad catch
 # degrades every failure to "skip", never a traceback, never non-zero.
+# -E -s: never trust the caller's Python environment (Phase 3.3 preflight
+# RE-RUN item A) -- this process still inherits the CALLER's full
+# environment (only $SUPERHUMAN_ROOT and $CLAUDE_PROJECT_DIR above are
+# ever read selectively), so a plain `"$PYTHON" ...` here honours an
+# inherited `PYTHONPATH` too, letting a planted module get imported into
+# this hook process. Applied to BOTH invocations below, for the same
+# reason each is its own bare `"$PYTHON"` call. See
+# templates/hooks/claude-code/session-start's identical comment for the
+# full citation and why `-I`/`-P` are deliberately not used instead (this
+# script's second invocation shares the identical `-m scripts.fleet.cli`
+# cwd-importability constraint).
 decision="$(
-  printf '%s' "$payload" | "$PYTHON" \
+  printf '%s' "$payload" | "$PYTHON" -E -s \
     "$SUPERHUMAN_ROOT/templates/hooks/claude-code/subagent_dispatch_filter.py" \
     --hook-payload - 2>/dev/null
 )"
@@ -107,7 +118,7 @@ fi
 
 (
   cd "$SUPERHUMAN_ROOT" \
-    && printf '%s' "$payload" | "$PYTHON" -m scripts.fleet.cli observe dispatch \
+    && printf '%s' "$payload" | "$PYTHON" -E -s -m scripts.fleet.cli observe dispatch \
       --hook-payload - \
       --harness subagent \
       "${ANCHOR_ARGS[@]}"

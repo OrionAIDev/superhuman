@@ -84,7 +84,15 @@ if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
   ANCHOR_ARGS=(--anchor "$CLAUDE_PROJECT_DIR")
 fi
 
-printf '%s' "$payload" | "$PYTHON" \
+# -E -s: never trust the caller's Python environment (Phase 3.3 preflight
+# RE-RUN item A) -- this process still inherits the CALLER's full
+# environment (only $SUPERHUMAN_ROOT and $CLAUDE_PROJECT_DIR above are
+# ever read selectively), so a plain `"$PYTHON" ...` here honours an
+# inherited `PYTHONPATH` too, letting a planted module get imported into
+# this hook process. See templates/hooks/claude-code/session-start's
+# identical comment for the full citation and why `-I`/`-P` are
+# deliberately not used instead.
+printf '%s' "$payload" | "$PYTHON" -E -s \
   "$SUPERHUMAN_ROOT/templates/hooks/claude-code/pre_tool_use_role_gate.py" \
   --hook-payload - \
   "${ANCHOR_ARGS[@]}" \

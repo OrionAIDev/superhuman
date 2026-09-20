@@ -103,9 +103,37 @@ if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
   ANCHOR_ARGS=(--anchor "$CLAUDE_PROJECT_DIR")
 fi
 
+# --- -E -s: never trust the caller's Python environment (Phase 3.3 --------
+# --- preflight RE-RUN item A) -----------------------------------------------
+#
+# This process still inherits the CALLER's full environment (only
+# $SUPERHUMAN_ROOT and, above, $CLAUDE_PROJECT_DIR are ever read
+# selectively) -- so a plain `"$PYTHON" -m ...` here honours an inherited
+# `PYTHONPATH` too, letting a planted module get imported into this hook
+# process. Confirmed: a `yaml.py` on `PYTHONPATH` was imported and printed
+# into this script's own (deliberately unredirected) stdout, which becomes
+# session context. `-E` makes Python "Ignore all PYTHON* environment
+# variables, e.g. PYTHONPATH and PYTHONHOME, that might be set"
+# (https://docs.python.org/3/using/cmdline.html#cmdoption-E, checked
+# 2026-09-19). `-s` additionally excludes the user site-packages directory
+# from `sys.path` (a `pip install --user` plant), which `-E` does not
+# cover. `-I`/`-P` are NOT used: `-P` (and `-I`, which implies it) also
+# stops `python -m module` from prepending the current working directory
+# to `sys.path` (https://docs.python.org/3/using/cmdline.html#cmdoption-P),
+# which is exactly what lets `-m scripts.fleet.cli` resolve after the `cd
+# "$SUPERHUMAN_ROOT"` below -- adopting either would trade one fault for
+# another (the module failing to import at all).
+#
+# Residual risk, stated rather than silently accepted: this hardens the
+# ENVIRONMENT `$PYTHON` runs under, not the resolution of `$PYTHON` itself
+# -- an attacker able to plant an earlier `python`/`python3` on `$PATH`
+# still controls which binary runs, and no flag on that binary can defend
+# against itself. Closing that soundly needs a different mechanism
+# (e.g. an interpreter allowlist or hardcoded path) and is not attempted
+# here.
 (
   cd "$SUPERHUMAN_ROOT" \
-    && "$PYTHON" -m scripts.fleet.cli observe session-start \
+    && "$PYTHON" -E -s -m scripts.fleet.cli observe session-start \
       --hook-payload - \
       --harness claude \
       "${ANCHOR_ARGS[@]}"

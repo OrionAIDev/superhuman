@@ -59,8 +59,18 @@ _VERB_INVOCATION_RE = re.compile(r"python -m scripts\.fleet\.cli (observe [\w-]+
 #: That comment-only match let this identity test pass no matter what the
 #: executable line actually invoked -- confirmed by mutation (see this
 #: chunk's status report).
+#:
+#: Phase 3.3 preflight RE-RUN item A: tolerates interpreter-level flags
+#: (`-E -s`, added to harden every wrapper against an inherited
+#: `PYTHONPATH`/user site-packages plant -- see session-start's own
+#: comment) between the interpreter token and `-m`. Those flags govern
+#: HOW the interpreter starts, never WHICH verb/flags the `observe` call
+#: itself carries, so admitting them here does not weaken what this test
+#: checks (still exact, still reads the real executable line, still
+#: excludes comments) -- it only stops an unrelated, already-landed
+#: security hardening from masquerading as a D4/FR-15 divergence.
 _HOOK_VERB_RE = re.compile(
-    r'(?:"\$PYTHON"|\$PYTHON|python3?)\s+-m\s+scripts\.fleet\.cli\s+(observe\s+[\w-]+)'
+    r'(?:"\$PYTHON"|\$PYTHON|python3?)(?:\s+-\S+)*\s+-m\s+scripts\.fleet\.cli\s+(observe\s+[\w-]+)'
 )
 
 #: A `--flag-name` token, used to extract the flag SHAPE of an invocation
