@@ -69,6 +69,17 @@ consulted: [business-expert]
      - Value-vs-foundation: value-first | foundation-first | hybrid
      - Git: none | local | remote (if remote, follow-ups per conventions/git.md)
      - Parallelism: PM-decides | gate-each | serial-only
+     - **Deployment ladder: the ordered rungs this work must reach before it is COMPLETE, or
+       `none`.** There is no blank answer here — `none` (work that is finished where it is
+       authored: a doc change, a local tool, a spec) is a real answer, and it is the right one
+       for most small projects. Lowest rung first, e.g. `dev > staging > production`.
+       **Where the ladder is already knowable — the operator's profile declares a `ladder:`, or
+       the harness context states one — present it and ask the user to CONFIRM or correct it,
+       rather than asking cold.** Do not read the rungs' order off the profile: a profile's
+       `ladder:` is ordered by detection precedence (narrowest first), not by promotion order.
+       Record the answer verbatim in SUPERHUMAN.md's `**Deployment ladder:**` field. This is what
+       HARD-GATE rule 3 reads to tell *accepted* from *complete*; it is locked at G1, and changing
+       it later is a G6 drift event.
    - If user picks per-chunk cadence, display the token-cost advisory from DESIGN.md §9.
    - If git=remote, run the remote-sync flow per conventions/git.md.
    - **If HITL-M or 2 was chosen, validate the precondition** before accepting it:
@@ -212,6 +223,7 @@ consulted: [business-expert]
 
 - G0 approved.
 - G1 prefs recorded, including a validated HITL-level.
+- `**Deployment ladder:**` answered — an ordered rung list or the literal `none`, never left blank.
 - (If git=remote) initial push succeeded.
 
 Next phase: 1-requirements.

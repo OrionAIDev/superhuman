@@ -32,6 +32,27 @@
 **Modifies-existing-code:** {{yes_or_no}}
 <!-- Set at Phase 0 kickoff (same detection as the pre-existing-code drift check). Gates whether
      HITL-L requires ROLLBACK.md — see scripts/autonomous-precondition.sh. -->
+**Deployment ladder:** {{ladder_rungs_or_none}}
+<!-- REQUIRED at G1, and there is no blank answer. Either an ordered, lowest-rung-first list of the
+     rungs this project's work must reach before it is COMPLETE:
+
+       **Deployment ladder:** dev > staging > production
+
+     or the literal `none` for work that is finished where it is authored (a doc change, a local
+     tool, a spec). `none` is a real answer and is satisfied immediately; a blank is not an answer,
+     and an ABSENT line (a project predating this field) means UNDECLARED — report it as
+     undeclared, never read it as `none`, never guess it. See SKILL.md HARD-GATE rule 3.
+
+     This is NOT `## Environment:` below, and does not replace it. That marker answers "which rung
+     am I standing on?" and feeds path/marker detection. This answers "which rungs must this work
+     reach?" — a different question, fixed at alignment, and one the profile cannot answer on its
+     own: a profile's `ladder:` list is ordered by DETECTION precedence (narrowest first, so
+     production often leads), never by promotion order, and `kind:` is a semantics-free label.
+     The sequence therefore has to be declared here.
+
+     Where the harness already knows the ladder, CONFIRM it with the user rather than asking cold.
+     Rung names should match the operator's profile where one exists; they are recorded as written
+     either way. Locked at G1 — changing it later is a G6 drift event, not a quiet edit. -->
 
 ## Environment: {{environment_marker_or_omit}}
 <!-- OPTIONAL. Declares which rung of your deployment profile this project belongs to, for cases
