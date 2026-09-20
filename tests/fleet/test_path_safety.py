@@ -6,6 +6,8 @@ it, the same class of defect standing unfixed in a sibling module).
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from scripts.fleet.path_safety import slug_is_safe
@@ -75,7 +77,33 @@ class TestSlugIsSafe:
     def test_drive_qualified_slug_actually_escapes_a_joined_path(self) -> None:
         """Confirms the mechanism `test_drive_qualified_slug_is_unsafe`
         exists to reject, so the regression this guards against is
-        traceable in the test suite itself, not just in a comment."""
+        traceable in the test suite itself, not just in a comment.
+
+        The join-based escape below is a WINDOWS-only `pathlib` behavior:
+        `Path("D:/ws") / "C:evil"` replaces the base path outright only
+        under `WindowsPath`/`PureWindowsPath` semantics, where a leading
+        `"C:"` segment is a drive. On POSIX, `Path` is `PosixPath`, which
+        has no drive concept at all -- `"C:evil"` is an ordinary path
+        component there, so joining it EXTENDS the base path instead of
+        replacing it, and the escape this sanity check exists to confirm
+        simply does not reproduce on that platform. The product guard
+        itself is unconditional regardless (`path_safety.slug_is_safe`
+        evaluates `PureWindowsPath(slug).drive` on every OS -- see its
+        docstring), so the assertion below checks that directly first,
+        independent of platform; only the join-mechanics sanity check
+        after it is Windows-only.
+        """
+        assert slug_is_safe("C:evil") is False
+
+        if sys.platform != "win32":
+            pytest.skip(
+                "the Path.__truediv__ drive-replacement escape is Windows-only "
+                "pathlib behavior (WindowsPath/PureWindowsPath); on POSIX "
+                "'C:evil' is an ordinary path segment with no drive semantics, "
+                "so joining it does not escape the base path -- the product "
+                "guard itself is still verified above, unconditionally"
+            )
+
         from pathlib import Path
 
         joined = Path("D:/fake-workspace") / "docs" / "superhuman" / "C:evil" / "fleet"

@@ -1068,6 +1068,17 @@ class TestSubagentHookFaultInjectionMatrix:
         env.pop("CLAUDE_PROJECT_DIR", None)
         env["PATH"] = str(stub_dir) + os.pathsep + env.get("PATH", "")
 
+        # `start_new_session=True` (POSIX only) makes `proc.pid` the leader
+        # of a new process group, so the `os.killpg(proc.pid, ...)` cleanup
+        # below actually targets a group containing bash AND everything it
+        # spawned (the stub `python3`, and its `sleep 300`) rather than
+        # whatever ambient group this test process itself happens to be
+        # in. Windows has no process-group equivalent here; `taskkill /T`
+        # below already walks the real parent/child tree instead.
+        popen_kwargs: dict[str, object] = {}
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+
         proc = subprocess.Popen(
             [_BASH, str(_subagent_hook_script(skill_root))],
             stdin=subprocess.PIPE,
@@ -1078,6 +1089,7 @@ class TestSubagentHookFaultInjectionMatrix:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **popen_kwargs,
         )
         try:
             assert proc.stdin is not None
@@ -1113,7 +1125,17 @@ class TestSubagentHookFaultInjectionMatrix:
             else:
                 import signal as _signal
 
-                os.killpg(proc.pid, _signal.SIGKILL)
+                try:
+                    os.killpg(proc.pid, _signal.SIGKILL)
+                except ProcessLookupError:
+                    # The process group (bash and everything it spawned)
+                    # had already exited by the time we got here -- a race
+                    # between the bounded `proc.wait(timeout=3.0)` above
+                    # and this cleanup step, not a wrapper defect.
+                    # "Already gone" IS the success case for a kill: there
+                    # is nothing left to kill, so the property this test
+                    # exists for (nothing survives) already holds.
+                    pass
             proc.wait(timeout=10)
 
             if stub_pid:

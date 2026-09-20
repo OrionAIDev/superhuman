@@ -208,21 +208,29 @@ class TestModuleIsolation:
     """D3: `project_id.py` is a strictly separate module from
     `project.py`, and `project.py` stays unmodified by this chunk."""
 
-    #: Golden SHA-256 of `scripts/fleet/project.py` as of Chunk 3 (this
-    #: chunk must not modify it — D3). Regenerate ONLY if `project.py` is
-    #: deliberately changed by a later, unrelated chunk.
-    _PROJECT_PY_SHA256 = "b0e2d3af6aac54d09e49c7b51875028bfcbf99462b534a134982f2c68dc36556"
+    #: Golden SHA-256 of `scripts/fleet/project.py`'s newline-normalized
+    #: content (LF only) as of Chunk 3 (this chunk must not modify it — D3).
+    #: Hashed on normalized content, not raw bytes, so the guard means "this
+    #: file's CONTENT is unchanged" on both a CRLF checkout (Windows,
+    #: `core.autocrlf=true`) and an LF checkout (Linux CI) — raw bytes
+    #: differ between the two even when nothing about the file actually
+    #: changed. Regenerate ONLY if `project.py` is deliberately changed by a
+    #: later, unrelated chunk.
+    _PROJECT_PY_SHA256 = "eb67995e350432abf4cd324ff702fabe657c4eabed926edc6746700266f87f75"
 
     def test_project_py_is_unmodified(self) -> None:
         """Content-hash guard on `scripts/fleet/project.py`, matching the
         `TestCoreUntouched` idiom already used for `scripts/fleet/core/` —
-        a golden SHA-256 of the file, asserted unchanged."""
+        a golden SHA-256 of the file's newline-normalized content, asserted
+        unchanged."""
         project_py = _REPO_ROOT / "scripts" / "fleet" / "project.py"
-        actual = hashlib.sha256(project_py.read_bytes()).hexdigest()
+        normalized = project_py.read_bytes().replace(b"\r\n", b"\n")
+        actual = hashlib.sha256(normalized).hexdigest()
         assert actual == self._PROJECT_PY_SHA256, (
-            "scripts/fleet/project.py changed. D3 requires it stay byte-unchanged so "
-            "its 'never invents an id' read contract stays literally true; minting "
-            "and validation belong in scripts/fleet/project_id.py instead."
+            "scripts/fleet/project.py changed. D3 requires it stay byte-unchanged "
+            "(modulo line-ending normalization) so its 'never invents an id' read "
+            "contract stays literally true; minting and validation belong in "
+            "scripts/fleet/project_id.py instead."
         )
 
     #: Matches any import spelling that would pull in `project_id.py`:
