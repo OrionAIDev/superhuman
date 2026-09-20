@@ -370,6 +370,67 @@ class TestCheckRoleBlockRoleFileSizeAndTypeBound:
         result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
         assert result.verdict == Verdict.UNMARKED
 
+    def test_oversized_role_file_carries_a_distinct_accurate_reject_reason(
+        self, roles_dir: Path
+    ) -> None:
+        """TC-139 (Minor, correctness lens): a role file rejected for
+        size previously yielded a bare `UNMARKED` with no way for the
+        `PreToolUse` adapter to tell "this prompt never opened with role
+        content at all" apart from "this prompt DID open with the role
+        file's exact content, but the file itself was rejected before
+        ever being read" -- the adapter's generic UNMARKED deny reason
+        ("opens with neither the full, unedited content of an existing
+        role file ... nor the exact line ...") is FALSE in the second
+        case: the prompt's opening content matches the role file, it is
+        the file on disk that was refused. `RoleCheckResult` must expose
+        a distinct, accurate cause (naming the real reason and the file)
+        so the adapter can build a truthful reason instead -- the verdict
+        itself stays `UNMARKED`."""
+        role_file = roles_dir / "developer.md"
+        role_file.write_bytes(b"x" * (role_block._MAX_ROLE_FILE_BYTES + 1))
+
+        result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
+
+        assert result.verdict == Verdict.UNMARKED
+        assert result.role_file_reject_reason is not None, (
+            "an oversized role file must carry a distinct reject reason, not None "
+            "(the generic 'no role block matched' explanation is inaccurate here)"
+        )
+        assert result.role == "developer"
+        assert result.role_file == role_file
+
+    def test_non_regular_role_file_carries_a_distinct_accurate_reject_reason(
+        self, roles_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same defect, the non-regular-file variant (TC-139)."""
+        role_file = roles_dir / "developer.md"
+        real_stat = Path.stat
+
+        def _fifo_stat(self: Path, *args: object, **kwargs: object):  # noqa: ANN001
+            result = real_stat(self, *args, **kwargs)
+            if self.name == "developer.md":
+                fifo_mode = stat.S_IFIFO | stat.S_IMODE(result.st_mode)
+                return os.stat_result((fifo_mode,) + tuple(result)[1:])
+            return result
+
+        monkeypatch.setattr(Path, "stat", _fifo_stat)
+
+        result = check_role_block(_DEVELOPER_ROLE_CONTENT, roles_dir)
+
+        assert result.verdict == Verdict.UNMARKED
+        assert result.role_file_reject_reason is not None
+        assert result.role == "developer"
+        assert result.role_file == role_file
+
+    def test_ordinary_unmarked_prose_carries_no_reject_reason(self, roles_dir: Path) -> None:
+        """Regression guard: the ordinary UNMARKED path (a prose brief
+        that never matches any role block at all) must NOT carry a
+        `role_file_reject_reason` -- only the size/type-rejection path
+        does. Otherwise the adapter could not tell the two cases apart."""
+        result = check_role_block("just a plain prose brief, no role block here", roles_dir)
+        assert result.verdict == Verdict.UNMARKED
+        assert result.role_file_reject_reason is None
+
 
 class TestRecordRoleGateDecision:
     """Feeds TC-89: the six-field decision log, bounded tail, silent no-op

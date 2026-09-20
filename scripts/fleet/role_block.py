@@ -25,7 +25,11 @@ D7.9's own file list does not include it).
   body that follows is not verbatim.
 - ``UNMARKED`` — everything else: a prose brief, a prompt that only
   *mentions* `roles/` mid-body (TC-52's analogue), an unknown role name,
-  or a misspelt/non-leading non-role line.
+  or a misspelt/non-leading non-role line. Also covers a role-shaped
+  prompt whose named role file was rejected outright for size or type
+  (preflight item 4) — that variant carries a distinct
+  `RoleCheckResult.role_file_reject_reason` (plus `role`/`role_file`) so
+  a caller can build an accurate explanation instead of the generic one.
 
 A fifth, internal-only value, ``FAULT``, is never a verdict a real prompt
 earns — it means the check itself could not be trusted (an empty/unreadable
@@ -144,6 +148,28 @@ class RoleCheckResult:
         mismatch_line_number: the 1-based line number the two diverge at
             (`MISMATCH` only; `None` otherwise). Carries no content — this
             is the field safe to write to the decision log.
+        role_file_reject_reason: preflight item 4 (Minor, correctness
+            lens) — set only on the `UNMARKED` verdict produced by the
+            role-file size/type bound (`_MAX_ROLE_FILE_BYTES` /
+            `stat.S_ISREG`), `None` everywhere else, including the
+            ordinary "no role block matched" `UNMARKED` path. A role file
+            rejected for size or type is a DIFFERENT situation from an
+            ordinary unmarked prompt: the prompt's opening content may be
+            byte-identical to the role file, and the generic UNMARKED
+            deny reason ("opens with neither the full, unedited content
+            of an existing role file ... nor the exact line ...") is
+            FALSE in that case — the file was refused before ever being
+            compared. This field names the real cause (over the size
+            bound, or not a regular file) so the `PreToolUse` adapter
+            (`templates/hooks/claude-code/pre_tool_use_role_gate.py`,
+            `_build_deny_reason` — out of scope here) can build an
+            accurate reason instead of the generic one, by checking this
+            field before falling back to the generic UNMARKED text. `role`
+            and `role_file` are also set alongside it (unlike the ordinary
+            UNMARKED path, where both stay `None`) so the adapter can name
+            which file was rejected without re-deriving it. The verdict
+            itself stays `UNMARKED` either way — only the explanation
+            changes.
     """
 
     verdict: Verdict
@@ -152,6 +178,7 @@ class RoleCheckResult:
     prompt_mismatch_line: str | None = None
     file_mismatch_line: str | None = None
     mismatch_line_number: int | None = None
+    role_file_reject_reason: str | None = None
 
 
 def _normalize_newlines(text: str) -> str:
@@ -348,10 +375,30 @@ def check_role_block(prompt: str, roles_dir: Path) -> RoleCheckResult:
         except OSError:
             role_file_stat = None
         if role_file_stat is not None:
+            # Preflight item 4: this UNMARKED carries a distinct, accurate
+            # `role_file_reject_reason` (plus `role`/`role_file`) -- unlike
+            # the ordinary "no role block matched" UNMARKED path below,
+            # where all three stay `None`. The generic UNMARKED deny
+            # reason ("opens with neither ... nor ...") would be FALSE
+            # here: the prompt's opening content is never even compared
+            # against a rejected file.
             if not stat.S_ISREG(role_file_stat.st_mode):
-                return RoleCheckResult(verdict=Verdict.UNMARKED)
+                return RoleCheckResult(
+                    verdict=Verdict.UNMARKED,
+                    role=role_name,
+                    role_file=role_file,
+                    role_file_reject_reason="the role file exists but is not a regular file",
+                )
             if role_file_stat.st_size > _MAX_ROLE_FILE_BYTES:
-                return RoleCheckResult(verdict=Verdict.UNMARKED)
+                return RoleCheckResult(
+                    verdict=Verdict.UNMARKED,
+                    role=role_name,
+                    role_file=role_file,
+                    role_file_reject_reason=(
+                        f"the role file is {role_file_stat.st_size} bytes, over the "
+                        f"{_MAX_ROLE_FILE_BYTES}-byte bound"
+                    ),
+                )
         try:
             file_content = role_file.read_text(encoding="utf-8")
         except (OSError, ValueError):
