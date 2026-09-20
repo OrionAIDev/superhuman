@@ -27,7 +27,6 @@ if the journal write itself fails. (3) Never stdout, never a non-zero exit
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -67,6 +66,10 @@ _JOURNAL_FILENAME = "observe-failures.log"
 #: consuming repo to remember the manual step.
 _SELF_IGNORE_FILENAME = ".gitignore"
 _SELF_IGNORE_CONTENT = "*\n"
+
+#: The canonical manifest file. `_fleet_dir_already_ignored` asks git about
+#: this path rather than the directory holding it; see the comment there.
+_EVENTS_FILENAME = "events.jsonl"
 
 
 def _validate_slug(slug: str) -> None:
@@ -261,12 +264,26 @@ def _fleet_dir_already_ignored(workspace: Path, fleet_dir: Path, *, timeout: flo
         Callers must treat `None` the same as `True` (do nothing): writing
         a marker is only ever safe on a *confirmed* "not ignored" answer.
     """
-    # A trailing separator tells `git check-ignore` this pathspec names a
-    # directory even when `fleet_dir` does not exist yet — without it, a
-    # directory-only `.gitignore` pattern (as this repo's own `/docs/
-    # superhuman/` and a fixed consumer's `docs/superhuman/*/fleet/` both
-    # are) would not match a plain, existence-unverified path.
-    pathspec = f"{fleet_dir}{os.sep}"
+    # Ask about a FILE INSIDE the directory, never the directory itself.
+    # Both obvious spellings of "the directory" are wrong:
+    #
+    # - `fleet_dir` bare misses a directory-only pattern (this repo's own
+    #   `/docs/superhuman/`, a fixed consumer's `docs/superhuman/*/fleet/`)
+    #   whenever `fleet_dir` does not exist on disk yet — the first-run case,
+    #   and the one where writing into the carrier would do real damage.
+    # - `fleet_dir` with a trailing separator fixes that, but makes git
+    #   report ANY directory as ignored in a repo whose `.gitignore` has
+    #   CRLF line endings: a blank CRLF line parses as a lone-`\r` pattern,
+    #   which matches a trailing-separator pathspec. Not exotic on Windows —
+    #   it silently disabled this whole function in every such repo, with the
+    #   suite still green (found 2026-09-19 on git 2.55.0.windows.3).
+    #
+    # A child path is immune to both: a directory-only pattern matches it
+    # through its parent, and the `\r` pattern does not match it, whether or
+    # not anything exists on disk. `events.jsonl` is the canonical manifest
+    # file — exactly what this function exists to keep out of the consumer's
+    # repo, so it is the honest thing to ask about.
+    pathspec = str(fleet_dir / _EVENTS_FILENAME)
     try:
         proc = subprocess.run(
             ["git", "-C", str(workspace), "check-ignore", "-q", pathspec],
