@@ -16,7 +16,7 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
 1. Check whether the current project has `<project>/docs/superhuman/<slug>/SUPERHUMAN.md`.
    - **Does not exist** → start Phase 0. Read `phases/0-kickoff.md` and follow its steps.
    - **Exists** → check whether it represents a **valid superhuman session**:
-     - VALID iff it has a `## Decisions log` section AND that section contains at least one entry matching `G<digit>` with a `user decision:` field (e.g., `[<timestamp>] G2: REQUIREMENTS approved; user decision: approve`).
+     - VALID iff it has a `## Decisions log` section AND that section contains at least one entry matching `G<digit>` with a `user decision:` field (e.g., `[2026-09-20T14:07:31Z] G2: REQUIREMENTS approved; user decision: approve`).
      - VALID → resume. **Read the `## Resume packet` FIRST** — it is the single always-current entry point — then follow its pointers into `## Decisions locked` and `## Chunk log`/`## Decisions log` before reconstructing anything else. **If `## Resume packet` (and/or `## Decisions locked`) is absent, the handling is version-gated on `Superhuman-version:`, not unconditional** — see `## Resume packet and locked decisions` below for the full rule: below `1.1.0` (or undeclared), the file predates these sections, treat the absence as empty, never as corruption, and reconstruct context from `## Decisions log` and `## Chunk log` exactly as before these sections existed — resume proceeds without error. At `1.1.0` or above the sections were guaranteed to exist, so a missing one is unexpected — treat it as stale state and surface it via G6 (same three options as the INVALID path below) rather than silently falling back to the logs. Identify the highest-numbered gate logged with a `user decision:` field; the NEXT gate (and every gate after it) MUST still fire with HITL in this session. "Resume" means "pick up at the next gate", NOT "skip remaining gates because work appears done".
      - INVALID (file exists but lacks a structured Decisions log, or contains only unstructured notes) → treat as stale state. Surface to the user via G6 with three options: (a) archive-and-restart (run `scripts/cleanup-project.sh <project>` and start Phase 0 fresh), (b) treat-as-legacy-import (keep the existing files as reference, but still run all 8 gates in this session), (c) abandon (stop). DO NOT resume; DO NOT backfill artifacts as documentation.
    - **Also check for pre-existing implementation code outside the superhuman flow** (e.g., `src/`, `tests/`, `pyproject.toml` at project root with no corresponding `## Chunk log` entries in SUPERHUMAN.md). If found, treat as a drift event (G6) regardless of SUPERHUMAN.md validity. Same three options as above.
@@ -266,6 +266,19 @@ Format rules (all Type A gates):
 3. Artifacts by path, not paste (token-efficiency).
 4. Fixed preamble: header → briefing → 3-5 bullets → artifact path → decision prompt. Use cached templates from `templates/gate-headers.md`. The briefing says, for a stakeholder who hasn't seen this project recently, what the project is, what is being decided and why it matters now; it is presentation only and is never copied into the SUPERHUMAN.md decisions log.
 5. Append gate + timestamp + decision to SUPERHUMAN.md.
+   The timestamp is ISO-8601 UTC **to the second** — `[YYYY-MM-DDTHH:MM:SSZ]`, e.g.
+   `[2026-09-20T14:07:31Z] G5: chunk 3 results accepted; user decision: continue`. A date
+   alone is not enough: several gates routinely land on one day, and a date-only log cannot
+   say which gate the project is at.
+   Two entries appended from one exchange never share a timestamp: stamp the first from the
+   clock, and give each one after it the previous entry's timestamp plus one second. The
+   combined G0+G1 confirmation at HITL-L is the case this exists for — G0 takes the
+   exchange's time, G1 takes it plus a second — so the log's last gate reads unambiguously
+   as G1.
+   If two entries do share a timestamp — any record written before that rule — the higher
+   gate number is the later entry. "Which gate is this project at" is answered by the
+   highest-numbered gate carrying a `user decision:` field, never by the timestamp alone
+   (this is the same ordering the HARD-GATE resume step already uses).
 6. Never auto-proceed past Type A when a human is the one answering it. (At HITL-L, G6/G8/G9 are answered by the PM/surrogate itself, not skipped — see "HITL levels" above; every such answer is still logged to SUPERHUMAN.md exactly like a human decision would be.)
 7. G6 is unconditional at HITL-H/M — cadence mode does not silence it. At level 2 it always fires too, just resolved by the PM/surrogate rather than paused on.
 8. Archive, never delete: if a gate decision removes work, move affected files to `archive/<YYYY-MM-DD-HHMMSS>-<chunk>/` with `WHY.md` + `RESTORE.md` (using `templates/archive-WHY.md.tpl` and `templates/archive-RESTORE.md.tpl`).

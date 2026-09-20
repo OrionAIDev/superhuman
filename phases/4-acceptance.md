@@ -67,7 +67,8 @@ consulted: []
    - Alternative: "request additional changes" → loop back to Phase 3.
 
 5. **On sign-off:**
-   - Append `[<timestamp>] G8: signed off` to SUPERHUMAN.md decisions log.
+   - Append `[YYYY-MM-DDTHH:MM:SSZ] G8: signed off` to SUPERHUMAN.md decisions log — an
+     ISO-8601 UTC timestamp to the second, never a date alone (SKILL.md gate format rule 5).
    - Optionally invoke `references/finishing-a-development-branch/SKILL.md` for merge/PR/cleanup options.
    - **Emit the PROJECT COMPLETE terminator** as the very last thing PM says, on its own line, after the summary and any merge/PR output — so the user cannot mistake it for another routine update:
 

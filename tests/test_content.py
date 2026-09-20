@@ -1824,3 +1824,179 @@ def test_phase_recipes_name_the_briefing(skill_root: Path, phase_file: str) -> N
     assert "briefing" in text.lower(), (
         f"phases/{phase_file} describes a Type A gate and must name the briefing"
     )
+
+
+# --- C-TIME: gate-entry timestamps carry a time to the second ---
+
+#: Every guidance surface that either states the decisions-log entry format or
+#: shows a gate entry by example. Deliberately excludes `tests/fixtures/`,
+#: `tests/smoke/` and `CHANGELOG.md`: those hold *recorded* history, and the
+#: rule is going-forward only — no existing record is rewritten.
+_GATE_ENTRY_SURFACES = (
+    "templates/SUPERHUMAN.md.tpl",
+    "SKILL.md",
+    "roles/pm.md",
+    "roles/architect.md",
+    "roles/surrogate-user.md",
+    "phases/0-kickoff.md",
+    "phases/3-autonomous-loop.md",
+    "phases/4-acceptance.md",
+)
+
+#: A gate entry as written into `## Decisions log`: a bracketed timestamp
+#: immediately followed by `G<n>`. The capture is whatever sits in the
+#: brackets — a real timestamp, or a placeholder such as `<ISO timestamp>`.
+_GATE_ENTRY_RE = re.compile(r"\[([^\]\n]{1,40})\]\s*G\d")
+
+#: The one accepted shape: ISO-8601 UTC to the second. Both the literal
+#: placeholder (`YYYY-MM-DDTHH:MM:SSZ`, optionally angle-bracketed the way a
+#: fill-me-in slot is written) and a concrete example date satisfy it.
+_SECOND_PRECISION_RE = re.compile(
+    r"^(?:<?YYYY-MM-DDTHH:MM:SSZ>?|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$"
+)
+
+#: The Decisions-log heading line. The bare string `## Decisions log` also
+#: appears inline (backticked) in the Resume packet and in the
+#: Decisions-locked comment, so the surrounding newlines are what anchor it.
+_DECISIONS_LOG_HEADING = """
+## Decisions log
+"""
+
+_RESUME_PACKET_HEADING = """
+## Resume packet
+"""
+
+_DECISIONS_LOCKED_HEADING = """
+## Decisions locked
+"""
+
+
+def test_gate_entry_format_is_stated_to_the_second(skill_root: Path) -> None:
+    """The decisions-log format statement demands a time, not just a date.
+
+    A gate entry carries an ISO-8601 UTC timestamp to the second. The measured
+    failure this fixes is a project whose latest decisions-log timestamp holds
+    G0 through G8 at once, leaving a reader unable to say which gate the
+    project is at — and leaving "the furthest gate logged" as the only way out,
+    which is a guess.
+
+    The three places that *state* the format — the template comment a fresh
+    project copies, and gate format rule 5 in both SKILL.md and pm.md — must
+    each spell the shape out.
+    """
+    tpl = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    log_block = tpl.split(_DECISIONS_LOG_HEADING, 1)
+    assert len(log_block) == 2, "template missing '## Decisions log' section"
+    comment = log_block[1].split("-->", 1)[0]
+    assert "YYYY-MM-DDTHH:MM:SSZ" in comment, (
+        "the template's Decisions log format comment must give the timestamp shape "
+        "to the second, not a vague '<ISO timestamp>'"
+    )
+    assert "to the second" in comment, (
+        "the template's Decisions log comment must say the timestamp is to the second"
+    )
+
+    for rel in ("SKILL.md", "roles/pm.md"):
+        text = (skill_root / rel).read_text(encoding="utf-8")
+        assert "`[YYYY-MM-DDTHH:MM:SSZ]`" in text and "to the second" in text, (
+            f"{rel} gate format rule 5 must state the to-the-second timestamp shape"
+        )
+
+
+@pytest.mark.parametrize("rel", _GATE_ENTRY_SURFACES)
+def test_gate_entry_examples_carry_hhmmss(skill_root: Path, rel: str) -> None:
+    """No guidance surface shows a gate entry with a date-only timestamp.
+
+    A worked example is what actually gets copied, so an example that drops
+    the time reintroduces the defect the format statement just fixed. Scans
+    for `[<anything>] G<n>` and requires the bracketed part to be either the
+    literal `YYYY-MM-DDTHH:MM:SSZ` slot or a concrete second-precision UTC
+    timestamp.
+    """
+    text = (skill_root / rel).read_text(encoding="utf-8")
+    offenders = [
+        stamp
+        for stamp in _GATE_ENTRY_RE.findall(text)
+        if not _SECOND_PRECISION_RE.match(stamp.strip())
+    ]
+    assert not offenders, (
+        f"{rel} shows gate entries whose timestamp is not ISO-8601 UTC to the second: "
+        f"{offenders}. Use [YYYY-MM-DDTHH:MM:SSZ] (or a concrete example such as "
+        f"[2026-09-20T14:07:31Z])."
+    )
+
+
+#: Every surface that must state the no-shared-timestamp rule. The combined
+#: G0+G1 confirmation is the one site that appends two gate entries from a
+#: single exchange, so `phases/0-kickoff.md` has to carry it at the point of
+#: use as well as in the two statements of format rule 5.
+_MONOTONIC_SURFACES = (
+    "templates/SUPERHUMAN.md.tpl",
+    "SKILL.md",
+    "roles/pm.md",
+    "phases/0-kickoff.md",
+)
+
+
+@pytest.mark.parametrize("rel", _MONOTONIC_SURFACES)
+def test_two_entries_from_one_exchange_never_share_a_timestamp(
+    skill_root: Path, rel: str
+) -> None:
+    """Second precision alone does not order two entries written at once.
+
+    At HITL-L the PM appends a G0 and a G1 entry from a single combined
+    confirmation. Stamped from one clock read those tie, and a tie is the same
+    unreadable record the to-the-second rule exists to prevent — the log could
+    not say whether the project is at G0 or G1 without falling back to a guess.
+    The rule is monotonic: the first entry takes the clock, each one after it
+    takes the previous entry's timestamp plus one second.
+    """
+    text = (skill_root / rel).read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    assert "plus one second" in normalized or "one second later" in normalized, (
+        f"{rel} must say a second entry appended from the same exchange takes the "
+        f"previous entry's timestamp plus one second"
+    )
+    assert "never share a timestamp" in normalized or "never the same" in normalized, (
+        f"{rel} must say two entries from one exchange never share a timestamp"
+    )
+
+
+@pytest.mark.parametrize("rel", ("templates/SUPERHUMAN.md.tpl", "SKILL.md", "roles/pm.md"))
+def test_timestamp_tie_is_broken_by_the_higher_gate_number(
+    skill_root: Path, rel: str
+) -> None:
+    """A tied timestamp is read by gate number, never by the timestamp alone.
+
+    The monotonic rule stops new ties, but every record written before it can
+    still tie, and that is the record a reader actually has in hand. The
+    ordering is not new — the HARD-GATE resume step in SKILL.md already reads
+    the *highest-numbered* gate rather than the latest-stamped one — but it
+    was stated only as a resume procedure, so the record itself never said how
+    to read it. Both statements of gate format rule 5, and the template a
+    fresh project copies, now do.
+    """
+    text = (skill_root / rel).read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    assert "higher gate number is the later" in normalized, (
+        f"{rel} must state that a tied timestamp is broken by the higher gate number"
+    )
+    assert "never by the timestamp alone" in normalized, (
+        f"{rel} must say the gate a project is at is not read from the timestamp alone"
+    )
+
+
+def test_resume_packet_points_at_the_highest_numbered_gate(skill_root: Path) -> None:
+    """The Resume packet's current-state pointer says last *by what*.
+
+    It is the first line a resuming PM reads, and it used to point at "the last
+    gate entry" — last by line order, by timestamp, or by gate number, take
+    your pick. Under a tie those disagree.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    # Anchor on headings: both strings also appear backticked inside the packet.
+    packet = text.split(_RESUME_PACKET_HEADING, 1)[1].split(_DECISIONS_LOCKED_HEADING, 1)[0]
+    assert "highest-numbered gate entry" in packet, (
+        "the Resume packet's current-state pointer must name the highest-numbered gate "
+        "entry, not an unqualified 'last' one"
+    )

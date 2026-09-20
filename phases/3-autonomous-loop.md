@@ -106,7 +106,7 @@ When the loop exits (success or bound):
 5. **Hand off, level-dependent:**
    - **HITL-M (Medium):** hand off to the **human acceptance gate** in `phases/4-acceptance.md` unchanged. Acceptance is human-only — do NOT self-accept. This recipe's responsibility ends at producing the beta-tagged result plus summary and surrendering control to the acceptance phase.
    - **HITL-L (Low):** the PM self-accepts, per `phases/4-acceptance.md`'s level-2 branch — do not present G8 to a human.
-     - **Preflight GO (or all Blockers closed):** the PM composes the acceptance summary itself, appends `[<timestamp>] G8: signed off (autonomous, HITL-L); basis: Phase 3.3 GO + <precedent/rationale for any residual judgment call>` to the Decisions log, and emits the PROJECT COMPLETE terminator per `phases/4-acceptance.md` Step 5.
+     - **Preflight GO (or all Blockers closed):** the PM composes the acceptance summary itself, appends `[YYYY-MM-DDTHH:MM:SSZ] G8: signed off (autonomous, HITL-L); basis: Phase 3.3 GO + <precedent/rationale for any residual judgment call>` to the Decisions log, and emits the PROJECT COMPLETE terminator per `phases/4-acceptance.md` Step 5.
      - **Preflight NO-GO:** the PM attempts to fix the Blockers itself (re-dispatch Developer/Tester, re-run the relevant lens) — this is not an escalation, just another bounded attempt. If that resolves the NO-GO, proceed to the GO path above. If it doesn't — the PM genuinely cannot self-resolve it — escalate via **G10**, presenting the unresolved Blockers and what was tried. This is the only point in a level-2 run where acceptance pauses for a human.
 
 ## Invariants

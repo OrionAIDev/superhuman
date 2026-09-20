@@ -185,7 +185,8 @@ consulted: [business-expert]
        HITL-level: 2, and the GOAL.md summary) in a single `<dispatch:ask>` exchange. This is the
        one lightweight human checkpoint before the PM goes fully unattended except for G10. On
        approval, append **both** a G0 and a G1 entry to the Decisions log, timestamped from this
-       one exchange.
+       one exchange — G0 at the exchange's time and G1 one second later, never the same
+       timestamp, so the log's last gate reads unambiguously as G1 (gate format rule 5).
 
    **3.5 Seed commit (if git enabled).** If G1 selected git (local or remote), make an initial commit so subagents can query git state without errors: `git -C <project> add VISION.md SUPERHUMAN.md && git -C <project> commit -m "chore: project kickoff (VISION + SUPERHUMAN initialized)"`. No `-c user.*` overrides: the commit uses the identity resolved by the G1 git step in `roles/pm.md` (inherited, or set repo-local only where nothing resolved). If G1 chose remote, configure the remote before this commit, so identity routing keyed on the remote URL applies to it too.
 

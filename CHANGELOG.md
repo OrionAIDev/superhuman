@@ -21,6 +21,35 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Changed
 
+- **A gate entry's timestamp now carries a time to the second.** The decisions-log format was
+  `[<ISO timestamp>] G<n>: ...`, and in practice most projects wrote a date only — so a project
+  whose latest timestamp held G0 through G8 at once could not tell a reader which gate it was
+  actually at, and the only way to resolve it was the kind of guess superhuman forbids elsewhere.
+  The format is now stated concretely as `[YYYY-MM-DDTHH:MM:SSZ]` in the `SUPERHUMAN.md` template,
+  in gate format rule 5 (`SKILL.md` and `roles/pm.md`), and in every worked gate-entry example
+  across `phases/` and `roles/`. Documentation and format only: no gate's behaviour changes, and
+  **no existing record is rewritten** — the rule is going-forward only, and a date-only record
+  written before it stays exactly as it stands. For consistency the same concrete shape replaces
+  `[<ISO timestamp>]` in the template's other append-only log comments (drift notes, archive log,
+  recommendation overrides, retuning notes, decisions locked); the normative rule itself stays
+  scoped to gate entries.
+
+  A second precision alone does not order two entries written at once, so the same rule adds a
+  monotonic clause: two entries appended from one exchange never share a timestamp — the first
+  takes the clock, each one after it takes the previous entry's timestamp plus one second. The
+  combined G0+G1 confirmation at HITL-L (`phases/0-kickoff.md`) is the one site that appends
+  two gate entries from a single exchange, and it now says so at the point of use: G0 at the
+  exchange's time, G1 one second later.
+
+  And because every record written before those rules can still tie, the tie-break is now
+  stated on the record itself rather than only inside the resume procedure: the higher gate
+  number is the later entry, and "which gate is this project at" is answered by the
+  highest-numbered gate carrying a `user decision:` field, never by the timestamp alone. This
+  is not a new ordering — `SKILL.md`'s HARD-GATE resume step already read the highest-numbered
+  gate — but the template's Resume packet pointed at "the last gate entry", which under a tie
+  does not say last by what; it now names the highest-numbered one.
+
+  Pinned by seventeen new tests in `tests/test_content.py`.
 - **`docs/superhuman/` is now a mount point and this repo tracks nothing in it.** Per-project
   working docs (VISION / REQUIREMENTS / DESIGN / PLAN / TEST / SUPERHUMAN / DECISIONS) are
   versioned in a separate private repository, cloned into that path as a
