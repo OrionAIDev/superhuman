@@ -1,0 +1,20 @@
+{
+  "_comment": "Authoritative role -> dispatch-class policy (roadmap#275). Harness-neutral: names no model, vendor or harness. A dispatch class is a tier from the operator's profile.yaml models: block, optionally at that tier's raised effort ('<tier>+raised'). 'default' is what the PM dispatches; 'opt_in' classes are allowed only with a 'superhuman-tier-opt-in: <reason>' line in the task brief AND a SUPERHUMAN.md decisions-log entry. adaptation/dispatch.md renders this table for humans; tests/test_role_tiers.py keeps the two in sync. Keys under 'roles' are roles/<name>.md stems; keys under 'duties' are non-role dispatches (prompt opens with 'superhuman-dispatch: non-role').",
+  "schema_version": 1,
+  "dispatch_classes": ["most_capable", "most_capable+raised", "standard", "cheap"],
+  "roles": {
+    "pm":             {"default": "most_capable", "opt_in": ["most_capable+raised"]},
+    "architect":      {"default": "most_capable", "opt_in": ["most_capable+raised"]},
+    "developer":      {"default": "standard",     "opt_in": ["most_capable"]},
+    "qa":             {"default": "standard",     "opt_in": ["most_capable"]},
+    "business-expert":{"default": "standard",     "opt_in": ["most_capable"]},
+    "surrogate-user": {"default": "standard",     "opt_in": ["most_capable"]},
+    "tester":         {"default": "cheap",        "opt_in": ["standard"]}
+  },
+  "duties": {
+    "code-quality-review":  {"default": "most_capable",        "opt_in": ["most_capable+raised"]},
+    "security-review":      {"default": "most_capable+raised", "opt_in": []},
+    "docs-sync":            {"default": "cheap",               "opt_in": ["standard"]},
+    "convention-check":     {"default": "cheap",               "opt_in": ["standard"]}
+  }
+}

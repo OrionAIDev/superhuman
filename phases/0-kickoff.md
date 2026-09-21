@@ -109,6 +109,13 @@ consulted: [business-expert]
      `scripts/superhuman_profile.py`, tiers `most_capable` / `standard` / `cheap`):
      - **If all three tiers already have a real (non-`PROMPT_ME`) `primary` entry, skip this
        elicitation entirely** — nothing to ask, proceed to Present G0 (and G1) below.
+     - **roadmap#275 addendum to the skip condition above.** The primary-only check above is
+       necessary but no longer sufficient: also require every tier to have a real (non-`PROMPT_ME`)
+       **`effort`** — an *absent* `effort` key counts as unconfigured too, the same as an explicit
+       `PROMPT_ME` (see `scripts/superhuman_profile.py`'s `Profile.models` docstring) — AND require
+       the harness step added below, run against the *current* profile, to report nothing to do
+       (see that step's own "nothing to do" condition). Skip only when both this addendum and the
+       original bullet's condition hold; otherwise elicit, per the bullets below.
      - **Otherwise (profile/`models:` absent, or any tier still `PROMPT_ME`), elicit.** Ask via
        `<dispatch:ask>`, per tier `most_capable`, `standard`, `cheap`, a **primary** AND a
        **fallback** provider·model pair the operator wants used at that capability level. The
@@ -116,9 +123,25 @@ consulted: [business-expert]
        *the* answer. Illustrative examples are fine when clearly marked (e.g. "for example, a
        vendor's flagship reasoning model for `most_capable`, a fast/cheap tier model for `cheap`")
        — but the field itself must start blank, never defaulted to one provider.
+     - **roadmap#275 addendum: effort, and for `most_capable`, raised effort.** Alongside the
+       primary/fallback question above, for each tier also ask a **reasoning effort**: one of
+       `low | medium | high | xhigh | max | n/a` (`n/a` is a real answer for a model that ignores
+       effort — it is not a gap). Unlike model/vendor, effort is harness/provider-neutral
+       vocabulary this skill defines, so **suggest `medium`** as the default answer rather than
+       leaving the field cold — the operator can just confirm it. Additionally, for `most_capable`
+       only, ask a **raised effort** (one of `low | medium | high | xhigh | max`, no `n/a` — a
+       raised tier is always a real level) — this is what a role opting into `most_capable+raised`
+       (security review, or a PM/Architect/code-quality-review opt-in per `adaptation/dispatch.md`)
+       runs at. **Suggest `high`** as the default answer. `most_capable`'s raised effort is
+       optional — the operator may decline it, in which case any `+raised` dispatch class is
+       simply never generated (see the harness step added below) and a role opting into it
+       degrades to its default class with a C-DISP-style warning, per `adaptation/dispatch.md`.
      - **Decline/defer.** The operator may decline or defer any or all tiers (e.g. "not sure yet",
        "skip for now"). This must never block kickoff — proceed regardless of how many tiers were
        answered.
+     - **roadmap#275 addendum: per-field decline.** The decline/defer bullet above applies per
+       field, not only per whole tier — the operator may answer `primary`/`fallback` now and defer
+       `effort` (or vice versa); this still must never block kickoff.
      - **Resolve the interpreter by EXECUTING candidates, not by testing for their existence.**
        `command -v python` only checks that something named `python` is on `PATH` and marked
        executable — on Windows that can resolve to the Microsoft Store "app execution alias" stub,
@@ -194,6 +217,46 @@ consulted: [business-expert]
        unrecognized tier name exits non-zero with a `ProfileError` message, never a silent no-op or
        a traceback — treat a non-zero exit here as a kickoff blocker, same as any other failed
        `<dispatch:bash>` step.
+     - **roadmap#275 addendum: effort/raised_effort ride the same JSON object.** Each tier's
+       object in the heredoc above may also carry `"effort": "..."` and (for `most_capable` only)
+       `"raised_effort": "..."` alongside `primary`/`fallback` — e.g. `{"most_capable": {"primary":
+       "...", "fallback": "...", "effort": "...", "raised_effort": "..."}, "standard": {"primary":
+       "...", "effort": "..."}, "cheap": {"primary": "...", "effort": "n/a"}}`. Either field may be
+       omitted per-tier if the operator declined just that one (an answered tier that omits
+       `effort` is written with no `effort` key at all, not a placeholder — see
+       `write_models_block`'s docstring; only a wholly untouched/declined tier gets the explicit
+       `PROMPT_ME`, this time also covering `effort`).
+     - **roadmap#275 addendum — harness step: install/merge the resolved model+effort into the
+       running harness.** Config generation stays code (dev-principle #5), never hand-authored —
+       after `models set` above (or immediately, on the skip path), detect which harness this
+       session is running under:
+       - **`<dispatch:agent>` harness** (this session's `<dispatch:agent>` maps to `Agent` per
+         `adaptation/dispatch.md`'s harness table — the ordinary case for this skill): run
+         (e.g. `"${PY[@]}" scripts/superhuman_profile.py models install-agents --harness claude-code --profile "<profile-path>"`)
+         (`<dispatch:bash>`; `--agents-dir` defaults to (e.g.) `~/.claude/agents` and normally
+         does not need overriding). This renders one tier-agent
+         definition per dispatch class (`most_capable`, `most_capable+raised`, `standard`,
+         `cheap`) that `adaptation/dispatch.md`'s `<dispatch:agent>` mapping dispatches through —
+         see that file's "tier agent definitions" section. **"Nothing to do"** (the skip-condition's
+         third clause above): running this command is idempotent and a no-op report (no file
+         written, no warning) when every configured tier's rendered agent already matches what is
+         on disk — check via `models doctor` first if you want to avoid a redundant write, but
+         re-running it unconditionally is also safe.
+       - **Hermes delegation harness** (this session is running inside a Hermes
+         instance): run `"${PY[@]}" scripts/superhuman_profile.py models
+         install-agents --harness hermes --profile "<profile-path>" --hermes-config "<path to
+         this instance's config.yaml>"` (`<dispatch:bash>`). This merges the `standard` tier's
+         primary model + effort into `config.yaml`'s `delegation:` block, preserving every other
+         key — see `adaptation/dispatch.md`'s "Hermes — config-level fallback" section for why
+         only `standard` (the `most_capable` roles run in the orchestrator session itself, never
+         delegated).
+       - **OpenClaw**: nothing is installed here — `sessions_spawn` takes `model`/`thinking`
+         per call (`adaptation/dispatch.md`'s "OpenClaw — per-spawn model + thinking"), so the
+         resolved tier table in `~/.superhuman/profile.yaml` is read live at dispatch time; note
+         this in the elicitation summary so the operator isn't left wondering why nothing was
+         written.
+       - Treat a non-zero exit from either installer the same as a failed `models set` above — a
+         kickoff blocker, not a silent skip.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On

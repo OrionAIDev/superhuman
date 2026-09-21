@@ -159,21 +159,35 @@ The PM thread (the model you, the user, are talking to) must be a most-capable t
 ### Where the tier -> model mapping lives
 
 Tier → model is account-specific, so it belongs in your profile rather than in this skill. Each
-tier carries both a primary and a fallback alias (ADR-6); a legacy bare-string tier value still
-loads and is normalized to this shape at read time:
+tier carries a primary and a fallback alias (ADR-6), plus — since roadmap#275 — a reasoning
+**effort**, and `most_capable` optionally a **raised effort** for a role that opts into the
+`+raised` dispatch class (security review, or an explicit PM/Architect/code-quality-review
+opt-in). A legacy bare-string tier value, or one with no `effort:` line at all, still loads and is
+normalized fine — an absent `effort` is simply "unconfigured", the same as the placeholder below:
 
 ```yaml
 # ~/.superhuman/profile.yaml
 models:
-  most_capable: { primary: <your-most-capable-alias>, fallback: <your-fallback-alias> }
-  standard:     { primary: <your-standard-alias>,     fallback: <your-fallback-alias> }
-  cheap:        { primary: <your-cheap-alias>,         fallback: <your-fallback-alias> }
+  most_capable: { primary: <your-most-capable-alias>, fallback: <your-fallback-alias>,
+                   effort: medium, raised_effort: high }
+  standard:     { primary: <your-standard-alias>,     fallback: <your-fallback-alias>,
+                   effort: medium }
+  cheap:        { primary: <your-cheap-alias>,         fallback: <your-fallback-alias>,
+                   effort: n/a }
 ```
 
-On first run, kickoff (G1) elicits these per-tier primary/fallback aliases and writes this block
-for you; declining leaves a neutral `PROMPT_ME` placeholder rather than assuming a provider — see
-"Set up a deployment profile" and `phases/0-kickoff.md`. `adaptation/dispatch.md` supplies a
-per-harness default when the profile declares none.
+`effort` is one of `low | medium | high | xhigh | max | n/a` — `n/a` is a real answer for a model
+that ignores reasoning effort, not a gap. `raised_effort` (no `n/a`) is optional and only ever
+consulted for a `+raised` dispatch.
+
+On first run, kickoff (G1) elicits these per-tier primary/fallback/effort aliases and writes this
+block for you; declining leaves a neutral `PROMPT_ME` placeholder rather than assuming a provider
+or effort — see "Set up a deployment profile" and `phases/0-kickoff.md`. That same kickoff step
+then runs `scripts/superhuman_profile.py models install-agents` to push the resolved model+effort
+into your harness (a generated Claude Code tier-agent per dispatch class, or a merged Hermes
+`delegation:` block) — see `adaptation/dispatch.md`'s "Model-tier selection" for the full
+model+effort resolution chain. `adaptation/dispatch.md` supplies a per-harness default when the
+profile declares none.
 
 **Acceptable** for the PM thread: any alias resolving to a current top-tier model, any provider.
 

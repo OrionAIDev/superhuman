@@ -121,6 +121,14 @@ class Verdict(str, Enum):
 
     A `str` subclass so `verdict.value` (used in JSON output/logging) and
     plain equality against a literal string both work without ceremony.
+
+    `TIER_DENY` (roadmap#275) is never produced by `check_role_block` — it
+    is the `templates/hooks/claude-code/pre_tool_use_role_gate.py` adapter's
+    own value, logged via `record_role_gate_decision` when a ROLE or
+    NON_ROLE dispatch that this module itself cleared is denied instead for
+    using a `subagent_type`/`model` the role-tier policy
+    (`scripts/fleet/role_tiers.py`) does not allow. Listed here, not on a
+    second enum, so the one decision log keeps one verdict vocabulary.
     """
 
     ROLE = "ROLE"
@@ -128,6 +136,7 @@ class Verdict(str, Enum):
     MISMATCH = "MISMATCH"
     UNMARKED = "UNMARKED"
     FAULT = "FAULT"
+    TIER_DENY = "TIER_DENY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,7 +503,12 @@ def record_role_gate_decision(
 
     Never called for `Verdict.ROLE` (chunk 7's own dispatch-registration
     row already counts it — D7.7: "a role dispatch in the correct form is
-    not logged here") or `Verdict.FAULT` (a fault is never a decision).
+    not logged here") or `Verdict.FAULT` (a fault is never a decision), by
+    `check_role_block`'s own callers. `pre_tool_use_role_gate.py` is the one
+    exception: it calls this with `Verdict.TIER_DENY` for a ROLE or
+    NON_ROLE dispatch it denies for a role-tier policy violation (roadmap
+    #275) — a distinct decision from anything `check_role_block` itself
+    can produce, so it is logged too, under its own verdict value.
     Writes nothing when fleet observation is disabled/unconfigured for
     `workspace` (mirrors `observe.journal_early_cli_failure`'s zero-I/O
     guarantee for a disabled workspace) and never carries prompt or
@@ -512,10 +526,12 @@ def record_role_gate_decision(
         workspace: the project's working tree root.
         slug: the superhuman project slug.
         session_id: the harness session id, or `None` if unavailable.
-        verdict: `Verdict.NON_ROLE`, `Verdict.MISMATCH`, or
-            `Verdict.UNMARKED` — the three verdicts D7.7 logs.
-        role: the frontmatter-claimed role name, if any (`MISMATCH` only;
-            `None` for `NON_ROLE`/`UNMARKED`).
+        verdict: `Verdict.NON_ROLE`, `Verdict.MISMATCH`, `Verdict.UNMARKED`,
+            or (roadmap#275, `pre_tool_use_role_gate.py` only) `Verdict.TIER_DENY`.
+        role: the frontmatter-claimed role name, if any (`MISMATCH` always;
+            `TIER_DENY` when the denied dispatch was role-shaped; `None`
+            for `NON_ROLE`/`UNMARKED` and for a `TIER_DENY` on a non-role
+            dispatch).
         subagent_type: the payload's dispatch-tool `subagent_type` field, if any.
         mismatch_line_number: the prompt's first differing line's 1-based
             line number (`MISMATCH` only) — never the line's own content,

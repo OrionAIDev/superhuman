@@ -128,23 +128,49 @@ def _role_gate_log_text(workspace: Path, slug: str) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
+#: roadmap#275: the tier agent for `roles/developer.md`'s default class
+#: (`adaptation/role-tiers.json`'s `roles.developer.default` is `standard`;
+#: `templates/agents/claude-code/tier-agents.json` maps `standard` to this
+#: name). Used as `_pre_tool_use_payload`'s default `subagent_type` because
+#: every fixture in this file that relies on that default also dispatches
+#: `roles/developer.md`'s content (`_developer_role_content`) or a
+#: non-role/UNMARKED/MISMATCH prompt, for which any tier agent name is
+#: equally tier-compliant (see `_non_role_tier_violation` in the adapter).
+#: Formerly the literal string `"developer"` — never a valid `subagent_type`
+#: at all once the role-tier gate (roadmap#275) started enforcing tier
+#: agent names, which is why every test relying on this default is now
+#: updated to a name the gate actually allows.
+_DEFAULT_TEST_SUBAGENT_TYPE = "superhuman-tier-standard-subagent"
+
+#: The tier agent for `roles/pm.md`'s default class (`most_capable`).
+_PM_TEST_SUBAGENT_TYPE = "superhuman-tier-most-capable-subagent"
+
+
 def _pre_tool_use_payload(
     *,
     prompt: str,
     cwd: Path | str,
-    subagent_type: str = "developer",
+    subagent_type: str | None = _DEFAULT_TEST_SUBAGENT_TYPE,
+    model: str | None = None,
     tool_name: str = "Agent",
     session_id: str = "role-gate-session",
     scratchpad_dir: Path | str | None = None,
     agent_id: str | None = None,
 ) -> dict:
+    tool_input: dict = {"subagent_type": subagent_type, "prompt": prompt}
+    if model is not None:
+        # roadmap#275: the tier gate's own violation, not something any
+        # pre-existing fixture ever needed -- `model` is left out of
+        # `tool_input` entirely unless a test explicitly asks for it, so
+        # every prior test's payload shape is unchanged.
+        tool_input["model"] = model
     payload: dict = {
         "session_id": session_id,
         "cwd": str(cwd),
         "hook_event_name": "PreToolUse",
         "tool_name": tool_name,
         "tool_use_id": "toolu_test",
-        "tool_input": {"subagent_type": subagent_type, "prompt": prompt},
+        "tool_input": tool_input,
     }
     if scratchpad_dir is not None:
         payload["scratchpad_dir"] = str(scratchpad_dir)
@@ -741,7 +767,7 @@ class TestRoleGateSecondRolesDirCheck:
         (different `git-common-dir`), so the primary MISMATCH stands."""
         workspace, slug, profile = session_checkout_project
         payload = _pre_tool_use_payload(
-            prompt=_SESSION_PM_CONTENT, cwd=workspace, subagent_type="pm"
+            prompt=_SESSION_PM_CONTENT, cwd=workspace, subagent_type=_PM_TEST_SUBAGENT_TYPE
         )
         result = _run_role_gate_hook(
             skill_root=skill_root,
@@ -775,7 +801,7 @@ class TestRoleGateSecondRolesDirCheck:
         change from this test's pre-amendment assertion."""
         workspace, slug, profile = session_checkout_project
         edited = _SESSION_PM_CONTENT.replace("tier: standard", "tier: cheap", 1)
-        payload = _pre_tool_use_payload(prompt=edited, cwd=workspace, subagent_type="pm")
+        payload = _pre_tool_use_payload(prompt=edited, cwd=workspace, subagent_type=_PM_TEST_SUBAGENT_TYPE)
         result = _run_role_gate_hook(
             skill_root=skill_root,
             stdin_text=json.dumps(payload),
@@ -829,7 +855,7 @@ class TestRoleGateSecondRolesDirCheck:
         _write_project(git_repo, slug)
 
         payload = _pre_tool_use_payload(
-            prompt=_SESSION_PM_CONTENT, cwd=git_repo, subagent_type="pm"
+            prompt=_SESSION_PM_CONTENT, cwd=git_repo, subagent_type=_PM_TEST_SUBAGENT_TYPE
         )
         result = _run_role_gate_hook(
             skill_root=skill_root,
@@ -937,7 +963,7 @@ class TestRoleGateSecondCheckSkippedWhenSameDirectory:
         _write_session_superhuman_checkout(git_repo, slug=slug)
 
         edited = _SESSION_PM_CONTENT.replace("tier: standard", "tier: cheap", 1)
-        payload = _pre_tool_use_payload(prompt=edited, cwd=git_repo, subagent_type="pm")
+        payload = _pre_tool_use_payload(prompt=edited, cwd=git_repo, subagent_type=_PM_TEST_SUBAGENT_TYPE)
 
         # `--roles-dir` points at the WORKSPACE's own roles/ -- identical
         # to `workspace/roles` (the would-be session_roles_dir), so
@@ -1098,7 +1124,7 @@ class TestRoleGateSecondRolesDirCheckSameRepository:
         (worktree_dir / "roles" / "pm.md").write_text(session_pm, encoding="utf-8")
 
         project_dir = worktree_dir / "docs" / "superhuman" / slug
-        payload = _pre_tool_use_payload(prompt=session_pm, cwd=project_dir, subagent_type="pm")
+        payload = _pre_tool_use_payload(prompt=session_pm, cwd=project_dir, subagent_type=_PM_TEST_SUBAGENT_TYPE)
         profile = tmp_path / "profile-legit.yaml"
         _write_profile(profile)
 
@@ -1481,7 +1507,7 @@ class TestRoleGateUTF8StdinDecoding:
             "hook_event_name": "PreToolUse",
             "tool_name": "Agent",
             "tool_use_id": "toolu_utf8_regression",
-            "tool_input": {"subagent_type": "developer", "prompt": prompt},
+            "tool_input": {"subagent_type": _DEFAULT_TEST_SUBAGENT_TYPE, "prompt": prompt},
         }
         # `ensure_ascii=False`: a real harness (e.g. Node's `JSON.stringify`)
         # emits non-ASCII characters as literal UTF-8 bytes, never `\uXXXX`
@@ -1849,3 +1875,369 @@ class TestRoleGateAdapterNamesRejectedRoleFileCause:
         assert "tier: cheap" in reason
         assert "tier: standard" in reason
         assert "opens with neither" not in reason
+
+
+# --- roadmap#275: role-tier policy enforcement ------------------------------------------
+
+
+@pytest.mark.skipif(
+    _BASH is None, reason="bash not available on this runner (Windows: Git Bash not found)"
+)
+class TestRoleGateTierEnforcement:
+    """roadmap#275, adaptation/dispatch.md "Claude Code -- tier agent
+    definitions" (enforcement bullet). A ROLE/NON_ROLE verdict that
+    check_role_block itself clears is a necessary but no longer a
+    sufficient condition for a pass: run() also checks subagent_type/model
+    against adaptation/role-tiers.json and
+    templates/agents/claude-code/tier-agents.json (this checkout's real
+    files -- both loaded from the skill root, independent of --roles-dir)."""
+
+    def _developer_prompt_with_opt_in(self, skill_root: Path, reason: str) -> str:
+        """roles/developer.md's real content, with a superhuman-tier-opt-in
+        line and a task brief appended -- still a ROLE verdict (D7.3: a
+        verbatim role block followed by a newline and more text is still a
+        match; only the leading block must be byte-identical)."""
+        role_content = _developer_role_content(skill_root)
+        return f"{role_content}\nsuperhuman-tier-opt-in: {reason}\n\nDo the task.\n"
+
+    def _developer_prompt_with_brief(self, skill_root: Path) -> str:
+        role_content = _developer_role_content(skill_root)
+        return f"{role_content}\nDo the task.\n"
+
+    # --- ROLE verdict: default class ----------------------------------------------------
+
+    def test_role_dispatch_at_its_default_tier_agent_is_allowed(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """developer's default class is standard -- dispatching at
+        superhuman-tier-standard-subagent (this file's own
+        _DEFAULT_TEST_SUBAGENT_TYPE) must give empty stdout."""
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt=self._developer_prompt_with_brief(skill_root), cwd=workspace
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert _role_gate_log_text(workspace, slug) == ""
+
+    # --- ROLE verdict: opt-in tier -------------------------------------------------------
+
+    def test_role_dispatch_at_an_opt_in_tier_with_a_reason_is_allowed(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """developer's opt_in list includes most_capable
+        (superhuman-tier-most-capable-subagent) -- allowed when the task
+        brief carries a superhuman-tier-opt-in: <reason> line."""
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt=self._developer_prompt_with_opt_in(skill_root, "needs deep debugging"),
+            cwd=workspace,
+            subagent_type="superhuman-tier-most-capable-subagent",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert _role_gate_log_text(workspace, slug) == ""
+
+    def test_role_dispatch_at_an_opt_in_tier_without_a_reason_denies(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt=self._developer_prompt_with_brief(skill_root),
+            cwd=workspace,
+            subagent_type="superhuman-tier-most-capable-subagent",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0, (
+            f"hook exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "developer" in reason
+        assert "superhuman-tier-opt-in" in reason
+        assert "superhuman-tier-standard-subagent" in reason  # the default, named as an option
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "TIER_DENY"' in log
+        assert '"role": "developer"' in log
+
+    # --- ROLE verdict: model= override ----------------------------------------------------
+
+    def test_role_dispatch_with_model_param_denies(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """model= on a role dispatch would silently override the tier
+        agent's own pin -- denied even though subagent_type itself names a
+        valid, default tier agent for this role."""
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt=self._developer_prompt_with_brief(skill_root),
+            cwd=workspace,
+            model="claude-opus-4",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "model=" in reason
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "TIER_DENY"' in log
+
+    # --- ROLE verdict: unknown subagent_type ----------------------------------------------
+
+    def test_role_dispatch_with_unknown_subagent_type_denies(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt=self._developer_prompt_with_brief(skill_root),
+            cwd=workspace,
+            subagent_type="general-purpose",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "general-purpose" in reason
+        assert "superhuman-tier-standard-subagent" in reason
+        assert "install-agents" in reason
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "TIER_DENY"' in log
+
+    # --- NON_ROLE verdict ------------------------------------------------------------------
+
+    def test_non_role_dispatch_at_any_tier_agent_is_allowed(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """A non-role duty is not tied to one role's allowed classes --
+        cheap's tier agent, though never a developer class, is fine."""
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt="superhuman-dispatch: non-role\n\nResearch.\n",
+            cwd=workspace,
+            subagent_type="superhuman-tier-cheap-subagent",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "NON_ROLE"' in log
+
+    def test_non_role_dispatch_with_explicit_model_is_allowed(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        """The documented alternative for a built-in subagent_type
+        (Explore, general-purpose) on a non-role duty: pass model=."""
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt="superhuman-dispatch: non-role\n\nResearch.\n",
+            cwd=workspace,
+            subagent_type="Explore",
+            model="claude-sonnet-4",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "NON_ROLE"' in log
+
+    def test_non_role_dispatch_with_neither_tier_agent_nor_model_denies(
+        self, skill_root: Path, enabled_project: tuple[Path, str, Path]
+    ) -> None:
+        workspace, slug, profile = enabled_project
+        payload = _pre_tool_use_payload(
+            prompt="superhuman-dispatch: non-role\n\nResearch.\n",
+            cwd=workspace,
+            subagent_type="Explore",
+        )
+        result = _run_role_gate_hook(
+            skill_root=skill_root, stdin_text=json.dumps(payload), cwd=workspace, profile_path=profile
+        )
+        assert result.returncode == 0
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "non-role dispatch" in reason
+        assert "Explore" in reason
+        log = _role_gate_log_text(workspace, slug)
+        assert '"verdict": "TIER_DENY"' in log
+        assert '"role": null' in log
+
+    # --- fail-soft: role missing from the policy --------------------------------------------
+
+    def test_role_with_no_policy_row_is_allowed_fail_soft(
+        self, skill_root: Path, tmp_path: Path
+    ) -> None:
+        """A role file with no adaptation/role-tiers.json row (a new role
+        added before the policy is updated for it) is not enforced against
+        -- D7.5-style fail-soft. This dispatch is compliant (no tier
+        violation) so it never needs to resolve scope at all; cwd is
+        deliberately an unresolvable directory to prove that."""
+        roles_dir = tmp_path / "roles"
+        roles_dir.mkdir()
+        scout_content = "---\nname: scout\ntier: n/a\n---\n\n# Scout role (not in policy)\n"
+        (roles_dir / "scout.md").write_text(scout_content, encoding="utf-8")
+
+        module = _load_adapter_module(skill_root)
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            module.run(
+                raw_payload=json.dumps(
+                    _pre_tool_use_payload(
+                        prompt=scout_content,
+                        cwd=tmp_path / "not-a-project",
+                        subagent_type="literally-anything",
+                    )
+                ),
+                roles_dir=roles_dir,
+                anchor=None,
+            )
+        assert buf.getvalue() == ""
+
+    # --- fail-soft: malformed policy / class-map files --------------------------------------
+
+    def test_malformed_policy_file_fails_soft_and_allows(
+        self, skill_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unreadable/malformed adaptation/role-tiers.json must never
+        turn into a false deny (NFR-9) -- the tier check is skipped
+        entirely, not just for this one role."""
+        module = _load_adapter_module(skill_root)
+        bad_policy = tmp_path / "bad-role-tiers.json"
+        bad_policy.write_text("{not valid json", encoding="utf-8")
+        monkeypatch.setattr(module, "_TIER_POLICY_PATH", bad_policy)
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            module.run(
+                raw_payload=json.dumps(
+                    _pre_tool_use_payload(
+                        prompt=self._developer_prompt_with_brief(skill_root),
+                        cwd=tmp_path / "not-a-project",
+                        subagent_type="this-is-not-a-real-tier-agent",
+                    )
+                ),
+                roles_dir=skill_root / "roles",
+                anchor=None,
+            )
+        assert buf.getvalue() == "", (
+            "a malformed policy file must fail soft (no deny), not deny every role dispatch"
+        )
+
+    def test_malformed_class_map_file_fails_soft_and_allows(
+        self, skill_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = _load_adapter_module(skill_root)
+        bad_class_map = tmp_path / "bad-tier-agents.json"
+        bad_class_map.write_text("[]", encoding="utf-8")  # not an object
+        monkeypatch.setattr(module, "_TIER_CLASS_MAP_PATH", bad_class_map)
+
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            module.run(
+                raw_payload=json.dumps(
+                    _pre_tool_use_payload(
+                        prompt=self._developer_prompt_with_brief(skill_root),
+                        cwd=tmp_path / "not-a-project",
+                        subagent_type="this-is-not-a-real-tier-agent",
+                    )
+                ),
+                roles_dir=skill_root / "roles",
+                anchor=None,
+            )
+        assert buf.getvalue() == "", (
+            "a malformed class-map file must fail soft (no deny), not deny every role dispatch"
+        )
+
+    # --- widened path still enforces the tier policy ----------------------------------------
+
+    def test_widened_role_pass_with_wrong_subagent_type_still_denies(
+        self, skill_root: Path, tmp_path: Path, worktree_builder
+    ) -> None:
+        """The G6/B4 widen (a MISMATCH against the hook's own roles/pm.md
+        turned into a pass against a legitimate linked worktree's own
+        copy) must still enforce the tier policy on the WIDENED verdict --
+        reusing TestRoleGateSecondRolesDirCheckSameRepository's own
+        fixtures/shape, but with an out-of-policy subagent_type."""
+        hook_repo = tmp_path / "hook-repo-tier"
+        hook_repo.mkdir()
+        slug = "tier-widen-worktree"
+        hook_pm = "---\nname: pm\ntier: standard\n---\n\n# PM (hook checkout copy)\n"
+        _init_superhuman_shaped_repo(hook_repo, pm_content=hook_pm, slug=slug)
+
+        worktree_dir = worktree_builder(hook_repo)
+        session_pm = hook_pm.replace("tier: standard", "tier: cheap", 1)
+        (worktree_dir / "roles" / "pm.md").write_text(session_pm, encoding="utf-8")
+
+        project_dir = worktree_dir / "docs" / "superhuman" / slug
+        # pm's allowed tier agents are most_capable/most_capable+raised --
+        # this uses the CHEAP tier agent, which is not one of them.
+        payload = _pre_tool_use_payload(
+            prompt=session_pm, cwd=project_dir, subagent_type="superhuman-tier-cheap-subagent"
+        )
+        profile = tmp_path / "profile-tier-widen.yaml"
+        _write_profile(profile)
+
+        env = os.environ.copy()
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["SUPERHUMAN_PROFILE"] = str(profile)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_adapter_script(skill_root)),
+                "--hook-payload",
+                "-",
+                "--roles-dir",
+                str(hook_repo / "roles"),
+            ],
+            input=json.dumps(payload),
+            cwd=str(project_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        assert result.returncode == 0, (
+            f"adapter exited {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert result.stdout != "", (
+            "a widened ROLE pass with an out-of-policy subagent_type must still be denied "
+            "by the tier check, not treated as an unconditional pass"
+        )
+        decision = json.loads(result.stdout)
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "pm" in reason
+        assert "superhuman-tier-cheap-subagent" in reason
+        log = _role_gate_log_text(worktree_dir, slug)
+        assert '"verdict": "TIER_DENY"' in log

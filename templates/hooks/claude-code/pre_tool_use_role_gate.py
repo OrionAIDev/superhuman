@@ -33,6 +33,30 @@ project. **The locator is called ONLY when the verdict could deny or is
 dispatch, and a `FAULT` verdict, never pay for it and never reach the
 locator.
 
+**Role-tier enforcement (roadmap#275).** A `ROLE` or `NON_ROLE` verdict that
+`check_role_block` itself clears is a NECESSARY but no longer a SUFFICIENT
+condition for a pass: `run` also checks the dispatch's `subagent_type`/
+`model` against `adaptation/role-tiers.json` (via `scripts/fleet/
+role_tiers.py`) and this harness's own dispatch-class map
+(`templates/agents/claude-code/tier-agents.json`), both always read from
+THIS skill checkout's own files, independent of `--roles-dir` (see
+`adaptation/dispatch.md` "Claude Code — tier agent definitions", the
+"Enforced" bullet). This check is evaluated BEFORE the locator runs for a
+`ROLE` verdict, so a compliant `ROLE` dispatch still never pays for the
+locator (D7.9's latency guarantee, above, is preserved); a tier VIOLATION,
+like a `NON_ROLE`/`MISMATCH`/`UNMARKED` deny, needs the locator for scope
+before it can print anything. A role with no `adaptation/role-tiers.json`
+row, or an unreadable/malformed policy or class-map file, fails SOFT (no
+deny) — this is enforcement layered on top of a discipline aid, not a
+second security control, and NFR-9 applies to it identically. The widened
+second-check path (a `MISMATCH`/`UNMARKED` primary verdict turned into a
+`ROLE`/`NON_ROLE` pass against the session's own `roles/`) applies this
+identical tier check to the WIDENED verdict before treating it as a pass —
+otherwise the widen path would be a second, unenforced way to dispatch
+outside the tier policy. Denials from this check are logged via
+`record_role_gate_decision` under `Verdict.TIER_DENY` (role_block.py),
+distinct from the four/five verdicts `check_role_block` itself produces.
+
 **This is a discipline aid, not a security control (G6, 2026-09-20T03:30Z
 — supersedes any earlier text in this module, including below, that reads
 as claiming a check here resists a deliberate bypass).** In normal
@@ -157,8 +181,25 @@ from scripts.fleet.role_block import (  # noqa: E402
     check_role_block,
     record_role_gate_decision,
 )
+from scripts.fleet.role_tiers import (  # noqa: E402
+    DISPATCH_CLASSES,
+    RoleTierError,
+    RoleTierPolicy,
+    has_opt_in_reason,
+    load_harness_class_map,
+    load_policy,
+)
 
 _DISPATCH_TOOL_NAMES = ("Agent", "Task")
+
+#: roadmap#275 — the harness-neutral policy and this harness's dispatch-class
+#: -> `subagent_type` map, both always read from THIS skill checkout's own
+#: files (never from `--roles-dir`, which names only the ROLE-BLOCK text to
+#: compare a prompt against, and may legitimately point at a worktree on
+#: another branch — the tier policy is a property of the installed hook,
+#: not of whichever workspace a dispatch happens to target).
+_TIER_POLICY_PATH = _SKILL_ROOT / "adaptation" / "role-tiers.json"
+_TIER_CLASS_MAP_PATH = _SKILL_ROOT / "templates" / "agents" / "claude-code" / "tier-agents.json"
 
 #: Verdicts for which the locator is even considered (D7.9's latency note;
 #: TC-84's spy). `ROLE` and `FAULT` never reach this set.
@@ -445,6 +486,144 @@ def _same_repository(first: Path, second: Path) -> bool:
     return first_common == second_common
 
 
+def _load_tier_policy() -> tuple[RoleTierPolicy | None, dict[str, str] | None]:
+    """Load the role-tier policy and this harness's dispatch-class map, fail-soft.
+
+    roadmap#275. Never raises (NFR-9): an unreadable or malformed
+    `adaptation/role-tiers.json` or `templates/agents/claude-code/
+    tier-agents.json` (`RoleTierError`), or any other unexpected exception
+    while loading either, degrades to `(None, None)` — every caller below
+    treats that as "skip the tier check for this dispatch," matching D7.5's
+    fail-soft posture for this gate's own machinery faulting.
+
+    Returns:
+        tuple[RoleTierPolicy | None, dict[str, str] | None]: the parsed
+        policy and class map, or `(None, None)` on any failure.
+    """
+    try:
+        policy = load_policy(_TIER_POLICY_PATH)
+        class_map = load_harness_class_map(_TIER_CLASS_MAP_PATH)
+    except RoleTierError:
+        return None, None
+    except Exception:  # noqa: BLE001 - fail-soft, NFR-9
+        return None, None
+    return policy, class_map
+
+
+_TIER_INSTALL_HINT = (
+    "If the tier agents are not installed, run `python "
+    "scripts/superhuman_profile.py models install-agents --harness claude-code`."
+)
+
+
+def _build_tier_deny_reason(
+    *, role: str | None, subagent_type: str | None, allowed_agents: tuple[str, ...]
+) -> str:
+    """Build the `permissionDecisionReason` text for a role-tier policy violation.
+
+    roadmap#275. Covers all three violation shapes (unknown `subagent_type`,
+    a `model=` override, a missing opt-in reason) with one unconditional
+    message — plain and actionable regardless of which shape triggered it.
+
+    Args:
+        role: the frontmatter-claimed role, or `None` for a non-role dispatch.
+        subagent_type: the `subagent_type` the dispatch actually used.
+        allowed_agents: the role's (or, for a non-role dispatch, every)
+            allowed tier-agent `subagent_type` values, default first.
+
+    Returns:
+        str: a one-paragraph human-readable reason.
+    """
+    who = f"the {role!r} role" if role is not None else "this non-role dispatch"
+    used = subagent_type if subagent_type else "none"
+    allowed_list = ", ".join(allowed_agents)
+    return (
+        f"This dispatch is for {who} but uses subagent_type={used!r}, which is not "
+        f"one of its allowed tier agents: {allowed_list} (default first). Drop "
+        "`model=` -- the tier agent pins the model itself, and passing `model=` would "
+        "silently override that pin. To use an opt-in tier, add a "
+        "`superhuman-tier-opt-in: <reason>` line to the task brief and log it in "
+        f"SUPERHUMAN.md's decisions log. {_TIER_INSTALL_HINT}"
+    )
+
+
+def _role_tier_violation(
+    *,
+    role: str,
+    subagent_type: str | None,
+    model: Any,
+    prompt: str,
+    policy: RoleTierPolicy,
+    class_map: dict[str, str],
+) -> str | None:
+    """Return a deny reason for a ROLE-verdict dispatch, or `None` if compliant.
+
+    roadmap#275, adaptation/dispatch.md "Claude Code — tier agent
+    definitions" enforcement bullet. Denies when: `role` has no policy row
+    (actually fail-soft — see below); `tool_input` carries a non-empty
+    `model` (it would override the tier agent's pinned model); `subagent_type`
+    is not one of the role's default/opt-in tier agents; or `subagent_type`
+    is an OPT-IN (not default) tier agent and the prompt carries no
+    `superhuman-tier-opt-in:` reason line.
+
+    Args:
+        role: the frontmatter-claimed role (`RoleCheckResult.role` on a
+            `ROLE` verdict).
+        subagent_type: the dispatch's `tool_input.subagent_type`.
+        model: the dispatch's `tool_input.model`, exactly as read from the
+            payload (untyped — checked here for "present and non-empty").
+        prompt: the full dispatch prompt (for `has_opt_in_reason`).
+        policy: the loaded role-tier policy.
+        class_map: this harness's dispatch-class -> `subagent_type` map.
+
+    Returns:
+        str | None: a deny reason, or `None` if the dispatch complies OR
+        `role` carries no policy row (a new role file without a policy
+        entry yet — D7.5-style fail-soft: this gate does not deny for a
+        gap in `role-tiers.json`, it only enforces rows that exist).
+    """
+    rule = policy.roles.get(role)
+    if rule is None:
+        return None  # fail-soft: no policy row for this role
+    allowed_classes = rule.allowed  # default first, then opt-ins
+    allowed_agents = tuple(class_map[c] for c in allowed_classes)
+    if isinstance(model, str) and model.strip():
+        return _build_tier_deny_reason(role=role, subagent_type=subagent_type, allowed_agents=allowed_agents)
+    if subagent_type not in allowed_agents:
+        return _build_tier_deny_reason(role=role, subagent_type=subagent_type, allowed_agents=allowed_agents)
+    used_class = next(c for c in allowed_classes if class_map[c] == subagent_type)
+    if used_class != rule.default and not has_opt_in_reason(prompt):
+        return _build_tier_deny_reason(role=role, subagent_type=subagent_type, allowed_agents=allowed_agents)
+    return None
+
+
+def _non_role_tier_violation(
+    *, subagent_type: str | None, model: Any, class_map: dict[str, str]
+) -> str | None:
+    """Return a deny reason for a NON_ROLE-verdict dispatch, or `None` if compliant.
+
+    roadmap#275. A non-role dispatch is not tied to one role's allowed
+    classes — any tier agent is fine, or an explicit `model=` (the
+    documented way to use a built-in `subagent_type` like `Explore` or
+    `general-purpose` for a non-role duty).
+
+    Args:
+        subagent_type: the dispatch's `tool_input.subagent_type`.
+        model: the dispatch's `tool_input.model`, exactly as read from the
+            payload.
+        class_map: this harness's dispatch-class -> `subagent_type` map.
+
+    Returns:
+        str | None: a deny reason, or `None` if compliant.
+    """
+    if isinstance(model, str) and model.strip():
+        return None  # an explicit model= is the documented alternative here
+    allowed_agents = tuple(class_map[c] for c in DISPATCH_CLASSES)
+    if subagent_type in allowed_agents:
+        return None
+    return _build_tier_deny_reason(role=None, subagent_type=subagent_type, allowed_agents=allowed_agents)
+
+
 def _build_deny_reason(result: Any, roles_dir: Path) -> str:
     """Build the `permissionDecisionReason` text for a `MISMATCH`/`UNMARKED` verdict.
 
@@ -588,13 +767,55 @@ def run(
     if not isinstance(subagent_type, str):
         subagent_type = None
 
+    model = tool_input.get("model")
+
     result = check_role_block(prompt, roles_dir)
-    if result.verdict in (Verdict.ROLE, Verdict.FAULT):
-        # Locator not needed: ROLE never denies, FAULT never denies either
-        # (D7.5) — both are "print nothing", and the locator is skipped
-        # entirely (D7.9's latency requirement; TC-84's spy).
+    if result.verdict == Verdict.FAULT:
+        # A fault never denies (D7.5) — print nothing, and skip both the
+        # tier policy load and the locator entirely.
         return
-    assert result.verdict in _VERDICTS_NEEDING_SCOPE  # NON_ROLE, MISMATCH, UNMARKED
+
+    # roadmap#275: a ROLE or NON_ROLE verdict that `check_role_block` itself
+    # clears can still be denied for using a `subagent_type`/`model` the
+    # role-tier policy does not allow. Loaded unconditionally here (cheap
+    # stdlib `json.load`s of two small files, unlike the locator below) so
+    # it is also available to the widen path further down, which can turn
+    # a MISMATCH/UNMARKED primary verdict into a second-check ROLE/NON_ROLE
+    # that itself needs the identical tier check. `tier_reason` stays
+    # `None` for MISMATCH/UNMARKED (the tier check does not apply to
+    # those — they already deny for role-block reasons below) and for a
+    # compliant/fail-soft ROLE or NON_ROLE dispatch.
+    policy, class_map = _load_tier_policy()
+    tier_reason: str | None = None
+    if policy is not None and class_map is not None and result.verdict in (Verdict.ROLE, Verdict.NON_ROLE):
+        try:
+            if result.verdict == Verdict.ROLE:
+                assert result.role is not None  # ROLE always carries a role name
+                tier_reason = _role_tier_violation(
+                    role=result.role,
+                    subagent_type=subagent_type,
+                    model=model,
+                    prompt=prompt,
+                    policy=policy,
+                    class_map=class_map,
+                )
+            else:
+                tier_reason = _non_role_tier_violation(
+                    subagent_type=subagent_type, model=model, class_map=class_map
+                )
+        except Exception:  # noqa: BLE001 - the tier check must never turn into a false deny
+            tier_reason = None
+
+    if result.verdict == Verdict.ROLE and tier_reason is None:
+        # Compliant, or fail-soft (no policy row / policy unreadable): no
+        # locate needed — D7.9's latency guarantee for a compliant ROLE
+        # dispatch still holds (TC-84's spy).
+        return
+
+    # Every branch below needs the locator: NON_ROLE and MISMATCH/UNMARKED
+    # always did (D7.4 clause 3); a ROLE verdict only reaches here with a
+    # non-`None` `tier_reason` (the compliant/fail-soft case already
+    # returned above).
 
     session_id = payload.get("session_id")
     session_id = session_id if isinstance(session_id, str) else None
@@ -640,7 +861,35 @@ def run(
     workspace = location.workspace
     slug = location.slug
 
+    if result.verdict == Verdict.ROLE:
+        # Only reachable with a tier violation (the compliant/fail-soft
+        # case already returned above, before the locator ever ran).
+        assert tier_reason is not None
+        _print_deny(tier_reason)
+        record_role_gate_decision(
+            workspace,
+            slug,
+            session_id=session_id,
+            verdict=Verdict.TIER_DENY,
+            role=result.role,
+            subagent_type=subagent_type,
+            mismatch_line_number=None,
+        )
+        return
+
     if result.verdict == Verdict.NON_ROLE:
+        if tier_reason is not None:
+            _print_deny(tier_reason)
+            record_role_gate_decision(
+                workspace,
+                slug,
+                session_id=session_id,
+                verdict=Verdict.TIER_DENY,
+                role=None,
+                subagent_type=subagent_type,
+                mismatch_line_number=None,
+            )
+            return
         record_role_gate_decision(
             workspace,
             slug,
@@ -673,10 +922,58 @@ def run(
     ):
         second_result = check_role_block(prompt, session_roles_dir)
         if second_result.verdict == Verdict.ROLE:
-            # Widened to a pass: print nothing, log nothing (D7.7 — a ROLE
-            # verdict is never logged).
+            # roadmap#275: the widen only clears the ROLE-BLOCK check: the
+            # tier policy still applies to a widened ROLE dispatch exactly
+            # as it would to a primary one.
+            second_tier_reason: str | None = None
+            if policy is not None and class_map is not None and second_result.role is not None:
+                try:
+                    second_tier_reason = _role_tier_violation(
+                        role=second_result.role,
+                        subagent_type=subagent_type,
+                        model=model,
+                        prompt=prompt,
+                        policy=policy,
+                        class_map=class_map,
+                    )
+                except Exception:  # noqa: BLE001 - fail-soft, NFR-9
+                    second_tier_reason = None
+            if second_tier_reason is None:
+                # Widened to a compliant pass: print nothing, log nothing
+                # (D7.7 — a ROLE verdict is never logged).
+                return
+            _print_deny(second_tier_reason)
+            record_role_gate_decision(
+                workspace,
+                slug,
+                session_id=session_id,
+                verdict=Verdict.TIER_DENY,
+                role=second_result.role,
+                subagent_type=subagent_type,
+                mismatch_line_number=None,
+            )
             return
         if second_result.verdict == Verdict.NON_ROLE:
+            second_tier_reason = None
+            if policy is not None and class_map is not None:
+                try:
+                    second_tier_reason = _non_role_tier_violation(
+                        subagent_type=subagent_type, model=model, class_map=class_map
+                    )
+                except Exception:  # noqa: BLE001 - fail-soft, NFR-9
+                    second_tier_reason = None
+            if second_tier_reason is not None:
+                _print_deny(second_tier_reason)
+                record_role_gate_decision(
+                    workspace,
+                    slug,
+                    session_id=session_id,
+                    verdict=Verdict.TIER_DENY,
+                    role=None,
+                    subagent_type=subagent_type,
+                    mismatch_line_number=None,
+                )
+                return
             record_role_gate_decision(
                 workspace,
                 slug,

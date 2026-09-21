@@ -1,0 +1,10 @@
+{
+  "_comment": "Synthetic test-only class -> subagent_type map for tests/test_dispatch_tier_audit.py.",
+  "schema_version": 1,
+  "agents": {
+    "most_capable": "test-tier-most-capable-subagent",
+    "most_capable+raised": "test-tier-most-capable-high-effort-subagent",
+    "standard": "test-tier-standard-subagent",
+    "cheap": "test-tier-cheap-subagent"
+  }
+}

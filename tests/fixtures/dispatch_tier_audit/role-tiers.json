@@ -1,0 +1,12 @@
+{
+  "_comment": "Synthetic test-only policy for tests/test_dispatch_tier_audit.py -- deliberately independent of the real adaptation/role-tiers.json so these tests never break when that table changes.",
+  "schema_version": 1,
+  "dispatch_classes": ["most_capable", "most_capable+raised", "standard", "cheap"],
+  "roles": {
+    "developer": {"default": "standard", "opt_in": ["most_capable"]},
+    "architect": {"default": "most_capable", "opt_in": ["most_capable+raised"]}
+  },
+  "duties": {
+    "docs-sync": {"default": "cheap", "opt_in": ["standard"]}
+  }
+}

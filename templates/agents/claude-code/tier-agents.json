@@ -1,0 +1,10 @@
+{
+  "_comment": "Claude Code only: dispatch class (adaptation/role-tiers.json) -> subagent_type of the generated tier agent definition. The single source for this mapping; read by superhuman_profile.py models install-agents, the pre-tool-use-role-gate hook, and scripts/superhuman_dispatch_tier_audit.py. adaptation/dispatch.md renders it for humans.",
+  "schema_version": 1,
+  "agents": {
+    "most_capable":        "superhuman-tier-most-capable-subagent",
+    "most_capable+raised": "superhuman-tier-most-capable-high-effort-subagent",
+    "standard":            "superhuman-tier-standard-subagent",
+    "cheap":               "superhuman-tier-cheap-subagent"
+  }
+}
