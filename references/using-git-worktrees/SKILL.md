@@ -84,11 +84,13 @@ Follow this priority order. Explicit user preference always beats observed files
 
 #### Safety Verification (project-local directories only)
 
-**MUST verify directory is ignored before creating worktree:**
+**MUST verify the chosen directory is ignored before creating worktree** — ask git about a path *inside* `$LOCATION` (`.worktrees` or `worktrees`), never the directory itself:
 
 ```bash
-git check-ignore -q .worktrees 2>/dev/null || git check-ignore -q worktrees 2>/dev/null
+git check-ignore -q "$LOCATION/.probe"   # exit 0 = ignored, exit 1 = not ignored
 ```
+
+Both spellings of the directory itself give wrong answers: a bare `.worktrees` misses a `.worktrees/` pattern while the directory does not exist yet, and `.worktrees/` (trailing slash) reports *any* directory as ignored when `.gitignore` has CRLF line endings. A child path is correct in both cases, whether or not anything exists on disk. Never add `--no-index` — it reports force-added, tracked files as ignored.
 
 **If NOT ignored:** Add to .gitignore, commit the change, then proceed.
 
