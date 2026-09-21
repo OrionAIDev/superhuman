@@ -290,6 +290,53 @@ deny into a pass, and can never turn a pass into a deny. When both checks deny, 
 logged decision name the session's own role file, not the hook's, since that is the copy the session can
 actually open and fix.
 
+### The role-tier check (roadmap#275)
+
+A `ROLE`/`NON_ROLE` verdict from the mechanism above is necessary but no longer sufficient for a
+pass: the same `PreToolUse` hook also checks the dispatch's `subagent_type` (and rejects a `model`
+parameter on a role dispatch) against `adaptation/role-tiers.json` — the harness-neutral table of
+which dispatch class (`most_capable`, `most_capable+raised`, `standard`, `cheap`) each role, and
+each non-role duty, runs at — and this harness's own dispatch-class -> agent-definition map
+(`templates/agents/claude-code/tier-agents.json`). Both files are always read from the hook's own
+skill checkout, independent of which `roles/` directory the ROLE-BLOCK comparison above used — the
+tier policy is a property of the installed hook, not of whichever workspace a dispatch happens to
+target. This closes the gap `adaptation/dispatch.md` names directly: without it, a subagent
+dispatch that passes no `model` silently inherits the parent session's model and effort (often the
+most-capable tier), an unforced overspend measured at roughly 40% of superhuman's own subagent
+dispatches before this check existed.
+
+- **A role dispatch** must use one of its role's tier agents (`adaptation/role-tiers.json`'s
+  `default`, or one of its `opt_in` classes) and must pass no `model=` at all — the tier agent
+  definition pins the model, and an explicit `model=` would silently override that pin. Using an
+  opt-in class additionally requires a `superhuman-tier-opt-in: <reason>` line in the task brief
+  (checked as plain text, anywhere in the prompt) — logged to `SUPERHUMAN.md`'s decisions log by
+  convention, not enforced by this hook.
+- **A non-role dispatch** (`superhuman-dispatch: non-role`) is not tied to one role's allowed
+  classes: any tier agent is fine, or an explicit `model=` — the documented way to use a built-in
+  `subagent_type` (`Explore`, `general-purpose`) for a non-role duty.
+- **Fail-soft, twice over.** A role with no row in `adaptation/role-tiers.json` (a new role file
+  added before the policy is updated for it) is not enforced against at all. An unreadable or
+  malformed policy or class-map file disables the tier check entirely for that invocation — NFR-9
+  applies here exactly as it does to the ROLE-BLOCK check above: a fault in this gate's own
+  machinery must never become the reason a dispatch is wrongly blocked.
+- **Latency.** The tier check runs BEFORE the locator for a `ROLE` verdict, so a compliant `ROLE`
+  dispatch still never pays for the locator — the D7.9 latency guarantee above is unaffected. A
+  tier violation, like an ordinary `NON_ROLE`/`MISMATCH`/`UNMARKED` deny, needs the locator for
+  scope (D7.4) before it can print anything.
+- **The widen path is covered too.** When a `MISMATCH`/`UNMARKED` primary verdict is widened into a
+  `ROLE`/`NON_ROLE` pass against the session's own `roles/` (the mechanism described above), the
+  identical tier check applies to that WIDENED verdict before it is treated as a pass — otherwise
+  the widen path would be a second, unenforced way to dispatch outside the tier policy.
+- **Logging.** A tier-policy denial is appended to `role-gate.jsonl` exactly like a `NON_ROLE`/
+  `MISMATCH`/`UNMARKED` denial, under its own verdict value, `TIER_DENY` — distinct from the four
+  verdicts the ROLE-BLOCK predicate itself produces, so a reader of the log can always tell which
+  mechanism denied a given dispatch.
+- **Deny reason.** Names the role (or "this non-role dispatch"), the `subagent_type` actually used,
+  and the allowed tier agent(s) (default first), then says: drop `model=`; for an opt-in, add the
+  `superhuman-tier-opt-in:` line and log it in `SUPERHUMAN.md`; if the tier agents are not
+  installed at all, run `python scripts/superhuman_profile.py models install-agents --harness
+  claude-code`.
+
 ## The D4 boundary: the portable floor and the harness ceiling
 
 Superhuman ships harness-agnostic; hooks are inherently harness-specific. This project drew the

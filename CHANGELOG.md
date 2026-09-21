@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Added
 
+- **Every dispatch resolves a model AND a reasoning effort (roadmap#275).** Measured before this
+  change: 801 of 802 subagents ran at exactly the parent session's effort (62% at high), and ~40%
+  of superhuman dispatches passed no model at all. Now:
+  - `adaptation/role-tiers.json` is the authoritative, harness-neutral role → dispatch-class policy
+    (`most_capable`, `most_capable+raised`, `standard`, `cheap`), with per-role opt-in classes that
+    need a `superhuman-tier-opt-in: <reason>` line plus a decisions-log entry. Developer is now
+    `standard` by default (opt-in `most_capable`); security review runs at `most_capable+raised`.
+    `scripts/fleet/role_tiers.py` loads it; `tests/test_role_tiers.py` keeps `dispatch.md` in sync.
+  - The profile `models:` block gains `effort` (`low|medium|high|xhigh|max|n/a`) and optional
+    `raised_effort` per tier; C-DISP also warns on an unfilled effort.
+  - `superhuman_profile.py models install-agents --harness claude-code` renders four Claude Code
+    tier agents (`superhuman-tier-{most-capable,most-capable-high-effort,standard,cheap}-subagent`)
+    pinning model + effort from the profile; `--harness hermes` merges a `delegation:` block
+    (standard tier) into a Hermes `config.yaml`, since Hermes's `delegate_task` takes no per-call
+    model or effort. OpenClaw passes `thinking=` per `sessions_spawn`. First-run setup
+    (`phases/0-kickoff.md`) now elicits effort and runs the harness install step; `doctor` reports
+    missing or stale tier agents.
+  - The role gate (`pre_tool_use_role_gate.py`) now also refuses a role dispatch that is not on its
+    role's tier agent, passes `model=`, or uses an opt-in class without a reason, and a non-role
+    dispatch with neither a tier agent nor an explicit model. Faults still let the dispatch through.
+  - `scripts/superhuman_dispatch_tier_audit.py` compares each superhuman dispatch's expected model
+    and effort with what its transcript actually ran at, per role, with tokens and wall-clock.
+
 - **Type A gates open with a plain-language briefing.** `templates/gate-headers.md` now puts a
   short paragraph under the gate header, written for a stakeholder who hasn't seen the project
   recently: what the project is, what is being decided, and why it matters now. It uses no

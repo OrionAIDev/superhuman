@@ -517,16 +517,25 @@ Per DESIGN §9 (13 baked-in rules).
 - **Structured reviewer outputs.** Accept only fixed schema from reviewers: verdict + bullets. Reject free-form prose.
 - **Canonical subagent return shape.** `conventions/subagent-return-schema.md` is the accepted shape for every dispatched subagent's return: `conclusion → evidence → commands → assumptions → risks → next-action`. A role's specialized verdict (e.g. QA/Tester `approved|issues_found`, Surrogate `ACCEPT|ESCALATE`) rides in `conclusion`; the other five fields are still required. Reject a report that omits the schema in favor of free-form prose — ask the subagent to resubmit in schema, per that doc's enforcement note.
 - **Terse Tester output.** Counts + only-failing detail; full logs to file.
-- **Model-tier routing** (per `adaptation/dispatch.md`):
-  - Most capable (this tier): PM, Architect, code-quality reviewer
-  - Standard: integration Developer, QA substantive review, Business Expert
-  - Cheap/fast: Tester, mechanical Developer chunks, docs-sync, convention checks
+- **Model-tier routing** (per `adaptation/dispatch.md`; authoritative table `adaptation/role-tiers.json`).
+  Every dispatch resolves a model AND a reasoning effort; never let either inherit from this session.
+  - Most capable (this tier): PM, Architect, code-quality review; security review at raised effort
+  - Standard: Developer, QA, Business Expert, surrogate-user
+  - Cheap/fast: Tester, docs-sync, convention checks
+  - **Opt-in.** Raise a dispatch to its role's opt-in class only when the chunk justifies it (data-model or
+    auth-boundary decisions, security/adversarial review, a Developer chunk the standard tier visibly
+    failed): put `superhuman-tier-opt-in: <reason>` in the task brief and log
+    `<UTC> — tier opt-in: role=<role> class=<class> reason=<reason>` in `SUPERHUMAN.md` `## Decisions log`.
 - **Dispatch-time placeholder warning (C-DISP).** Before dispatching a subagent, if the resolved
   tier is still the unfilled placeholder (`PROMPT_ME`) in the operator's `~/.superhuman/profile.yaml`
   `models:` block, emit a one-line, Type-B (notification, non-blocking) warning naming the tier —
   e.g. `warning: tier 'most_capable' is unconfigured (PROMPT_ME) — run first-run provider setup` —
-  and PROCEED with the dispatch. This warning does not pause or gate autonomous progression; it is
-  not a gate (FR-10, OQ-5).
+  and PROCEED with the dispatch. **The same warning fires when the resolved tier's `effort` is
+  unfilled** (absent, or the explicit `PROMPT_ME` placeholder — both mean "unconfigured"; see
+  `adaptation/dispatch.md` C-DISP) — e.g. `warning: tier 'standard' effort is unconfigured
+  (PROMPT_ME) — run first-run provider setup`; a `+raised` class with no `raised_effort` configured
+  warns naming `raised_effort` instead. This warning does not pause or gate autonomous progression;
+  it is not a gate (FR-10, OQ-5).
 - **Chunk size cap.** PM soft-caps each chunk; logs rationale when cap is exceeded.
 - **Per-chunk re-eval batching.** Parallel-finishing chunks → one consolidated delta report.
 - **Cache priming.** Artifact templates loaded at session start (SessionStart hook); delta-report and gate-header templates cached.
