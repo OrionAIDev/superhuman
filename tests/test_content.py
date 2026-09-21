@@ -603,6 +603,63 @@ def test_superhuman_template_has_autonomous_sections(skill_root: Path) -> None:
     assert "## Environment:" in text, "needed by the precondition guard's marker check"
 
 
+def test_hard_gate_separates_accepted_from_complete(skill_root: Path) -> None:
+    """HARD-GATE rule 3 must not define 'complete' as 'all 8 gates fired'.
+
+    That sentence was the whole defect (roadmap#272): it made the last gate the
+    definition of done, so superhuman reported projects complete while their
+    deployment ladder was untouched. Gates firing establishes ACCEPTED; complete
+    additionally requires the declared ladder to be cleared, or an explicit PM
+    declaration over an incomplete ladder.
+    """
+    text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "NEVER claim a project is complete unless all 8 phase gates" not in text, (
+        "SKILL.md still defines 'complete' as 'all 8 phase gates have fired' — "
+        "that is the definition roadmap#272 removed"
+    )
+    assert "accepted" in text.lower(), "HARD-GATE must name the accepted-but-not-complete state"
+    assert "Deployment ladder:" in text, (
+        "HARD-GATE rule 3 must read the declared **Deployment ladder:** field"
+    )
+    assert "promote_into" in text, (
+        "completeness must be decided on recorded promote_into sign-offs, not re-derived"
+    )
+    # The PM override must survive, and must be logged rather than assumed.
+    assert "declared it complete" in text or "declare it complete" in text, (
+        "the human PM must always be able to declare a project complete over an incomplete ladder"
+    )
+    assert "undeclared" in text.lower(), (
+        "an absent ladder must be reported as undeclared, never silently read as 'none'"
+    )
+
+
+def test_superhuman_template_declares_deployment_ladder(skill_root: Path) -> None:
+    """The template must capture the ladder as its own decision, not overload ## Environment.
+
+    `## Environment:` answers 'which rung am I standing on?' and is a detection
+    input matched against the profile's env_marker. Completion asks 'which rungs
+    must this work reach?'. Overloading one field on the other makes the value
+    `none` fall through to path detection — reintroducing the ambiguity this
+    field exists to remove.
+    """
+    text = (skill_root / "templates" / "SUPERHUMAN.md.tpl").read_text(encoding="utf-8")
+    assert "**Deployment ladder:**" in text, "template must carry the Deployment ladder field"
+    assert "none" in text, "`none` must be documented as an explicit, allowed answer"
+    assert "## Environment:" in text, (
+        "the ladder field must ADD to `## Environment:`, never replace it"
+    )
+
+
+def test_kickoff_elicits_the_deployment_ladder(skill_root: Path) -> None:
+    """G1 must elicit (or confirm) the ladder; it is not allowed to stay blank."""
+    text = (skill_root / "phases" / "0-kickoff.md").read_text(encoding="utf-8")
+    assert "Deployment ladder" in text, "G1 must elicit the deployment ladder"
+    assert "CONFIRM" in text or "confirm" in text, (
+        "where the ladder is already knowable, G1 confirms it rather than asking cold"
+    )
+
+
 RESUME_PACKET_FIELDS = [
     "objective",
     "immutable constraints",

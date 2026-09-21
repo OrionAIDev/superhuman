@@ -37,6 +37,31 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Changed
 
+- **"All 8 gates fired" now means *accepted*, not *complete*.** HARD-GATE rule 3 in `SKILL.md`
+  defined completeness as every phase gate having fired, so superhuman reported projects finished
+  while their deployment ladder was untouched. Gates firing now establishes **accepted**; a project
+  is **complete** only when, in addition, every rung of its declared ladder carries a recorded
+  `promote_into` sign-off, or the human PM has explicitly declared it complete over an incomplete
+  ladder — an override that always stays available and is logged in `## Decisions log`, naming the
+  uncleared rungs, rather than assumed. The gate **reads** those sign-off records and never
+  re-derives them, because the promotions underneath them are irreversible acts that already carry
+  code plus an explicit human yes.
+
+  `templates/SUPERHUMAN.md.tpl` gains a `**Deployment ladder:**` field and `phases/0-kickoff.md`
+  elicits it at G1 — an ordered, lowest-rung-first list, or the literal `none`, with no blank
+  answer permitted; where the ladder is already knowable the PM confirms it instead of asking cold.
+  It is a **new field rather than a promotion of `## Environment:`**, which keeps its meaning
+  untouched: that marker is a detection input answering "which rung am I standing on", and
+  `## Environment: none` would fall through to path detection and reintroduce the very ambiguity
+  the field exists to remove. The ladder's **order** has to be declared because the profile does not
+  hold it — a profile's `ladder:` is sorted by detection precedence (narrowest first, so production
+  commonly leads) and `kind:` is a semantics-free label.
+
+  Additive: a project predating the field resumes unchanged and is reported as **undeclared**,
+  never silently read as `none`. `phases/4-acceptance.md` is deliberately NOT yet made to refuse on
+  this — refusing on a signal nothing has validated yet produces false refusals, which is how a
+  gate gets disabled. Spec: `docs/specs/2026-09-20-ladder-aware-completion.md` (roadmap #272).
+  Pinned by three new tests in `tests/test_content.py`.
 - **A gate entry's timestamp now carries a time to the second.** The decisions-log format was
   `[<ISO timestamp>] G<n>: ...`, and in practice most projects wrote a date only — so a project
   whose latest timestamp held G0 through G8 at once could not tell a reader which gate it was
