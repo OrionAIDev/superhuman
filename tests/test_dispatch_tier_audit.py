@@ -648,9 +648,117 @@ def test_build_summaries_aggregates_per_role(
     assert dev.effort_ok == 2
     assert dev.input_tokens == 300
     assert dev.output_tokens == 125
-    wall_clock = dev.wall_clock_seconds()
-    assert wall_clock is not None
-    assert wall_clock == pytest.approx(630.0)
+    elapsed_span = dev.elapsed_span_seconds()
+    assert elapsed_span is not None
+    assert elapsed_span == pytest.approx(630.0)
+
+
+def test_active_seconds_excludes_resume_gap(
+    tmp_path: Path, patched_profile: superhuman_profile.Profile
+) -> None:
+    """A dispatch resumed hours later must not inflate active_seconds.
+
+    Regression test for roadmap#275's audit finding: the old wall-clock
+    column summed first-to-last timestamps, so a subagent paused and
+    resumed later reported as if it had been working the whole gap.
+    """
+    b = TranscriptBuilder(tmp_path, "proj-a", "sess-1")
+    b.add_dispatch(
+        tool_use_id="toolu_1",
+        agent_id="a1",
+        prompt=DEVELOPER_ROLE_TEXT + "\n\nResumed dispatch.",
+        subagent_type="test-tier-standard-subagent",
+        agent_type="test-tier-standard-subagent",
+        dispatch_ts="2026-09-10T10:00:00.000Z",
+        turns=[
+            ("claude-sonnet-5", "medium", "2026-09-10T10:00:00.000Z", 100, 50),
+            # 30s of real turn-to-turn work.
+            ("claude-sonnet-5", "medium", "2026-09-10T10:00:30.000Z", 100, 50),
+            # Resumed 3 days later — a real idle gap, not active work.
+            ("claude-sonnet-5", "medium", "2026-09-13T10:00:30.000Z", 100, 50),
+            # Another 45s of real work after the resume.
+            ("claude-sonnet-5", "medium", "2026-09-13T10:01:15.000Z", 100, 50),
+        ],
+    )
+    report = _run(tmp_path)
+    summaries = audit.build_summaries(report.audits)
+    dev = summaries["developer"]
+
+    # Naive span counts the full 3-day gap.
+    elapsed_span = dev.elapsed_span_seconds()
+    assert elapsed_span is not None
+    assert elapsed_span > 3 * 24 * 3600
+
+    # Active seconds excludes the resume gap and keeps only the real work.
+    assert dev.active_seconds_total == pytest.approx(30.0 + 45.0)
+
+
+def test_active_seconds_sums_additively_across_dispatches(
+    tmp_path: Path, patched_profile: superhuman_profile.Profile
+) -> None:
+    """Two dispatches on different days must sum, not union into one span."""
+    b = TranscriptBuilder(tmp_path, "proj-a", "sess-1")
+    b.add_dispatch(
+        tool_use_id="toolu_1",
+        agent_id="a1",
+        prompt=DEVELOPER_ROLE_TEXT + "\n\nDay one.",
+        subagent_type="test-tier-standard-subagent",
+        agent_type="test-tier-standard-subagent",
+        dispatch_ts="2026-09-10T10:00:00.000Z",
+        turns=[
+            ("claude-sonnet-5", "medium", "2026-09-10T10:00:00.000Z", 100, 50),
+            ("claude-sonnet-5", "medium", "2026-09-10T10:00:20.000Z", 100, 50),
+        ],
+    )
+    b.add_dispatch(
+        tool_use_id="toolu_2",
+        agent_id="a2",
+        prompt=DEVELOPER_ROLE_TEXT + "\n\nDay ten.",
+        subagent_type="test-tier-standard-subagent",
+        agent_type="test-tier-standard-subagent",
+        dispatch_ts="2026-09-20T10:00:00.000Z",
+        turns=[
+            ("claude-sonnet-5", "medium", "2026-09-20T10:00:00.000Z", 100, 50),
+            ("claude-sonnet-5", "medium", "2026-09-20T10:00:40.000Z", 100, 50),
+        ],
+    )
+    report = _run(tmp_path)
+    summaries = audit.build_summaries(report.audits)
+    dev = summaries["developer"]
+
+    # The naive span unions across dispatches: ~10 calendar days.
+    elapsed_span = dev.elapsed_span_seconds()
+    assert elapsed_span is not None
+    assert elapsed_span > 9 * 24 * 3600
+
+    # active_seconds is the sum of each dispatch's own real work.
+    assert dev.active_seconds_total == pytest.approx(20.0 + 40.0)
+
+
+def test_active_gap_threshold_is_configurable(
+    tmp_path: Path, patched_profile: superhuman_profile.Profile
+) -> None:
+    """A gap just above the threshold is excluded; raising the threshold includes it."""
+    b = TranscriptBuilder(tmp_path, "proj-a", "sess-1")
+    b.add_dispatch(
+        tool_use_id="toolu_1",
+        agent_id="a1",
+        prompt=DEVELOPER_ROLE_TEXT + "\n\nBorderline gap.",
+        subagent_type="test-tier-standard-subagent",
+        agent_type="test-tier-standard-subagent",
+        dispatch_ts="2026-09-10T10:00:00.000Z",
+        turns=[
+            ("claude-sonnet-5", "medium", "2026-09-10T10:00:00.000Z", 100, 50),
+            ("claude-sonnet-5", "medium", "2026-09-10T10:10:00.000Z", 100, 50),
+        ],
+    )
+    report = _run(tmp_path)
+
+    tight = audit.build_summaries(report.audits, active_gap_threshold_seconds=60.0)
+    assert tight["developer"].active_seconds_total == pytest.approx(0.0)
+
+    loose = audit.build_summaries(report.audits, active_gap_threshold_seconds=600.0)
+    assert loose["developer"].active_seconds_total == pytest.approx(600.0)
 
 
 # --------------------------------------------------------------------------

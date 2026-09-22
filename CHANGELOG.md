@@ -27,7 +27,8 @@ All notable changes to this project will be documented in this file. Format adap
     role's tier agent, passes `model=`, or uses an opt-in class without a reason, and a non-role
     dispatch with neither a tier agent nor an explicit model. Faults still let the dispatch through.
   - `scripts/superhuman_dispatch_tier_audit.py` compares each superhuman dispatch's expected model
-    and effort with what its transcript actually ran at, per role, with tokens and wall-clock.
+    and effort with what its transcript actually ran at, per role, with tokens and active time
+    (see "Fixed" below for the timing-metric correction).
 
 - **Type A gates open with a plain-language briefing.** `templates/gate-headers.md` now puts a
   short paragraph under the gate header, written for a stakeholder who hasn't seen the project
@@ -170,6 +171,18 @@ All notable changes to this project will be documented in this file. Format adap
   the author to write it as `v1.2.3.4`, which passes. Pinned by three new tests in
   `tests/test_publication_guard.py`, which also check that real addresses in config values, URLs,
   ranges and sentence-final positions are still caught.
+- **`superhuman_dispatch_tier_audit.py`'s timing metric no longer inflates on a resumed subagent
+  or on unioning separate dispatches together (roadmap#275 follow-up).** The old
+  `wall_clock_seconds` summed a role/duty group's earliest to latest timestamp across every
+  dispatch in it, so a subagent resumed hours or days after its first turn counted the whole idle
+  gap as work, and two unrelated dispatches on different days unioned into one multi-day span. The
+  naive span is kept as `RoleSummary.elapsed_span_seconds()` (JSON `elapsed_span_seconds`, with an
+  explicit caveat key) for diagnostic use only. The trustworthy metric is now `active_seconds`: per
+  dispatch, it sums only consecutive-turn gaps at or below `--active-gap-threshold-seconds`
+  (default 300s), excluding a longer gap as a resume pause, then sums additively across dispatches
+  in a group instead of taking a min/max span. Pinned by three new tests in
+  `tests/test_dispatch_tier_audit.py`: a resumed-subagent case, a two-dispatches-on-different-days
+  case, and a threshold-boundary case.
 
 ### Security
 

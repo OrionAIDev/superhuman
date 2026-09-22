@@ -50,6 +50,17 @@ Transcript format found (read-only inspection of
 This script never prints prompt text — only role names, agent types, models,
 effort, counts, and timestamps (PROJECT-SPECIFIC CONSTRAINTS: real transcripts
 under ``~/.claude/projects`` can carry PHI/PII).
+
+Timing metric (roadmap#275 audit finding, 2026-09-22): the summary table's
+"active" column and JSON's ``active_seconds`` sum only consecutive-turn
+gaps within a dispatch that fall at or below
+``--active-gap-threshold-seconds`` (default 300s), so a resumed subagent's
+idle gap is excluded rather than counted as work. The older naive
+first-to-last-timestamp span is still available as
+``RoleSummary.elapsed_span_seconds()`` / JSON ``elapsed_span_seconds``, but
+it over-reports for resumed subagents and further inflates once multiple
+dispatches in one role/duty group are unioned together — do not use it for
+a before/after comparison.
 """
 
 from __future__ import annotations
@@ -81,6 +92,19 @@ from scripts.fleet.role_tiers import (  # noqa: E402
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_MISMATCH = 1
+
+#: The largest gap between two consecutive assistant turns within one
+#: dispatch that still counts as active work. A subagent's own transcript
+#: can span a real-world pause — the run was resumed later, e.g. after a
+#: context-window break or a session restart — and the naive
+#: first-timestamp-to-last-timestamp span (``RoleSummary.elapsed_span_seconds``)
+#: counts that idle gap as if the model had been working the whole time.
+#: ``_dispatch_active_seconds`` instead sums only consecutive-turn deltas at
+#: or below this threshold, on the theory that a live agentic turn-to-turn
+#: gap (tool calls, thinking) is on the order of seconds to low minutes,
+#: while a resume gap is the human coming back hours or days later
+#: (roadmap#275 audit finding, 2026-09-22 — see CHANGELOG.md).
+_DEFAULT_ACTIVE_GAP_THRESHOLD_SECONDS = 300.0
 
 #: The Claude Code model aliases whose expected id is a family substring
 #: match against the actual concrete model id, rather than an exact match
@@ -705,9 +729,22 @@ class RoleSummary:
     input_tokens: int = 0
     output_tokens: int = 0
     timestamps: list[str] = field(default_factory=list)
+    active_seconds_total: float = 0.0
 
-    def wall_clock_seconds(self) -> float | None:
+    def elapsed_span_seconds(self) -> float | None:
         """Return the span from the earliest to the latest timestamp seen.
+
+        CAVEAT: this is a naive union span across every dispatch in the
+        group, not a wall-clock work estimate. It over-reports whenever a
+        dispatch's own subagent was resumed after a real-world pause (the
+        gap counts as if the model had been working), and it further
+        inflates once two or more separate dispatches in the same role/duty
+        group are unioned together — their calendar gap (e.g. dispatches on
+        different days) is counted as if it were one continuous span. Prefer
+        :attr:`active_seconds_total` for a before/after time comparison;
+        this method is kept for diagnostic/debugging use only (was named
+        ``wall_clock_seconds`` prior to the roadmap#275 audit fix,
+        2026-09-22 — see CHANGELOG.md).
 
         Returns:
             Seconds between the first and last timestamp, or ``None`` if
@@ -733,6 +770,40 @@ def _parse_ts(value: str) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _dispatch_active_seconds(
+    timestamps: tuple[str, ...], gap_threshold_seconds: float
+) -> float | None:
+    """Sum consecutive-turn deltas within one dispatch, excluding resume gaps.
+
+    Unlike :meth:`RoleSummary.elapsed_span_seconds` (a naive first-to-last
+    span), this sums only the gaps between *consecutive* turns that are at
+    or below ``gap_threshold_seconds``, so a turn-to-turn pause longer than
+    that (the dispatch was resumed later) is excluded rather than counted as
+    active work. Because it is a sum, not a min/max span, aggregating it
+    across multiple dispatches in a role/duty group is additive and does not
+    conflate their separate calendar gaps the way the naive span does.
+
+    Args:
+        timestamps: Every assistant turn's timestamp for one dispatch, not
+            necessarily in sorted order.
+        gap_threshold_seconds: The largest consecutive-turn gap still
+            counted as active work.
+
+    Returns:
+        Summed active seconds, or ``None`` if fewer than two timestamps
+        parsed (no interval to measure).
+    """
+    parsed = sorted(dt for dt in (_parse_ts(t) for t in timestamps) if dt is not None)
+    if len(parsed) < 2:
+        return None
+    total = 0.0
+    for prev, curr in zip(parsed, parsed[1:]):
+        delta = (curr - prev).total_seconds()
+        if delta <= gap_threshold_seconds:
+            total += delta
+    return total
 
 
 def _in_range(ts: str | None, since: datetime | None, until: datetime | None) -> bool:
@@ -851,11 +922,18 @@ def _group_key(audit: DispatchAudit) -> str:
     return "non-role"
 
 
-def build_summaries(audits: list[DispatchAudit]) -> dict[str, RoleSummary]:
+def build_summaries(
+    audits: list[DispatchAudit],
+    *,
+    active_gap_threshold_seconds: float = _DEFAULT_ACTIVE_GAP_THRESHOLD_SECONDS,
+) -> dict[str, RoleSummary]:
     """Aggregate audited dispatches into a per-role/duty summary.
 
     Args:
         audits: Every audited dispatch.
+        active_gap_threshold_seconds: Passed through to
+            :func:`_dispatch_active_seconds` per dispatch before summing
+            into :attr:`RoleSummary.active_seconds_total`.
 
     Returns:
         Group key (role name, or ``"non-role"``) -> aggregate stats.
@@ -877,6 +955,9 @@ def build_summaries(audits: list[DispatchAudit]) -> dict[str, RoleSummary]:
         summary.input_tokens += audit.input_tokens
         summary.output_tokens += audit.output_tokens
         summary.timestamps.extend(audit.timestamps)
+        active = _dispatch_active_seconds(audit.timestamps, active_gap_threshold_seconds)
+        if active is not None:
+            summary.active_seconds_total += active
     return dict(summaries)
 
 
@@ -925,7 +1006,13 @@ def render_json(report: AuditReport, summaries: dict[str, RoleSummary]) -> str:
                 "mismatch_count": summary.mismatch_count,
                 "input_tokens": summary.input_tokens,
                 "output_tokens": summary.output_tokens,
-                "wall_clock_seconds": summary.wall_clock_seconds(),
+                "active_seconds": summary.active_seconds_total,
+                "elapsed_span_seconds": summary.elapsed_span_seconds(),
+                "elapsed_span_seconds_caveat": (
+                    "naive union span across every dispatch in this group; inflated by "
+                    "resumed subagents and by unioning separate dispatches' calendar "
+                    "gaps — use active_seconds for comparison"
+                ),
             }
             for role, summary in sorted(summaries.items())
         },
@@ -940,7 +1027,13 @@ def render_json(report: AuditReport, summaries: dict[str, RoleSummary]) -> str:
     return json.dumps(payload, indent=2, sort_keys=False)
 
 
-def render_text(report: AuditReport, summaries: dict[str, RoleSummary], *, mismatches_only: bool) -> str:
+def render_text(
+    report: AuditReport,
+    summaries: dict[str, RoleSummary],
+    *,
+    mismatches_only: bool,
+    active_gap_threshold_seconds: float = _DEFAULT_ACTIVE_GAP_THRESHOLD_SECONDS,
+) -> str:
     """Render the full report as the default human-readable text.
 
     Args:
@@ -948,6 +1041,9 @@ def render_text(report: AuditReport, summaries: dict[str, RoleSummary], *, misma
         summaries: Per-role/duty aggregates.
         mismatches_only: If set, the per-dispatch mismatch list is the only
             section printed with detail; the summary table still prints.
+        active_gap_threshold_seconds: The threshold actually used to build
+            ``summaries`` (for the footer note only — aggregation itself
+            already happened in :func:`build_summaries`).
 
     Returns:
         The report text.
@@ -955,18 +1051,22 @@ def render_text(report: AuditReport, summaries: dict[str, RoleSummary], *, misma
     lines: list[str] = []
     lines.append(
         f"{'role/duty':<20} {'dispatches':>10} {'model ok':>10} {'effort ok':>10} "
-        f"{'mismatches':>11} {'in tok':>10} {'out tok':>10} {'wall clock':>12}"
+        f"{'mismatches':>11} {'in tok':>10} {'out tok':>10} {'active':>12}"
     )
     for role, summary in sorted(summaries.items()):
-        wall_clock = summary.wall_clock_seconds()
-        wall_clock_str = f"{wall_clock:.0f}s" if wall_clock is not None else "n/a"
+        active_str = f"{summary.active_seconds_total:.0f}s"
         model_ok_str = f"{summary.model_ok}/{summary.dispatch_count - summary.model_unknown}"
         effort_ok_str = f"{summary.effort_ok}/{summary.dispatch_count - summary.effort_unknown}"
         lines.append(
             f"{role:<20} {summary.dispatch_count:>10} {model_ok_str:>10} {effort_ok_str:>10} "
             f"{summary.mismatch_count:>11} {summary.input_tokens:>10} {summary.output_tokens:>10} "
-            f"{wall_clock_str:>12}"
+            f"{active_str:>12}"
         )
+    lines.append(
+        "('active' = summed consecutive-turn deltas <= "
+        f"{active_gap_threshold_seconds:.0f}s per dispatch, excluding resume gaps; "
+        "see --json for the naive elapsed_span_seconds and its caveat)"
+    )
 
     if report.other_by_type:
         lines.append("")
@@ -1063,6 +1163,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit 1 if any dispatch has a mismatch (for CI use; default always exits 0)",
     )
+    parser.add_argument(
+        "--active-gap-threshold-seconds",
+        type=float,
+        default=_DEFAULT_ACTIVE_GAP_THRESHOLD_SECONDS,
+        help=(
+            "largest consecutive-turn gap within one dispatch still counted as active "
+            f"work (default: {_DEFAULT_ACTIVE_GAP_THRESHOLD_SECONDS:.0f}s); a longer gap "
+            "is treated as a resume pause and excluded from active_seconds"
+        ),
+    )
     return parser
 
 
@@ -1099,12 +1209,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"superhuman-dispatch-tier-audit: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
-    summaries = build_summaries(report.audits)
+    summaries = build_summaries(
+        report.audits, active_gap_threshold_seconds=args.active_gap_threshold_seconds
+    )
 
     if args.json:
         print(render_json(report, summaries))
     else:
-        print(render_text(report, summaries, mismatches_only=args.mismatches_only))
+        print(
+            render_text(
+                report,
+                summaries,
+                mismatches_only=args.mismatches_only,
+                active_gap_threshold_seconds=args.active_gap_threshold_seconds,
+            )
+        )
 
     if args.fail_on_mismatch and any(a.mismatches for a in report.audits):
         return EXIT_MISMATCH
