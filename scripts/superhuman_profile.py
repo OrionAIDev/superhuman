@@ -2264,6 +2264,27 @@ def write_models_block(
     return profile_path
 
 
+def _models_profile_destination(args: argparse.Namespace) -> Path:
+    """Pick the profile ``models set`` writes when ``--profile`` is omitted.
+
+    Writes go to the file the rest of the CLI will *read*: whatever
+    :func:`find_profile` resolves from ``--root`` (``$SUPERHUMAN_PROFILE``,
+    then a project-local profile, then ``~/.superhuman/profile.yaml``). Only
+    when nothing resolves does it fall back to ``~/.superhuman/profile.yaml``,
+    the same default :func:`cmd_init` creates.
+
+    Args:
+        args: Parsed CLI arguments carrying ``profile`` and ``root``.
+
+    Returns:
+        The destination ``profile.yaml`` path (it may not exist yet).
+    """
+    if args.profile:
+        return Path(args.profile)
+    found = find_profile(Path(args.root))
+    return found if found is not None else Path.home() / ".superhuman" / "profile.yaml"
+
+
 def cmd_models_set(args: argparse.Namespace) -> int:
     """Write/merge the ``models:`` block of a profile from CLI-supplied JSON.
 
@@ -2288,9 +2309,12 @@ def cmd_models_set(args: argparse.Namespace) -> int:
             ``--answers-json-file`` may be given unless ``--decline`` alone
             supplies everything there is to do. ``--decline`` is an optional
             comma-separated list of tier names to write as
-            :data:`MODEL_PLACEHOLDER`; ``--profile`` defaults to
-            ``~/.superhuman/profile.yaml``, the same default destination
-            :func:`cmd_init` uses for the operator's profile.
+            :data:`MODEL_PLACEHOLDER`; ``--profile`` defaults to the
+            profile :func:`find_profile` resolves from ``--root`` (so
+            ``$SUPERHUMAN_PROFILE`` and a project-local profile are
+            honoured, exactly as ``doctor`` reads them), else
+            ``~/.superhuman/profile.yaml`` — see
+            :func:`_models_profile_destination`.
 
     Returns:
         Process exit code (0 on success).
@@ -2305,7 +2329,7 @@ def cmd_models_set(args: argparse.Namespace) -> int:
             or the existing profile. Caught by :func:`main`, which prints
             the message and exits 2 — never a raw traceback.
     """
-    dest = Path(args.profile) if args.profile else (Path.home() / ".superhuman" / "profile.yaml")
+    dest = _models_profile_destination(args)
     decline = {tok.strip() for tok in (args.decline or "").split(",") if tok.strip()}
 
     if args.answers_json is not None and args.answers_json_file is not None:
@@ -2707,23 +2731,54 @@ def cmd_models_install_agents(args: argparse.Namespace) -> int:
     delegated child inherits this one block; the `most_capable` roles run in
     the orchestrator session itself and are never delegated.
 
+    The profile is ``--profile`` when given (it must exist), otherwise the
+    one :func:`find_profile` resolves from ``--root`` — the same file
+    ``doctor`` and ``explain`` read.
+
     Args:
         args: Parsed CLI arguments.
 
     Returns:
-        Process exit code (0 on success).
+        Process exit code: 0 on success; :data:`EXIT_UNRESOLVED` (4) when the
+        profile configures nothing this harness can install (every Claude
+        Code class skipped, or Hermes's `standard` tier unconfigured) —
+        loud, never a silent success; kickoff treats 4 as "every tier
+        deferred", not a blocker.
 
     Raises:
         ProfileError: If `--harness hermes` is given without
-            `--hermes-config`, or if the underlying installer/merge raises.
+            `--hermes-config`, if ``--profile`` names a missing file, if
+            ``$SUPERHUMAN_PROFILE`` names a missing file, or if the
+            underlying installer/merge raises.
     """
-    profile_path = Path(args.profile) if args.profile else (Path.home() / ".superhuman" / "profile.yaml")
-    profile = load_profile(profile_path if profile_path.is_file() else None)
+    if args.profile:
+        explicit = Path(args.profile)
+        if not explicit.is_file():
+            raise ProfileError(f"--profile points at a missing file: {explicit}")
+        profile = load_profile(explicit)
+    else:
+        # The same resolver `doctor`/`explain` use ($SUPERHUMAN_PROFILE, then
+        # the project walk, then ~/.superhuman) — a hardcoded ~/.superhuman
+        # default read a different file than `doctor` on hosts that set
+        # SUPERHUMAN_PROFILE, and silently skipped every tier (roadmap#275).
+        profile = _load_for_cli(Path(args.root))
+    print(
+        "superhuman-profile: profile "
+        + (profile.path.as_posix() if profile.path else "(none — built-in ladder)")
+    )
 
     if args.harness == "claude-code":
         agents_dir = Path(args.agents_dir) if args.agents_dir else (Path.home() / ".claude" / "agents")
-        for message in install_claude_code_agents(profile, agents_dir, dry_run=args.dry_run):
+        messages = install_claude_code_agents(profile, agents_dir, dry_run=args.dry_run)
+        for message in messages:
             print(f"superhuman-profile: {message}")
+        if all(message.startswith("skip ") for message in messages):
+            print(
+                "superhuman-profile: no tier is configured in this profile — nothing "
+                "installed (run `models set` first)",
+                file=sys.stderr,
+            )
+            return EXIT_UNRESOLVED
         return EXIT_OK
 
     # harness == "hermes"
@@ -2735,9 +2790,10 @@ def cmd_models_install_agents(args: argparse.Namespace) -> int:
     if not primary or primary == MODEL_PLACEHOLDER:
         print(
             "superhuman-profile: skip — tier 'standard' primary is unconfigured "
-            f"({MODEL_PLACEHOLDER}); nothing written to delegation:"
+            f"({MODEL_PLACEHOLDER}); nothing written to delegation:",
+            file=sys.stderr,
         )
-        return EXIT_OK
+        return EXIT_UNRESOLVED
 
     updates: dict[str, Any] = {"model": primary}
     effort = entry.get("effort")
@@ -3049,7 +3105,13 @@ def build_parser() -> argparse.ArgumentParser:
     models_set.add_argument(
         "--profile",
         default=None,
-        help="destination profile.yaml (default: ~/.superhuman/profile.yaml, same as `init`)",
+        help=(
+            "destination profile.yaml (default: the profile doctor resolves from --root — "
+            "$SUPERHUMAN_PROFILE, then the project walk, then ~/.superhuman/profile.yaml)"
+        ),
+    )
+    models_set.add_argument(
+        "--root", default=".", help="where the default-profile search starts (default: .)",
     )
     models_set.add_argument(
         "--answers-json",
@@ -3088,7 +3150,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     install_agents.add_argument(
         "--profile", default=None,
-        help="source profile.yaml (default: ~/.superhuman/profile.yaml)",
+        help=(
+            "source profile.yaml, which must exist (default: the profile doctor resolves "
+            "from --root — $SUPERHUMAN_PROFILE, then the project walk, then "
+            "~/.superhuman/profile.yaml)"
+        ),
+    )
+    install_agents.add_argument(
+        "--root", default=".", help="where the default-profile search starts (default: .)",
     )
     install_agents.add_argument(
         "--agents-dir", default=None,

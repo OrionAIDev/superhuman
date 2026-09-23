@@ -145,6 +145,17 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **`models install-agents` and `models set` now read the same profile as `doctor` (roadmap#275
+  follow-up).** Without `--profile`, both hardcoded `~/.superhuman/profile.yaml` and ignored
+  `$SUPERHUMAN_PROFILE` and the project walk. On a host that sets `SUPERHUMAN_PROFILE` and has no
+  `~/.superhuman` (e.g. a shared server install), `install-agents` fell back to the built-in ladder and
+  "skipped" all four tier agents as unconfigured with exit 0, while `doctor` read the real file and
+  reported them MISSING. Both now resolve via `find_profile` (new `--root`, default `.`), and
+  `install-agents` prints the path it read. `install-agents` also fails loud when `--profile` names a
+  missing file (it used to fall back silently), and exits 4 when the profile configures no tier the
+  harness can install. `phases/0-kickoff.md` treats exit 4 as the all-tiers-deferred path, not a
+  blocker. Pinned by five tests in `tests/test_tier_agent_install.py` that fail on the old code.
+
 - **TC-25 now catches a renamed, deleted or added gate-bearing phase recipe.** It used to compare
   each HEAD recipe's `gates:` list against the same path at the merge-base, and it skipped paths
   that were missing on either side. So renaming `phases/2.1-test-plan.md` (which moves G4) or

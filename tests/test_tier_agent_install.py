@@ -9,6 +9,7 @@ Companion to `tests/test_profile_onboarding.py`, which already covers the
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -406,3 +407,117 @@ def test_doctor_never_fails_with_no_models_block(tmp_path: Path) -> None:
     lines, problems = sp._claude_code_tier_agent_status(profile, agents_dir)
     assert problems == 0
     assert all("n/a" in line for line in lines)
+
+
+# --------------------------------------------------------------------------- #
+# default-profile resolution: install-agents / models set read the same file
+# `doctor` does (roadmap#275 follow-up — a host that sets
+# SUPERHUMAN_PROFILE and has no ~/.superhuman, so a hardcoded
+# ~/.superhuman default silently skipped every tier)
+# --------------------------------------------------------------------------- #
+
+_RESOLVER = Path(__file__).resolve().parents[1] / "scripts" / "superhuman_profile.py"
+
+
+def _run_cli_isolated(
+    argv: list[str], *, home: Path, cwd: Path, superhuman_profile: Path | None
+) -> subprocess.CompletedProcess[str]:
+    """Run the CLI with an empty home and an explicit SUPERHUMAN_PROFILE (or none)."""
+    import os
+
+    env = dict(os.environ)
+    env.pop("SUPERHUMAN_PROFILE", None)
+    env.pop("SUPERHUMAN_REQUIRE_PROFILE", None)
+    env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)  # Path.home() on Windows
+    env["PYTHONIOENCODING"] = "utf-8"  # the CLI prints em dashes; Windows defaults to cp1252
+    if superhuman_profile is not None:
+        env["SUPERHUMAN_PROFILE"] = str(superhuman_profile)
+    return subprocess.run(
+        [sys.executable, str(_RESOLVER), *argv],
+        capture_output=True, text=True, encoding="utf-8", env=env, cwd=cwd, check=False,
+    )
+
+
+@pytest.fixture()
+def isolated_dirs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """An empty home (no ~/.superhuman), a non-repo cwd, and an agents dir."""
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    return home, work, tmp_path / "agents"
+
+
+def test_install_agents_honours_superhuman_profile_env(
+    isolated_dirs: tuple[Path, Path, Path], full_profile: Path
+) -> None:
+    """With no --profile, SUPERHUMAN_PROFILE is read and all four agents are written."""
+    home, work, agents_dir = isolated_dirs
+    result = _run_cli_isolated(
+        ["models", "install-agents", "--harness", "claude-code", "--agents-dir", str(agents_dir)],
+        home=home, cwd=work, superhuman_profile=full_profile,
+    )
+    assert result.returncode == sp.EXIT_OK, result.stdout + result.stderr
+    assert full_profile.as_posix() in result.stdout
+    assert sorted(p.name for p in agents_dir.glob("*.md")) == sorted([
+        "superhuman-tier-most-capable-subagent.md",
+        "superhuman-tier-most-capable-high-effort-subagent.md",
+        "superhuman-tier-standard-subagent.md",
+        "superhuman-tier-cheap-subagent.md",
+    ])
+    assert not (home / ".superhuman").exists()
+
+
+def test_models_set_default_destination_honours_superhuman_profile_env(
+    isolated_dirs: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """With no --profile, `models set` writes the file SUPERHUMAN_PROFILE names, not ~."""
+    home, work, _ = isolated_dirs
+    target = tmp_path / "opt" / ".superhuman" / "profile.yaml"
+    result = _run_cli_isolated(
+        ["models", "set", "--answers-json",
+         '{"standard": {"primary": "sonnet", "effort": "medium"}}'],
+        home=home, cwd=work, superhuman_profile=target,
+    )
+    assert result.returncode == sp.EXIT_OK, result.stdout + result.stderr
+    assert sp.load_profile(target).models["standard"]["primary"] == "sonnet"
+    assert not (home / ".superhuman").exists()
+
+
+def test_install_agents_wholly_unconfigured_profile_exits_unresolved(
+    isolated_dirs: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """Every tier PROMPT_ME: exit 4 and say so — never a silent success."""
+    home, work, agents_dir = isolated_dirs
+    dest = tmp_path / "declined.yaml"
+    sp.write_models_block(dest, decline=True)
+    result = _run_cli_isolated(
+        ["models", "install-agents", "--harness", "claude-code", "--agents-dir", str(agents_dir)],
+        home=home, cwd=work, superhuman_profile=dest,
+    )
+    assert result.returncode == sp.EXIT_UNRESOLVED, result.stdout + result.stderr
+    assert "no tier is configured" in result.stderr
+    assert not list(agents_dir.glob("*.md"))
+
+
+def test_install_agents_hermes_unconfigured_standard_exits_unresolved(tmp_path: Path) -> None:
+    dest = tmp_path / "profile.yaml"
+    sp.write_models_block(dest, {"most_capable": {"primary": "opus", "effort": "medium"}},
+                          decline=["standard", "cheap"])
+    config = tmp_path / "config.yaml"
+    args = sp.build_parser().parse_args([
+        "models", "install-agents", "--harness", "hermes",
+        "--profile", str(dest), "--hermes-config", str(config),
+    ])
+    assert args.func(args) == sp.EXIT_UNRESOLVED
+    assert not config.exists()
+
+
+def test_install_agents_explicit_missing_profile_fails_loud(tmp_path: Path) -> None:
+    args = sp.build_parser().parse_args([
+        "models", "install-agents", "--harness", "claude-code",
+        "--profile", str(tmp_path / "nope.yaml"), "--agents-dir", str(tmp_path / "agents"),
+    ])
+    with pytest.raises(sp.ProfileError, match="missing file"):
+        args.func(args)
