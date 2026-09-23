@@ -257,6 +257,12 @@ consulted: [business-expert]
          written.
        - Treat a non-zero exit from either installer the same as a failed `models set` above — a
          kickoff blocker, not a silent skip.
+       - **Exit 4 is not a blocker.** Either installer exits 4 when the profile configures no tier
+         this harness can install (every tier declined/deferred). That is the decline path above,
+         which must never block kickoff: note in the elicitation summary that no tier agents were
+         installed, and proceed. Without `--profile`, both installers resolve the profile the way
+         `doctor` does (`$SUPERHUMAN_PROFILE`, then the project walk, then
+         `~/.superhuman/profile.yaml`) and print the path they read.
    - **If HITL-M or 2, re-run the gate WITHOUT `--kickoff`:**
      `scripts/autonomous-precondition.sh <project> --level <1|2> --slug <slug>`. Everything the
      deferred checks needed now exists, so this is the run that actually authorizes the level. On
