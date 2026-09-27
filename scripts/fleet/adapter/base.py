@@ -101,6 +101,26 @@ def format_launch_instruction() -> str:
     return _LAUNCH_INSTRUCTION
 
 
+def extract_claude_session_local_id(record: dict[str, Any]) -> str:
+    """Return the harness-local session id from one Claude session record.
+
+    The one id-extraction rule for a Claude session record, shared by
+    `adapter.claude.ClaudeAdapter.enumerate_sessions` and
+    `adapter.session_liveness.resolve_liveness` (DESIGN O.4: "the same
+    id-extraction rule `ClaudeAdapter.enumerate_sessions` already applies,
+    refactored into one shared private helper so the two cannot drift").
+
+    Args:
+        record: one raw session record, as the `list_sessions` agent tool
+            or a `--sessions-json` dump provides it.
+
+    Returns:
+        str: the trimmed `sessionId` field, or `session_id` if the former is
+        absent, or `""` if neither is present or both are blank.
+    """
+    return str(record.get("sessionId") or record.get("session_id") or "").strip()
+
+
 def workspace_component(workspace: Path | str) -> str:
     """Return a short, filesystem-safe, stable node-id component for `workspace`.
 

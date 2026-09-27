@@ -21,6 +21,7 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -31,11 +32,14 @@ from . import doctor as fleet_doctor
 from . import hook_payload as fleet_hook_payload
 from . import hooks_install as fleet_hooks_install
 from . import observe as fleet_observe
+from . import path_safety as fleet_path_safety
+from . import project as fleet_project
 from . import project_id as fleet_project_id
 from . import role_block as fleet_role_block
-from .adapter.base import SessionAdapter, SessionInfo
+from .adapter.base import SessionAdapter, SessionInfo, extract_claude_session_local_id
 from .adapter.claude import ClaudeAdapter
 from .adapter.portable import PortableAdapter
+from .adapter.session_liveness import resolve_liveness
 from .adapter.subagent import SubagentAdapter
 from .core.done import DONE_LEVELS
 from .core.done import advance as done_advance
@@ -45,12 +49,18 @@ from .core.errors import (
     DonePolicyError,
     FragmentCorrupt,
     LockTimeoutError,
+    OwnershipContended,
     OwnershipError,
+    OwnershipRefused,
     SessionIdentityUnresolved,
     ValidationError,
 )
-from .core.events import append
+from .core.events import append, read_all
+from .core.nodes import parse_node_id
 from .core.projection import project_event, rebuild
+from .core.project_owner import claim as owner_claim
+from .core.project_owner import fold_owner as owner_fold_owner
+from .core.project_owner import stand_down as owner_stand_down
 from .core.query import edges_of
 from .core.schema import Event, Fragment, validate_event
 from .core.store import read_fragment
@@ -203,6 +213,44 @@ def _append_with_bounded_retry(
     for attempt in range(attempts):
         try:
             return append(log_path, event_dict, **kwargs)
+        except LockTimeoutError as exc:
+            last_exc = exc
+            if attempt < attempts - 1 and backoff > 0:
+                time.sleep(backoff)
+    assert last_exc is not None  # attempts >= 1 guarantees at least one raise
+    raise last_exc
+
+
+def _call_with_bounded_lock_retry(
+    call: Callable[[], Event | None], *, attempts: int, backoff: float
+) -> Event | None:
+    """Call `call()`, retrying a bounded number of times on `LockTimeoutError` (I3).
+
+    `core.project_owner.claim`/`stand_down` already retry internally against
+    a *changing ownership state* (bounded re-evaluation, `OwnershipContended`
+    on exhaustion) — this is a distinct, coarser tier for plain lock
+    *contention*, the same second-tier retry every other manifest-writing
+    verb already gets via `_append_with_bounded_retry`. Never proceeds as if
+    the call succeeded — either `call()` eventually returns within the
+    attempt budget, or `LockTimeoutError` propagates to the caller.
+
+    Args:
+        call: a zero-argument callable wrapping one `owner_claim`/
+            `owner_stand_down` invocation.
+        attempts: total attempts, including the first (must be >= 1).
+        backoff: seconds to sleep between attempts.
+
+    Returns:
+        Event | None: whatever `call()` returns.
+
+    Raises:
+        LockTimeoutError: if every attempt timed out. The caller must treat
+            this exactly like a single call's timeout — nothing was written.
+    """
+    last_exc: LockTimeoutError | None = None
+    for attempt in range(attempts):
+        try:
+            return call()
         except LockTimeoutError as exc:
             last_exc = exc
             if attempt < attempts - 1 and backoff > 0:
@@ -377,6 +425,61 @@ def _resolved_git_timeout_override(workspace: Path | str) -> float | None:
     return cfg.git_timeout_seconds
 
 
+#: Refuse a `--sessions-json` file larger than this many bytes outright,
+#: rather than reading an arbitrarily large file into memory on a bad or
+#: hostile path (I1).
+_MAX_SESSIONS_JSON_BYTES = 50 * 1024 * 1024
+
+
+class SessionsJsonUnusable(ValueError):
+    """`--sessions-json` could not be loaded as a list of session records (I1).
+
+    A `ValueError` subclass so it is still caught anywhere an existing
+    `except ValueError` already wraps adapter construction — but every
+    `owner` verb handler catches this specific type first, so the printed
+    reason is never mislabeled as an identity-resolution failure.
+    """
+
+
+def _load_sessions_json(path: Path) -> list[dict[str, Any]]:
+    """Load and validate a `--sessions-json` file (I1).
+
+    Args:
+        path: the `--sessions-json` path.
+
+    Returns:
+        list[dict[str, Any]]: the parsed session records.
+
+    Raises:
+        SessionsJsonUnusable: for a missing or unreadable file, a file over
+            `_MAX_SESSIONS_JSON_BYTES`, bytes that are not valid UTF-8,
+            content that is not valid JSON, or JSON that is not a list of
+            objects (a bare object, a list of non-dict items, etc). The
+            reason is always human-readable and never a raw traceback.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise SessionsJsonUnusable(f"could not stat {path}: {exc}") from exc
+    if size > _MAX_SESSIONS_JSON_BYTES:
+        raise SessionsJsonUnusable(
+            f"{path} is too large ({size} bytes, limit {_MAX_SESSIONS_JSON_BYTES})"
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SessionsJsonUnusable(f"could not read {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise SessionsJsonUnusable(f"{path} is not valid UTF-8: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SessionsJsonUnusable(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise SessionsJsonUnusable(f"{path} must contain a JSON array of objects")
+    return data
+
+
 def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
     """Construct the `SessionAdapter` selected by `args.harness`.
 
@@ -393,12 +496,15 @@ def _build_adapter(args: argparse.Namespace) -> SessionAdapter:
             the way `PortableAdapter` does (`str(os.getpid())`; see
             `adapter/subagent.py`'s module docstring), so the PM-minted
             dispatch id must be supplied explicitly.
+        SessionsJsonUnusable: `--sessions-json` was given but is unusable
+            (I1) — a `ValueError` subclass, so any pre-existing `except
+            ValueError` around adapter construction still catches it.
     """
     git_timeout = _resolved_git_timeout_override(args.workspace)
     if args.harness == "claude":
         sessions = None
         if args.sessions_json is not None:
-            sessions = json.loads(args.sessions_json.read_text(encoding="utf-8"))
+            sessions = _load_sessions_json(args.sessions_json)
         return ClaudeAdapter(
             args.workspace,
             args.slug,
@@ -1636,6 +1742,579 @@ def _cmd_observe_status(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Exit codes for the `fleet owner` verb group (DESIGN O.3). `2` is
+#: argparse's own reserved usage-error code (unchanged); these three are
+#: this verb group's own, distinct from every other subcommand's 0/1 split.
+_OWNER_EXIT_COORDINATION_REQUIRED = 3
+_OWNER_EXIT_STATE_MISMATCH = 4
+_OWNER_EXIT_NOT_APPLICABLE = 5
+
+
+def _resolve_owner_manifest(args: argparse.Namespace) -> tuple[Path, str] | None:
+    """Resolve `(log_path, project_id)` for an `owner` verb, or `None` if not applicable.
+
+    A deliberate act, never routed through `observe.py`'s fail-soft façade
+    (O-NFR-1) — this prints **exactly one** stderr line and returns `None`
+    when fleet is disabled, the slug fails path-confinement validation, or
+    the project's identity cannot be resolved (OQ-5); the caller must then
+    return exit `5` without writing anything.
+
+    Args:
+        args: parsed CLI arguments carrying `workspace` and `slug`.
+
+    Returns:
+        tuple[Path, str] | None: `(log_path, project_id)`, or `None`.
+    """
+    cfg = fleet_config.resolve_fleet_config(args.workspace)
+    if not cfg.enabled:
+        print(f"fleet owner: not applicable: {cfg.reason}", file=sys.stderr)
+        return None
+
+    # M6: validate the slug even when an operator `manifest_dir` override
+    # means `default_fleet_dir` (the usual validator, below) is never
+    # reached — `read_project_identity` builds a path from this same raw
+    # slug regardless of `cfg.manifest_dir`, so an unsafe slug must be
+    # rejected before that call every time, not only when there is no
+    # override.
+    if not fleet_path_safety.slug_is_safe(args.slug):
+        print(
+            f"fleet owner: not applicable: invalid slug {args.slug!r}: "
+            "path separators and '..' are not permitted",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        fleet_dir = cfg.manifest_dir or fleet_path_safety.default_fleet_dir(args.workspace, args.slug)
+    except fleet_path_safety.InvalidSlug as exc:
+        print(f"fleet owner: not applicable: {exc}", file=sys.stderr)
+        return None
+
+    identity = fleet_project.read_project_identity(args.workspace, args.slug)
+    if identity is None:
+        print(
+            "fleet owner: not applicable: project identity could not be resolved "
+            f"(no Project-id in {args.workspace}/docs/superhuman/{args.slug}/SUPERHUMAN.md)",
+            file=sys.stderr,
+        )
+        return None
+    project_id, _file_slug = identity
+
+    return fleet_dir / "events.jsonl", project_id
+
+
+def _node_id_conflicts_with_self_identity(args: argparse.Namespace) -> bool:
+    """Return whether `--node-id` was given together with a self-identity flag (M3).
+
+    DESIGN O.3 names `claim`/`stand-down`'s identity flags as two MUTUALLY
+    EXCLUSIVE groups: self (`_add_harness_arguments`'s set) or on-behalf
+    (`--node-id`). `--harness` defaults to `"portable"` even when never
+    typed, so a bare `--node-id` (the documented on-behalf shape) must NOT
+    be flagged — only an EXPLICIT self-identity flag conflicts: a
+    non-default `--harness`, or any of `--session-id`/`--local-id`/
+    `--session-relay-script` (none of which has a meaningful non-`None`
+    default).
+
+    Args:
+        args: parsed CLI arguments for `owner claim`/`stand-down`.
+
+    Returns:
+        bool: `True` iff `args.node_id is not None` and at least one
+        self-identity flag was also given.
+    """
+    if args.node_id is None:
+        return False
+    return (
+        args.harness != "portable"
+        or args.session_id is not None
+        or args.local_id is not None
+        or args.session_relay_script is not None
+    )
+
+
+def _resolve_owner_identity(args: argparse.Namespace, *, verb: str) -> str | None:
+    """Resolve the acting node id for an `owner claim`/`stand-down` call.
+
+    Args:
+        args: parsed CLI arguments carrying `node_id`/`writer_role`, plus
+            the harness-identity flags (`_add_harness_arguments`) when
+            acting for self.
+        verb: `"claim"` or `"stand-down"`, for the printed message only.
+
+    Returns:
+        str | None: the resolved `node_id`, or `None` if resolution failed
+        — the caller must then return exit `4` (`--node-id` without
+        `--writer-role cto`) or `1` (adapter construction / identity
+        failure); the message already printed distinguishes the two.
+    """
+    if args.node_id is not None:
+        if args.writer_role.strip().lower() != "cto":
+            print(f"fleet owner {verb}: --node-id requires --writer-role cto", file=sys.stderr)
+            return None
+        return args.node_id
+
+    try:
+        adapter = _build_adapter(args)
+        return adapter.current_session().node_id
+    except SessionsJsonUnusable as exc:
+        # I1: never misreported as an identity-resolution failure, even
+        # though this happens inside `_build_adapter`.
+        print(f"fleet owner {verb}: --sessions-json unusable: {exc}", file=sys.stderr)
+        return None
+    except (ValueError, SessionIdentityUnresolved) as exc:
+        print(f"fleet owner {verb}: could not resolve identity: {exc}", file=sys.stderr)
+        return None
+
+
+def _find_latest_registration(events: list[Event], project_id: str, node_id: str) -> Event | None:
+    """Return the newest `session_registered` event for `node_id`, or `None`.
+
+    Args:
+        events: event-log entries, e.g. as read by `core.events.read_all`.
+        project_id: the project to search.
+        node_id: the registered node to search for.
+
+    Returns:
+        Event | None: the last (newest, by log order) matching registration,
+        or `None` if `node_id` was never registered in `project_id`.
+    """
+    match: Event | None = None
+    for event in events:
+        if event.project_id == project_id and event.type == "session_registered" and event.node_id == node_id:
+            match = event
+    return match
+
+
+def _find_session_record_title(sessions: list[dict[str, Any]] | None, local_id: str) -> str | None:
+    """Return the `title` of the supplied session record matching `local_id`, if any.
+
+    Args:
+        sessions: raw session records from `--sessions-json`, or `None`.
+        local_id: the harness-local session id to match (same extraction
+            rule as `adapter.session_liveness`/`ClaudeAdapter.enumerate_sessions`).
+
+    Returns:
+        str | None: the matching record's `title`, iff EXACTLY ONE record
+        matches `local_id` (M5: the same exactly-one-match rule
+        `adapter.session_liveness.resolve_liveness` applies) and that
+        record has a `title`. Zero matches, two or more matches (ambiguous
+        — printing either one's title could name the wrong session), or a
+        blank/missing `title` all return `None`.
+    """
+    if not sessions:
+        return None
+    matches = [record for record in sessions if extract_claude_session_local_id(record) == local_id]
+    if len(matches) != 1:
+        return None
+    title = matches[0].get("title")
+    return str(title) if title else None
+
+
+def _format_coordination_refusal(
+    log_path: Path,
+    project_id: str,
+    owner_node_id: str,
+    sessions: list[dict[str, Any]] | None,
+) -> str:
+    """Build the exit-3 message naming the current owner (DESIGN O.3).
+
+    Prints the owner's `node_id` (the exact, pastable string for a re-run's
+    `--prior-owner-notified`), its harness/local id, and the
+    workspace/branch/origination from its registration — written for the
+    claiming *agent*, per DESIGN's "the prose seams tell the agent to name
+    the session by title, not id, when reporting to a person."
+
+    Args:
+        log_path: path to the project's event log (re-read fresh, since the
+            refusal's `current_owner` may differ from any owner this call
+            resolved liveness against earlier).
+        project_id: the owning project's id.
+        owner_node_id: the current owner's `node_id`, from `OwnershipRefused.current_owner`.
+        sessions: raw session records from `--sessions-json`, or `None`.
+
+    Returns:
+        str: a multi-line message, no trailing newline.
+    """
+    events = read_all(log_path)
+    try:
+        harness, _workspace, _slug, local_id = parse_node_id(owner_node_id)
+    except ValueError:
+        harness, local_id = "", ""
+
+    lines = [
+        "fleet owner claim: refused - coordination required",
+        f"current owner: {owner_node_id}",
+    ]
+    if harness or local_id:
+        lines.append(f"  harness={harness} local_id={local_id}")
+
+    registration = _find_latest_registration(events, project_id, owner_node_id)
+    if registration is not None:
+        payload = registration.payload
+        lines.append(
+            f"  workspace={payload.get('workspace')} branch={payload.get('branch')!r} "
+            f"origination={payload.get('origination')}"
+        )
+
+    if harness == "claude":
+        title = _find_session_record_title(sessions, local_id)
+        if title:
+            lines.append(f"  title={title}")
+
+    lines.append(
+        f"re-run adding --prior-owner-notified {owner_node_id} --notified-via <how you reached it>"
+    )
+    return "\n".join(lines)
+
+
+def _cmd_owner_claim(args: argparse.Namespace) -> int:
+    """Handle `fleet owner claim` (O-FR-1/3/4/5/6, DESIGN O.3/O.4).
+
+    A deliberate act: never routed through the fail-soft `observe` façade
+    (O-NFR-1). Every refusal or failure is a stated, non-zero exit, and the
+    manifest log is left byte-unchanged on every one of them.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` written, or an already-owner no-op; `1` could not write
+            (lock timeout after bounded retry, validation/ownership error,
+            re-evaluation budget exhausted, adapter-construction/identity
+            failure, an I/O error); `2` if `--prior-owner-notified` and
+            `--notified-via` were not given together; `3` refused,
+            coordination required (an active prior owner with no or
+            mismatched attestation); `4` refused, state is not what was
+            assumed (`--node-id` without `--writer-role cto`, or the
+            claimant is not registered in this project); `5` not
+            applicable (fleet disabled, an invalid slug, or the project
+            identity could not be resolved).
+    """
+    if (args.prior_owner_notified is None) != (args.notified_via is None):
+        print(
+            "fleet owner claim: --prior-owner-notified and --notified-via "
+            "must be given together",
+            file=sys.stderr,
+        )
+        return 2
+
+    if _node_id_conflicts_with_self_identity(args):
+        print(
+            "fleet owner claim: --node-id is mutually exclusive with self-identity flags "
+            "(--harness/--session-id/--local-id/--session-relay-script)",
+            file=sys.stderr,
+        )
+        return 2
+
+    resolved = _resolve_owner_manifest(args)
+    if resolved is None:
+        return _OWNER_EXIT_NOT_APPLICABLE
+    log_path, project_id = resolved
+
+    claimant = _resolve_owner_identity(args, verb="claim")
+    if claimant is None:
+        return 1 if args.node_id is None else _OWNER_EXIT_STATE_MISMATCH
+
+    sessions: list[dict[str, Any]] | None = None
+    if args.sessions_json is not None:
+        try:
+            sessions = _load_sessions_json(args.sessions_json)
+        except SessionsJsonUnusable as exc:
+            print(f"fleet owner claim: --sessions-json unusable: {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        events = read_all(log_path)
+    except OSError as exc:
+        # M4: bare read_all calls elsewhere crashed uncaught on this; wrap
+        # it the same way `owner show` already does.
+        print(f"fleet owner claim: could not read manifest: {exc}", file=sys.stderr)
+        return 1
+    # C1: build liveness for EVERY node registered in this project, not just
+    # the one owner this unlocked read happens to see. `claim()` re-resolves
+    # the prior owner on every re-evaluation under the lock (DESIGN O.5 step
+    # 6); a mapping keyed by node id lets it look up the right node's
+    # liveness each time, instead of this call blindly handing it a single
+    # value resolved for whatever owner was current a moment ago.
+    registered_nodes = {
+        event.node_id
+        for event in events
+        if event.project_id == project_id and event.type == "session_registered"
+    }
+    liveness_map = {node_id: resolve_liveness(node_id, sessions) for node_id in registered_nodes}
+    liveness_source = "sessions-json" if args.sessions_json is not None else "not-supplied"
+
+    try:
+        event = _call_with_bounded_lock_retry(
+            lambda: owner_claim(
+                log_path,
+                project_id=project_id,
+                claimant=claimant,
+                writer_role=args.writer_role,
+                liveness=liveness_map,
+                liveness_source=liveness_source,
+                attested_owner=args.prior_owner_notified,
+                notified_via=args.notified_via,
+            ),
+            attempts=args.lock_retry_attempts,
+            backoff=_DEFAULT_LOCK_RETRY_BACKOFF,
+        )
+    except OwnershipRefused as exc:
+        if exc.code in ("coordination_required", "attestation_mismatch"):
+            try:
+                message = _format_coordination_refusal(log_path, project_id, exc.current_owner, sessions)
+            except OSError as read_exc:
+                # M4: `_format_coordination_refusal` re-reads the manifest
+                # (its own bare `read_all`) to enrich the exit-3 message;
+                # wrap it the same way `owner show` already does.
+                print(f"fleet owner claim: could not read manifest: {read_exc}", file=sys.stderr)
+                return 1
+            print(message, file=sys.stderr)
+            return _OWNER_EXIT_COORDINATION_REQUIRED
+        print(f"fleet owner claim: refused ({exc.code}): {exc}", file=sys.stderr)
+        return _OWNER_EXIT_STATE_MISMATCH
+    except OwnershipContended as exc:
+        print(f"fleet owner claim: {exc}", file=sys.stderr)
+        return 1
+    except (LockTimeoutError, ValidationError, OwnershipError, ValueError, OSError) as exc:
+        print(f"fleet owner claim: could not write: {exc}", file=sys.stderr)
+        return 1
+
+    if event is None:
+        print(f"{claimant} already owns this project")
+    else:
+        print(f"{claimant} claimed ownership (event_id={event.event_id})")
+    return 0
+
+
+def _cmd_owner_stand_down(args: argparse.Namespace) -> int:
+    """Handle `fleet owner stand-down` (O-FR-2, DESIGN O.3).
+
+    A deliberate act, never routed through `observe.py` (O-NFR-1).
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` written, or an already-stood-down no-op; `1` could not
+            write (lock timeout, validation/ownership error, re-evaluation
+            budget exhausted, adapter-construction/identity failure, an I/O
+            error); `4` refused (`--node-id` without `--writer-role cto`,
+            or `node` is not the project's current owner); `5` not
+            applicable (fleet disabled, an invalid slug, or the project
+            identity could not be resolved).
+    """
+    if _node_id_conflicts_with_self_identity(args):
+        print(
+            "fleet owner stand-down: --node-id is mutually exclusive with self-identity flags "
+            "(--harness/--session-id/--local-id/--session-relay-script)",
+            file=sys.stderr,
+        )
+        return 2
+
+    resolved = _resolve_owner_manifest(args)
+    if resolved is None:
+        return _OWNER_EXIT_NOT_APPLICABLE
+    log_path, project_id = resolved
+
+    node = _resolve_owner_identity(args, verb="stand-down")
+    if node is None:
+        return 1 if args.node_id is None else _OWNER_EXIT_STATE_MISMATCH
+
+    try:
+        event = _call_with_bounded_lock_retry(
+            lambda: owner_stand_down(
+                log_path,
+                project_id=project_id,
+                node=node,
+                writer_role=args.writer_role,
+                reason=args.reason,
+            ),
+            attempts=args.lock_retry_attempts,
+            backoff=_DEFAULT_LOCK_RETRY_BACKOFF,
+        )
+    except OwnershipRefused as exc:
+        print(f"fleet owner stand-down: refused ({exc.code}): {exc}", file=sys.stderr)
+        return _OWNER_EXIT_STATE_MISMATCH
+    except OwnershipContended as exc:
+        print(f"fleet owner stand-down: {exc}", file=sys.stderr)
+        return 1
+    except (LockTimeoutError, ValidationError, OwnershipError, ValueError, OSError) as exc:
+        print(f"fleet owner stand-down: could not write: {exc}", file=sys.stderr)
+        return 1
+
+    if event is None:
+        print(f"{node} already stood down")
+    else:
+        print(f"{node} stood down (event_id={event.event_id})")
+    return 0
+
+
+def _cmd_owner_show(args: argparse.Namespace) -> int:
+    """Handle `fleet owner show` (O-NFR-3, DESIGN O.3).
+
+    Read-only: prints the current owner, the basis of the claim that made
+    it owner (via the log's own events), and the last few ownership events.
+
+    Args:
+        args: parsed CLI arguments.
+
+    Returns:
+        int: `0` if readable; `1` on a read failure; `5` not applicable
+            (fleet disabled, an invalid slug, or the project identity could
+            not be resolved).
+    """
+    resolved = _resolve_owner_manifest(args)
+    if resolved is None:
+        return _OWNER_EXIT_NOT_APPLICABLE
+    log_path, project_id = resolved
+
+    try:
+        events = read_all(log_path)
+    except OSError as exc:
+        print(f"fleet owner show: could not read manifest: {exc}", file=sys.stderr)
+        return 1
+
+    state = owner_fold_owner(events, project_id)
+
+    # I4: the declaring event carries the basis/attestation/prior_owner the
+    # current owner's claim was decided on (DESIGN O.3: "`show` ... prints
+    # the current owner, the basis and attestation of the claim that made it
+    # owner"). `None` when there is no current owner.
+    declaring_event = (
+        next((e for e in events if e.event_id == state.declaring_event_id), None)
+        if state.declaring_event_id is not None
+        else None
+    )
+    basis = declaring_event.payload.get("basis") if declaring_event is not None else None
+    prior_owner = declaring_event.payload.get("prior_owner") if declaring_event is not None else None
+    attestation = declaring_event.payload.get("attestation") if declaring_event is not None else None
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "owner": state.owner,
+                    "has_ownership_events": state.has_ownership_events,
+                    "anchor": state.anchor,
+                    "anchor_kind": state.anchor_kind,
+                    "anchor_node": state.anchor_node,
+                    "basis": basis,
+                    "prior_owner": prior_owner,
+                    "attestation": attestation,
+                }
+            )
+        )
+        return 0
+
+    if not state.has_ownership_events:
+        print("no declared owner (no ownership events)")
+        return 0
+    if state.owner is None:
+        print(f"no declared owner (stood down; last anchor={state.anchor})")
+        return 0
+
+    print(f"owner: {state.owner}")
+    print(f"  basis: {basis}")
+    print(f"  prior_owner: {prior_owner}")
+    print(f"  attestation: {attestation}")
+    recent = [
+        e
+        for e in events
+        if e.project_id == project_id and e.type in ("ownership_declared", "ownership_stood_down")
+    ][-5:]
+    for e in recent:
+        print(f"  {e.ts}  {e.type}  node={e.node_id}  event_id={e.event_id}")
+    return 0
+
+
+def _add_owner_subparsers(subparsers: argparse._SubParsersAction) -> None:
+    """Wire the `owner claim|stand-down|show` verb group (O-NFR-1, DESIGN O.3).
+
+    A sibling of `register`/`handoff`/`done` — deliberately **not** inside
+    the `observe` verb group: these are deliberate acts that fail loudly
+    (non-zero exit, a stated reason), never the fail-soft façade's
+    always-exits-0 contract.
+
+    Args:
+        subparsers: the top-level `fleet` subparsers action to attach to.
+    """
+    owner_parser = subparsers.add_parser(
+        "owner",
+        help="Declare, hand over, or inspect a project's owning session. "
+        "Deliberate acts: fails loudly, never silently (see `observe` for the fail-soft façade).",
+    )
+    owner_subparsers = owner_parser.add_subparsers(dest="owner_command", required=True)
+
+    claim_parser = owner_subparsers.add_parser(
+        "claim", help="Claim ownership of a project (O-FR-1/3/4/5/6)."
+    )
+    claim_parser.add_argument("--workspace", required=True, type=Path, help="the project's working tree root")
+    claim_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    claim_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    claim_parser.add_argument(
+        "--node-id",
+        default=None,
+        help="claim on behalf of this node id instead of self (requires --writer-role cto)",
+    )
+    claim_parser.add_argument(
+        "--prior-owner-notified",
+        default=None,
+        help="the current owner's node id, attesting it was notified (must be given "
+        "together with --notified-via)",
+    )
+    claim_parser.add_argument(
+        "--notified-via",
+        default=None,
+        help="how the prior owner named by --prior-owner-notified was reached "
+        "(must be given together with --prior-owner-notified)",
+    )
+    claim_parser.add_argument(
+        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+    )
+    _add_harness_arguments(
+        claim_parser,
+        sessions_json_help=(
+            "harness session records used ONLY for prior-owner liveness (DESIGN O.4), "
+            "for the claimant's own harness or any prior owner's -- not just --harness claude"
+        ),
+    )
+    claim_parser.set_defaults(func=_cmd_owner_claim)
+
+    stand_down_parser = owner_subparsers.add_parser(
+        "stand-down", help="Stand down as a project's owner (O-FR-2)."
+    )
+    stand_down_parser.add_argument("--workspace", required=True, type=Path, help="the project's working tree root")
+    stand_down_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    stand_down_parser.add_argument(
+        "--writer-role", default="pm", help="a role name, never an AI/model/vendor string"
+    )
+    stand_down_parser.add_argument(
+        "--node-id",
+        default=None,
+        help="stand down this node id instead of self (requires --writer-role cto)",
+    )
+    stand_down_parser.add_argument("--reason", default=None, help="optional single-line free-text reason")
+    stand_down_parser.add_argument(
+        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+    )
+    _add_harness_arguments(
+        stand_down_parser,
+        sessions_json_help="unused by stand-down (present only so --harness claude self-identity resolution finds the attribute)",
+    )
+    stand_down_parser.set_defaults(func=_cmd_owner_stand_down)
+
+    show_parser = owner_subparsers.add_parser(
+        "show", help="Show a project's current declared owner (O-NFR-3)."
+    )
+    show_parser.add_argument("--workspace", required=True, type=Path, help="the project's working tree root")
+    show_parser.add_argument("--slug", required=True, help="the superhuman project slug")
+    show_parser.add_argument("--json", action="store_true", help="print machine-readable JSON instead")
+    show_parser.set_defaults(func=_cmd_owner_show)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the `fleet` argument parser.
 
@@ -1740,6 +2419,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_query_subparsers(subparsers)
     _add_view_subparsers(subparsers)
     _add_observe_subparsers(subparsers)
+    _add_owner_subparsers(subparsers)
     _add_locate_subparser(subparsers)
     _add_doctor_subparser(subparsers)
     _add_project_subparsers(subparsers)
@@ -1948,7 +2628,9 @@ def _add_hooks_subparsers(subparsers: argparse._SubParsersAction) -> None:
     status_parser.set_defaults(func=_cmd_hooks_status)
 
 
-def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_harness_arguments(
+    parser: argparse.ArgumentParser, *, sessions_json_help: str | None = None
+) -> None:
     """Attach the shared `--harness`/session-identity arguments `_build_adapter` needs.
 
     Factored out of `_add_observe_subparsers` since every `observe`
@@ -1957,6 +2639,15 @@ def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
 
     Args:
         parser: the subcommand parser to attach the arguments to.
+        sessions_json_help: override for `--sessions-json`'s help text
+            (M2) — every `observe` verb and `register` use `--sessions-json`
+            strictly for `--harness claude` self-identity resolution, so the
+            default text ("--harness claude only") is correct for them. The
+            `owner` verb group's callers pass their own: `claim` uses it for
+            prior-owner liveness regardless of the CLAIMANT's harness
+            (DESIGN O.3), and `stand-down` never reads it at all (it is
+            registered there only so `_build_adapter`'s `--harness claude`
+            branch always finds the attribute).
     """
     parser.add_argument(
         "--harness",
@@ -1967,7 +2658,12 @@ def _add_harness_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--session-id", default=None, help="--harness claude only: see `register`'s equivalent flag"
     )
-    parser.add_argument("--sessions-json", type=Path, default=None, help="--harness claude only")
+    parser.add_argument(
+        "--sessions-json",
+        type=Path,
+        default=None,
+        help=sessions_json_help or "--harness claude only",
+    )
     parser.add_argument(
         "--session-relay-script", type=Path, default=None, help="--harness claude only"
     )

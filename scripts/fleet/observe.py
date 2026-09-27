@@ -40,7 +40,8 @@ from . import config as fleet_config
 from . import project as fleet_project
 from .adapter.base import SessionAdapter
 from .bounded_journal import append_bounded_line
-from .path_safety import slug_is_safe
+from .path_safety import InvalidSlug
+from .path_safety import default_fleet_dir as _validated_default_fleet_dir
 from .core.errors import LockTimeoutError, OwnershipError, SessionIdentityUnresolved, ValidationError
 from .handoff import emit as handoff_emit_impl
 from .handoff import extract_handoff_id
@@ -74,55 +75,16 @@ _SELF_IGNORE_CONTENT = "*\n"
 _EVENTS_FILENAME = "events.jsonl"
 
 
-def _validate_slug(slug: str) -> None:
-    """Reject a slug that could walk the fleet manifest path outside the project.
-
-    Phase 3.3 preflight FIX 4: `_default_fleet_dir` builds
-    `<workspace>/docs/superhuman/<slug>/fleet` from a raw CLI/caller-supplied
-    `slug` with no prior validation anywhere in this façade. A slug
-    containing a path separator or a `..` segment (e.g. `"../../escape"`)
-    would resolve outside the project tree — most dangerous on this
-    module's own error branches (`journal_early_cli_failure`, the
-    `_IdentityUnresolved` journal calls), which are the least-noticed paths
-    and the ones a hostile/malformed `--slug` is most likely to reach
-    unexamined. This is the single chokepoint every `_default_fleet_dir`
-    call in this module passes through, so one check here covers all of
-    them.
-
-    The character check itself lives in `path_safety.slug_is_safe` (moved
-    there at preflight B5, which found `role_block.py`'s own
-    `record_role_gate_decision` builds the identical shape of path from the
-    identical shape of untrusted input and had never inherited this guard —
-    a shared, public helper replaces what would otherwise be two
-    independently-maintained copies of one check).
-
-    Raises the existing `_Disabled` sentinel rather than a new exception
-    type: every caller of `_default_fleet_dir` already has a "fleet is
-    disabled/unconfigured for this workspace" branch, so an invalid slug is
-    handled identically — no path is built, nothing is written, and the
-    caller reports `disabled`/`"not configured"` (or, for
-    `journal_early_cli_failure`'s bare `except Exception: pass`, silently
-    does nothing at all — still a clean rejection, never a path escape).
-
-    Args:
-        slug: the superhuman project slug to validate.
-
-    Raises:
-        _Disabled: if `slug` contains `/`, `\\`, or a `..` segment.
-    """
-    if not slug_is_safe(slug):
-        raise _Disabled(
-            f"invalid slug {slug!r}: path separators and '..' are not permitted"
-        )
-
-
 def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
     """Return the default per-project fleet manifest directory.
 
-    Deliberately duplicated from `cli.py`'s private helper of the same name
-    (not imported): `cli.py` imports this module to wire the `observe` verb
-    group, so this module must not import `cli.py` at module-load time (it
-    does import `cli.register_session` lazily, inside function bodies, for
+    Thin wrapper over the shared, slug-validated `path_safety.default_fleet_dir`
+    (Phase 3.3 preflight FIX 4; extracted to `path_safety` in increment O so
+    the `fleet owner` verb group can resolve the identical, validated
+    location without importing this module's fail-soft machinery — DESIGN
+    O.3). `cli.py` imports this module to wire the `observe` verb group, so
+    this module must not import `cli.py` at module-load time (it does
+    import `cli.register_session` lazily, inside function bodies, for
     exactly this reason — see `_observe_register`).
 
     Args:
@@ -133,7 +95,7 @@ def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
         Path: `<workspace>/docs/superhuman/<slug>/fleet`.
 
     Raises:
-        _Disabled: if `slug` fails `_validate_slug` (FIX 4) — a
+        _Disabled: if `slug` fails validation (FIX 4) — a
             path-traversal-shaped slug is rejected here, before any path is
             built or any I/O happens. Also raised (Phase 3.3 preflight
             RE-RUN item E) if the built path does not actually resolve
@@ -144,13 +106,10 @@ def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
             `record_role_gate_decision` (which this module previously had
             no equivalent of).
     """
-    _validate_slug(slug)
-    workspace_path = Path(workspace)
-    fleet_dir = workspace_path / "docs" / "superhuman" / slug / "fleet"
-    expected_root = (workspace_path / "docs" / "superhuman" / slug).resolve()
-    if not fleet_dir.resolve().is_relative_to(expected_root):
-        raise _Disabled(f"slug {slug!r} resolves outside the workspace ({workspace_path})")
-    return fleet_dir
+    try:
+        return _validated_default_fleet_dir(workspace, slug)
+    except InvalidSlug as exc:
+        raise _Disabled(str(exc)) from exc
 
 
 def _journal_path(fleet_dir: Path) -> Path:

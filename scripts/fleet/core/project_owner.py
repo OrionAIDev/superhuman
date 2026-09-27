@@ -19,6 +19,7 @@ layer's job (`adapter/session_liveness.py`, a later chunk).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -311,7 +312,7 @@ class ClaimDecision:
 def decide_claim(
     state: OwnerState,
     claimant: str,
-    liveness: str,
+    liveness: Mapping[str, str],
     attested_owner: str | None,
     *,
     legacy: tuple[str, str] | None = None,
@@ -324,9 +325,17 @@ def decide_claim(
     Args:
         state: the project's current `fold_owner` snapshot.
         claimant: the claiming node's `node_id`.
-        liveness: the prior owner's liveness — `"active"`, `"unknown"`,
-            `"archived"`, or `"deleted"` (O-FR-5: `"unknown"` counts as
-            active — coordination is still required). Ignored when there is
+        liveness: `node_id -> liveness` for every node this decision might
+            need (DESIGN O.4: "a `Mapping[node_id, Liveness]` built for
+            every node registered in the project"). The liveness actually
+            used is looked up here, by whichever prior owner (declared or
+            legacy) THIS call resolves — never a value the caller resolved
+            against a possibly-stale owner (C1: the caller may have read
+            the owner unlocked before a race changed it; looking the
+            mapping up here, against the owner this exact decision is
+            about, is what keeps a re-evaluation honest). A missing key
+            defaults to `"unknown"` (O-FR-5: `"unknown"` counts as active —
+            coordination is still required). Ignored entirely when there is
             no prior owner.
         attested_owner: the `node_id` the caller attests it notified, or
             `None` if no attestation was given.
@@ -354,11 +363,13 @@ def decide_claim(
     else:
         return ClaimDecision(outcome=CLAIM_UNOWNED, basis="unowned", prior_owner_kind="none")
 
-    if liveness in _LIVENESS_ENDS_OWNERSHIP:
+    resolved_liveness = liveness.get(prior_owner, "unknown")
+
+    if resolved_liveness in _LIVENESS_ENDS_OWNERSHIP:
         return ClaimDecision(
             outcome=CLAIM_OVER,
             prior_owner=prior_owner,
-            basis=liveness,
+            basis=resolved_liveness,
             prior_owner_kind=prior_owner_kind,
             prior_owner_registration_event_id=prior_registration_event_id,
         )
@@ -546,7 +557,7 @@ def claim(
     project_id: str,
     claimant: str,
     writer_role: str,
-    liveness: str = "unknown",
+    liveness: Mapping[str, str] | None = None,
     liveness_source: str = "not-supplied",
     attested_owner: str | None = None,
     notified_via: str | None = None,
@@ -568,9 +579,15 @@ def claim(
         claimant: the claiming node's `node_id`.
         writer_role: `"pm"`, or `"cto"` when writing on the claimant's
             behalf (Decision O2 — must be in the ownership-event allowlist).
-        liveness: the prior owner's liveness, if any — `"active"`,
-            `"unknown"` (the default — conservative when the caller has not
-            resolved liveness), `"archived"`, or `"deleted"`.
+        liveness: `node_id -> liveness` (`"active"`/`"unknown"`/`"archived"`/
+            `"deleted"`) for every node this call might need — typically
+            built by the CLI over every node registered in the project
+            (DESIGN O.4). `None` (the default) is treated as `{}`. A missing
+            key resolves to `"unknown"` (conservative when the caller has
+            not resolved liveness for that node). Looked up fresh on EVERY
+            re-evaluation, against whichever prior owner (declared or
+            legacy) that specific re-evaluation resolves — never against a
+            owner the caller may have resolved unlocked before a race (C1).
         liveness_source: `"sessions-json"` or `"not-supplied"` (default) —
             recorded on the event for audit, not interpreted here.
         attested_owner: the `node_id` the caller attests it notified, or
@@ -595,6 +612,8 @@ def claim(
         ValidationError, OwnershipError, LockTimeoutError: as raised by
             `core.events.append_batch`.
     """
+    liveness_map: Mapping[str, str] = liveness if liveness is not None else {}
+
     for _ in range(_MAX_REEVALUATIONS + 1):
         events = read_all(log_path)
 
@@ -607,7 +626,7 @@ def claim(
             if state.has_ownership_events
             else resolve_legacy_owner(events, project_id, claimant)
         )
-        decision = decide_claim(state, claimant, liveness, attested_owner, legacy=legacy)
+        decision = decide_claim(state, claimant, liveness_map, attested_owner, legacy=legacy)
 
         if decision.outcome == NOOP_ALREADY_OWNER:
             return None
@@ -616,13 +635,18 @@ def claim(
         if decision.outcome == REFUSE_ATTESTATION_MISMATCH:
             raise OwnershipRefused("attestation_mismatch", current_owner=decision.prior_owner)
 
+        resolved_liveness = (
+            liveness_map.get(decision.prior_owner, "unknown")
+            if decision.prior_owner is not None
+            else "unknown"
+        )
         claim_event = _build_claim_event(
             project_id=project_id,
             claimant=claimant,
             writer_role=writer_role,
             decision=decision,
             anchor=state.anchor,
-            liveness=liveness,
+            liveness=resolved_liveness,
             liveness_source=liveness_source,
             attested_owner=attested_owner,
             notified_via=notified_via,

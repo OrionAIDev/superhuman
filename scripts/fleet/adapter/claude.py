@@ -58,6 +58,7 @@ from .base import (
     GitFacts,
     SessionAdapter,
     SessionInfo,
+    extract_claude_session_local_id,
     format_handoff_line,
     format_launch_instruction,
     workspace_component,
@@ -237,7 +238,7 @@ class ClaudeAdapter(SessionAdapter):
         records = self._enrich_sessions_via_script()
         result: list[SessionInfo] = []
         for record in records:
-            local_id = str(record.get("sessionId") or record.get("session_id") or "").strip()
+            local_id = extract_claude_session_local_id(record)
             if not local_id:
                 continue
             cwd = str(record.get("cwd") or self.workspace)

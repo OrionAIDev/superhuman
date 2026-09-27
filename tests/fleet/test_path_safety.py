@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from scripts.fleet.path_safety import slug_is_safe
+from scripts.fleet.path_safety import InvalidSlug, default_fleet_dir, slug_is_safe
 
 
 class TestSlugIsSafe:
@@ -111,3 +111,47 @@ class TestSlugIsSafe:
             "sanity check failed: a drive-qualified slug must escape a joined path "
             "for this to be the defect item E describes"
         )
+
+
+class TestDefaultFleetDir:
+    """`default_fleet_dir` -- the shared, slug-validated helper extracted at
+    increment O (DESIGN O.3) so the `fleet owner` verb group resolves the
+    identical manifest location `observe.py` does, without importing
+    `observe.py`'s fail-soft machinery.
+    """
+
+    def test_ordinary_workspace_and_slug(self, tmp_path: "Path") -> None:
+        result = default_fleet_dir(tmp_path, "demo-project")
+        assert result == tmp_path / "docs" / "superhuman" / "demo-project" / "fleet"
+
+    @pytest.mark.parametrize(
+        "slug",
+        ["../../evil", "..", "foo/bar", "foo\\bar", "", ".", "C:evil"],
+    )
+    def test_unsafe_slug_raises_invalid_slug(self, tmp_path: "Path", slug: str) -> None:
+        with pytest.raises(InvalidSlug):
+            default_fleet_dir(tmp_path, slug)
+
+    def test_symlink_style_escape_raises_invalid_slug(
+        self, tmp_path: "Path", monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A slug that is itself ordinary and `slug_is_safe` can still
+        escape if the built `fleet` path resolves somewhere else entirely
+        (a symlinked `fleet` subdirectory) -- defense in depth beyond the
+        character check, mirroring `role_block.py`'s confinement check."""
+        from pathlib import Path
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        escape_target = tmp_path / "escaped"
+        real_resolve = Path.resolve
+
+        def _fake_resolve(self: "Path", *args: object, **kwargs: object) -> "Path":
+            if self.name == "fleet":
+                return escape_target
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", _fake_resolve)
+
+        with pytest.raises(InvalidSlug):
+            default_fleet_dir(workspace, "demo-slug")

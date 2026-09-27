@@ -123,6 +123,19 @@ def _events(*raw: dict) -> list[Event]:
     return [validate_event(d) for d in raw]
 
 
+class _AlwaysArchivedLiveness(dict):
+    """A liveness mapping that resolves `"archived"` for ANY node id.
+
+    Used by tests where the contended-owner identity changes on every
+    re-evaluation (a fresh `racer-<n>` node each time) and the test's intent
+    is "the prior owner is always archived, whoever it currently is" — not
+    a fixed, enumerable set of node ids known in advance.
+    """
+
+    def get(self, key, default=None):  # noqa: ARG002 - default unused by design
+        return "archived"
+
+
 class TestFoldOwnerTruthTable:
     """TC-O7: fold_owner's truth table (O-FR-2, O-NFR-3)."""
 
@@ -398,7 +411,7 @@ class TestDecideClaimOutcomeMatrix:
         state = fold_owner([], PROJECT_ID)
         for liveness in ("active", "unknown", "archived", "deleted"):
             for attested in (None, "someone"):
-                decision = decide_claim(state, "nodeA", liveness, attested)
+                decision = decide_claim(state, "nodeA", {"nodeP": liveness}, attested)
                 assert decision.outcome == CLAIM_UNOWNED
                 assert decision.basis == "unowned"
 
@@ -407,7 +420,7 @@ class TestDecideClaimOutcomeMatrix:
         state = fold_owner(events, PROJECT_ID)
         for liveness in ("active", "unknown", "archived", "deleted"):
             for attested in (None, "nodeA", "someone-else"):
-                decision = decide_claim(state, "nodeA", liveness, attested)
+                decision = decide_claim(state, "nodeA", {"nodeA": liveness}, attested)
                 assert decision.outcome == NOOP_ALREADY_OWNER
 
     @pytest.mark.parametrize("liveness", ["archived", "deleted"])
@@ -417,7 +430,7 @@ class TestDecideClaimOutcomeMatrix:
         events = _events(_declared("nodeP", "e1"))
         state = fold_owner(events, PROJECT_ID)
         for attested in (None, "nodeP", "someone-else"):
-            decision = decide_claim(state, "nodeA", liveness, attested)
+            decision = decide_claim(state, "nodeA", {"nodeP": liveness}, attested)
             assert decision.outcome == CLAIM_OVER
             assert decision.basis == liveness
             assert decision.prior_owner == "nodeP"
@@ -428,7 +441,7 @@ class TestDecideClaimOutcomeMatrix:
     ) -> None:
         events = _events(_declared("nodeP", "e1"))
         state = fold_owner(events, PROJECT_ID)
-        decision = decide_claim(state, "nodeA", liveness, "nodeP")
+        decision = decide_claim(state, "nodeA", {"nodeP": liveness}, "nodeP")
         assert decision.outcome == CLAIM_OVER
         assert decision.basis == "notified"
 
@@ -438,7 +451,7 @@ class TestDecideClaimOutcomeMatrix:
     ) -> None:
         events = _events(_declared("nodeP", "e1"))
         state = fold_owner(events, PROJECT_ID)
-        decision = decide_claim(state, "nodeA", liveness, None)
+        decision = decide_claim(state, "nodeA", {"nodeP": liveness}, None)
         assert decision.outcome == REFUSE_COORDINATION_REQUIRED
         assert decision.prior_owner == "nodeP"
 
@@ -446,8 +459,18 @@ class TestDecideClaimOutcomeMatrix:
     def test_owned_by_other_with_mismatched_attestation_is_refused(self, liveness: str) -> None:
         events = _events(_declared("nodeP", "e1"))
         state = fold_owner(events, PROJECT_ID)
-        decision = decide_claim(state, "nodeA", liveness, "some-other-node")
+        decision = decide_claim(state, "nodeA", {"nodeP": liveness}, "some-other-node")
         assert decision.outcome == REFUSE_ATTESTATION_MISMATCH
+        assert decision.prior_owner == "nodeP"
+
+    def test_missing_map_entry_for_the_resolved_prior_owner_defaults_to_unknown(self) -> None:
+        """C1: a mapping that simply omits the resolved prior owner (as
+        opposed to naming it "unknown" explicitly) must fall back to
+        `"unknown"`, not silently skip the coordination requirement."""
+        events = _events(_declared("nodeP", "e1"))
+        state = fold_owner(events, PROJECT_ID)
+        decision = decide_claim(state, "nodeA", {}, None)
+        assert decision.outcome == REFUSE_COORDINATION_REQUIRED
         assert decision.prior_owner == "nodeP"
 
     def test_revert_to_red_treating_unknown_like_archived_breaks_coordination(self) -> None:
@@ -456,7 +479,7 @@ class TestDecideClaimOutcomeMatrix:
         requirement), this "requires coordination" assertion would fail."""
         events = _events(_declared("nodeP", "e1"))
         state = fold_owner(events, PROJECT_ID)
-        decision = decide_claim(state, "nodeA", "unknown", None)
+        decision = decide_claim(state, "nodeA", {"nodeP": "unknown"}, None)
         assert decision.outcome == REFUSE_COORDINATION_REQUIRED
 
 
@@ -508,7 +531,7 @@ class TestClaimRetryAndNoop:
             project_id=PROJECT_ID,
             claimant="nodeB",
             writer_role="pm",
-            liveness="archived",
+            liveness={"nodeA": "archived"},
         )
         # nodeA re-claims after the takeover — must be a NEW event, not a
         # dedupe against its own first claim.
@@ -517,7 +540,7 @@ class TestClaimRetryAndNoop:
             project_id=PROJECT_ID,
             claimant="nodeA",
             writer_role="pm",
-            liveness="archived",
+            liveness={"nodeB": "archived"},
         )
         assert second is not None
         assert second.event_id != first.event_id
@@ -624,7 +647,7 @@ def _claim_racer_worker(
             project_id=PROJECT_ID,
             claimant=claimant,
             writer_role=writer_role,
-            liveness="active",
+            liveness={attested_owner: "active"},
             attested_owner=attested_owner,
             notified_via="slack",
         )
@@ -649,7 +672,7 @@ class TestExactlyOneStandDownOFR4:
             project_id=PROJECT_ID,
             claimant="nodeA",
             writer_role="pm",
-            liveness="archived",
+            liveness={"nodeP": "archived"},
         )
 
         standdowns = [
@@ -788,7 +811,7 @@ class TestOrphanStanddownVacatesNothingI1:
         legacy = resolve_legacy_owner(events_before, PROJECT_ID, "nodeA")
         assert legacy == ("legacyPM", "eid-reg-legacyPM")
         state = fold_owner(events_before, PROJECT_ID)
-        decision = decide_claim(state, "nodeA", "unknown", "legacyPM", legacy=legacy)
+        decision = decide_claim(state, "nodeA", {"legacyPM": "unknown"}, "legacyPM", legacy=legacy)
         assert decision.outcome == CLAIM_OVER
         assert decision.prior_owner_kind == "legacy"
 
@@ -871,7 +894,7 @@ class TestClaimTornBatchDeclaredVariantI3:
 
         events_before = read_all(log_path)
         state = fold_owner(events_before, PROJECT_ID)
-        decision = decide_claim(state, "nodeA", "archived", None)
+        decision = decide_claim(state, "nodeA", {"nodeP": "archived"}, None)
         assert decision.outcome == CLAIM_OVER
 
         from scripts.fleet.core.project_owner import _build_claim_event, _build_standdown_event
@@ -906,7 +929,7 @@ class TestClaimTornBatchDeclaredVariantI3:
         assert fold_owner(read_all(log_path), PROJECT_ID).owner == "nodeP"
 
         result = claim(
-            log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm", liveness="archived"
+            log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm", liveness={"nodeP": "archived"}
         )
         assert result is not None
         assert fold_owner(read_all(log_path), PROJECT_ID).owner == "nodeA"
@@ -960,6 +983,74 @@ class TestClaimPreconditionAlsoCoversLegacyResolutionI2:
         )
 
 
+class TestClaimLivenessResolvedPerReevaluatedOwnerC1:
+    """C1: liveness must be looked up for whichever prior owner THIS
+    re-evaluation resolves, never a single value the caller resolved
+    against a possibly-stale owner before the race.
+
+    Probe (DESIGN O.4): owner A is archived, B is active. B claims over A
+    between the caller's unlocked read and core's own read. A caller that
+    resolves liveness once, for A, and hands `claim()` that single value
+    would let core land a claim over B with `basis=archived` and no
+    attestation -- exactly wrong, since B is a live session. A mapping
+    covering every registered node, looked up fresh by whichever owner each
+    re-evaluation actually resolves, must instead force coordination for B.
+    """
+
+    def test_a_late_race_forces_coordination_for_the_new_owner_not_the_stale_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from scripts.fleet.core import project_owner as po_mod
+
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA"))
+        append(log_path, _register("nodeB"))
+        append(log_path, _register("nodeC"))
+        claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+
+        real_read_all = po_mod.read_all
+        calls = {"n": 0}
+
+        def _racing_read_all(path):
+            calls["n"] += 1
+            result = real_read_all(path)
+            if calls["n"] == 1:
+                # nodeB takes real ownership over nodeA between this
+                # unlocked read and claim()'s locked write -- nodeB is a
+                # live (active) session, unlike archived nodeA.
+                append(path, _declared("nodeB", "e-nodeB-takeover"))
+            return result
+
+        monkeypatch.setattr(po_mod, "read_all", _racing_read_all)
+
+        # nodeA (the owner this call's FIRST unlocked read sees) is
+        # archived; nodeB (who actually wins the race) is active. The old,
+        # single-string-liveness design could only ever hand `claim()` one
+        # value, resolved for nodeA -- and that value would then get
+        # blindly applied to whichever owner core re-resolved, including
+        # nodeB.
+        liveness_map = {"nodeA": "archived", "nodeB": "active"}
+
+        with pytest.raises(OwnershipRefused) as exc_info:
+            claim(
+                log_path,
+                project_id=PROJECT_ID,
+                claimant="nodeC",
+                writer_role="pm",
+                liveness=liveness_map,
+            )
+
+        assert exc_info.value.code == "coordination_required"
+        assert exc_info.value.current_owner == "nodeB"
+        assert calls["n"] == 2, "the precondition mismatch must trigger exactly one re-evaluation"
+
+        declared_after = [e for e in read_all(log_path) if e.type == "ownership_declared"]
+        assert not any(e.node_id == "nodeC" for e in declared_after), (
+            "nodeC's claim must never land with basis=archived over an owner "
+            "(nodeB) this mapping marks active"
+        )
+
+
 class TestClaimRaisesOwnershipContendedI3:
     """I3: `claim()` must raise `OwnershipContended` (writing nothing) after
     exhausting its bounded re-evaluation budget against a state that keeps
@@ -996,7 +1087,7 @@ class TestClaimRaisesOwnershipContendedI3:
                 project_id=PROJECT_ID,
                 claimant="nodeA",
                 writer_role="pm",
-                liveness="archived",
+                liveness=_AlwaysArchivedLiveness(),
             )
 
         assert calls["n"] == 4  # _MAX_REEVALUATIONS + 1 attempts, all exhausted
@@ -1037,7 +1128,7 @@ class TestClaimFindEventFallbackM4:
             project_id=PROJECT_ID,
             claimant="nodeA",
             writer_role="pm",
-            liveness="archived",
+            liveness={"nodeP": "archived"},
         )
         # Fix round 2: not a crash, and not an ambiguous `None` (which the
         # docstring reserves for the already-owner no-op) — the landed claim
