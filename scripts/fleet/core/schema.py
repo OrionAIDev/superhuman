@@ -60,8 +60,44 @@ EVENT_TYPES: Final[frozenset[str]] = frozenset(
         "orphan_flagged",
         "observation",
         "recommendation",
+        "ownership_declared",
+        "ownership_stood_down",
     }
 )
+
+#: `ownership_declared` payload — required keys, exactly (increment O, O.1).
+_OWNERSHIP_DECLARED_REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "claim_id",
+        "anchor",
+        "prior_owner",
+        "prior_owner_kind",
+        "basis",
+        "prior_owner_liveness",
+        "liveness_source",
+        "attestation",
+    }
+)
+
+#: `ownership_stood_down` payload — required keys, exactly (increment O, O.1).
+_OWNERSHIP_STOOD_DOWN_REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
+    {"stood_down_from", "written_by", "basis", "claimant", "claim_key", "reason"}
+)
+
+#: Enum vocabularies for the two new event types (increment O, O.1).
+_PRIOR_OWNER_KINDS: Final[frozenset[str]] = frozenset({"none", "declared", "legacy"})
+_CLAIM_BASIS_VALUES: Final[frozenset[str]] = frozenset(
+    {"unowned", "notified", "archived", "deleted"}
+)
+_LIVENESS_VALUES: Final[frozenset[str]] = frozenset({"active", "unknown", "archived", "deleted"})
+_LIVENESS_SOURCE_VALUES: Final[frozenset[str]] = frozenset({"sessions-json", "not-supplied"})
+_STANDDOWN_WRITTEN_BY_VALUES: Final[frozenset[str]] = frozenset({"self", "claimant"})
+_STANDDOWN_BASIS_VALUES: Final[frozenset[str]] = frozenset(
+    {"self", "notified", "archived", "deleted"}
+)
+_ATTESTATION_REQUIRED_KEYS: Final[frozenset[str]] = frozenset({"notified_owner", "notified_via"})
+_NOTIFIED_VIA_MAX_LEN: Final[int] = 200
+_REASON_MAX_LEN: Final[int] = 1000
 
 #: The five decomposed status fields (FR-5) — never collapsed into one enum.
 STATUS_FIELDS: Final[tuple[str, ...]] = (
@@ -295,6 +331,7 @@ def validate_event(data: dict[str, Any]) -> Event:
     _assert_done_level_write_boundary(event_type, payload)
     _assert_payload_status_values_are_valid(payload)
     _assert_done_level_value_is_recognized(event_type, payload)
+    _assert_ownership_payload_is_valid(event_type, payload)
 
     return Event(
         schema_version=data["schema_version"],
@@ -459,6 +496,192 @@ def _assert_done_level_value_is_recognized(event_type: str, payload: dict[str, A
             f"done_level_advanced payload 'done_level' {value!r} is not a "
             f"recognized done_level (expected one of {DONE_LEVELS})"
         )
+
+
+def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
+    """Raise ValidationError unless `value` is a single-line string within `max_len`.
+
+    Shared bound for free-text payload fields on the two ownership event
+    types (increment O, O-NFR-2): `notified_via` and `reason` must each be
+    one line (no embedded `\\n`/`\\r`) and bounded, so a runaway or
+    multi-line value can never be persisted (NFR-7).
+
+    Args:
+        value: the candidate value.
+        what: noun/description used in the error message.
+        max_len: the maximum allowed length, inclusive.
+
+    Raises:
+        ValidationError: if `value` is not a string, contains a newline or
+            carriage return, or exceeds `max_len` characters.
+    """
+    if not isinstance(value, str):
+        raise ValidationError(f"{what} must be a string, got {value!r}")
+    if "\n" in value or "\r" in value:
+        raise ValidationError(f"{what} must be a single line (no embedded newline)")
+    if len(value) > max_len:
+        raise ValidationError(f"{what} must be at most {max_len} characters, got {len(value)}")
+
+
+def _assert_nullable_nonempty_string(value: Any, what: str) -> None:
+    """Raise ValidationError unless `value` is `None` or a non-empty string.
+
+    Args:
+        value: the candidate value.
+        what: noun/description used in the error message.
+
+    Raises:
+        ValidationError: if `value` is neither `None` nor a non-empty string.
+    """
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValidationError(f"{what} must be null or a non-empty string, got {value!r}")
+
+
+def _assert_ownership_declared_payload(payload: dict[str, Any]) -> None:
+    """Raise ValidationError if an `ownership_declared` payload is malformed (O.1).
+
+    Args:
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: on a missing/unrecognized key, an out-of-enum
+            value, or a malformed `attestation`.
+    """
+    missing = _OWNERSHIP_DECLARED_REQUIRED_KEYS - payload.keys()
+    if missing:
+        raise ValidationError(
+            f"ownership_declared payload missing required key(s): {sorted(missing)}"
+        )
+    unknown = payload.keys() - _OWNERSHIP_DECLARED_REQUIRED_KEYS
+    if unknown:
+        raise ValidationError(
+            f"ownership_declared payload has unrecognized key(s): {sorted(unknown)}"
+        )
+
+    if not isinstance(payload["claim_id"], str) or not payload["claim_id"]:
+        raise ValidationError("ownership_declared payload 'claim_id' must be a non-empty string")
+    if not isinstance(payload["anchor"], str) or not payload["anchor"]:
+        raise ValidationError("ownership_declared payload 'anchor' must be a non-empty string")
+    _assert_nullable_nonempty_string(
+        payload["prior_owner"], "ownership_declared payload 'prior_owner'"
+    )
+    if payload["prior_owner_kind"] not in _PRIOR_OWNER_KINDS:
+        raise ValidationError(
+            "ownership_declared payload 'prior_owner_kind' must be one of "
+            f"{sorted(_PRIOR_OWNER_KINDS)}, got {payload['prior_owner_kind']!r}"
+        )
+    if payload["basis"] not in _CLAIM_BASIS_VALUES:
+        raise ValidationError(
+            f"ownership_declared payload 'basis' must be one of {sorted(_CLAIM_BASIS_VALUES)}, "
+            f"got {payload['basis']!r}"
+        )
+    liveness = payload["prior_owner_liveness"]
+    if liveness is not None and liveness not in _LIVENESS_VALUES:
+        raise ValidationError(
+            "ownership_declared payload 'prior_owner_liveness' must be null or one of "
+            f"{sorted(_LIVENESS_VALUES)}, got {liveness!r}"
+        )
+    if payload["liveness_source"] not in _LIVENESS_SOURCE_VALUES:
+        raise ValidationError(
+            "ownership_declared payload 'liveness_source' must be one of "
+            f"{sorted(_LIVENESS_SOURCE_VALUES)}, got {payload['liveness_source']!r}"
+        )
+
+    attestation = payload["attestation"]
+    if attestation is not None:
+        if not isinstance(attestation, dict):
+            raise ValidationError(
+                "ownership_declared payload 'attestation' must be null or a dict"
+            )
+        if attestation.keys() != _ATTESTATION_REQUIRED_KEYS:
+            raise ValidationError(
+                "ownership_declared payload 'attestation' must have exactly keys "
+                f"{sorted(_ATTESTATION_REQUIRED_KEYS)}, got {sorted(attestation.keys())}"
+            )
+        if not isinstance(attestation["notified_owner"], str) or not attestation["notified_owner"]:
+            raise ValidationError(
+                "ownership_declared payload attestation 'notified_owner' must be a "
+                "non-empty string"
+            )
+        _assert_single_line_bounded(
+            attestation["notified_via"],
+            "ownership_declared payload attestation 'notified_via'",
+            max_len=_NOTIFIED_VIA_MAX_LEN,
+        )
+
+
+def _assert_ownership_stood_down_payload(payload: dict[str, Any]) -> None:
+    """Raise ValidationError if an `ownership_stood_down` payload is malformed (O.1).
+
+    Args:
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: on a missing/unrecognized key, an out-of-enum
+            value, or `written_by="claimant"` missing `claimant`/`claim_key`.
+    """
+    missing = _OWNERSHIP_STOOD_DOWN_REQUIRED_KEYS - payload.keys()
+    if missing:
+        raise ValidationError(
+            f"ownership_stood_down payload missing required key(s): {sorted(missing)}"
+        )
+    unknown = payload.keys() - _OWNERSHIP_STOOD_DOWN_REQUIRED_KEYS
+    if unknown:
+        raise ValidationError(
+            f"ownership_stood_down payload has unrecognized key(s): {sorted(unknown)}"
+        )
+
+    if not isinstance(payload["stood_down_from"], str) or not payload["stood_down_from"]:
+        raise ValidationError(
+            "ownership_stood_down payload 'stood_down_from' must be a non-empty string"
+        )
+    written_by = payload["written_by"]
+    if written_by not in _STANDDOWN_WRITTEN_BY_VALUES:
+        raise ValidationError(
+            "ownership_stood_down payload 'written_by' must be one of "
+            f"{sorted(_STANDDOWN_WRITTEN_BY_VALUES)}, got {written_by!r}"
+        )
+    if payload["basis"] not in _STANDDOWN_BASIS_VALUES:
+        raise ValidationError(
+            "ownership_stood_down payload 'basis' must be one of "
+            f"{sorted(_STANDDOWN_BASIS_VALUES)}, got {payload['basis']!r}"
+        )
+    _assert_nullable_nonempty_string(
+        payload["claimant"], "ownership_stood_down payload 'claimant'"
+    )
+    _assert_nullable_nonempty_string(
+        payload["claim_key"], "ownership_stood_down payload 'claim_key'"
+    )
+    if written_by == "claimant" and (payload["claimant"] is None or payload["claim_key"] is None):
+        raise ValidationError(
+            "ownership_stood_down payload written_by='claimant' requires both "
+            "'claimant' and 'claim_key' to be set"
+        )
+    reason = payload["reason"]
+    if reason is not None:
+        _assert_single_line_bounded(
+            reason, "ownership_stood_down payload 'reason'", max_len=_REASON_MAX_LEN
+        )
+
+
+def _assert_ownership_payload_is_valid(event_type: str, payload: dict[str, Any]) -> None:
+    """Dispatch payload validation for the two ownership event types (increment O).
+
+    A no-op for every other event type — this is purely additive to the
+    existing checks `validate_event` already runs.
+
+    Args:
+        event_type: the event's `type`.
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: see `_assert_ownership_declared_payload` /
+            `_assert_ownership_stood_down_payload`.
+    """
+    if event_type == "ownership_declared":
+        _assert_ownership_declared_payload(payload)
+    elif event_type == "ownership_stood_down":
+        _assert_ownership_stood_down_payload(payload)
 
 
 def fold_done_level(current_level: str, event: Event) -> str:

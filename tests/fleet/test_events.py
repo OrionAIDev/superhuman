@@ -13,18 +13,29 @@ from __future__ import annotations
 
 import errno
 import json
+import multiprocessing
 import os
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+# Belt-and-suspenders (mirrors test_concurrency.py): this module must be
+# independently importable-by-name in a freshly spawned child interpreter,
+# since `_hammer_worker` (a module-level function, picklable under `spawn`)
+# is defined here.
+_SKILL_ROOT = Path(__file__).resolve().parents[2]
+if str(_SKILL_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SKILL_ROOT))
+
 from scripts.fleet.core import events as events_mod
 from scripts.fleet.core.errors import LockTimeoutError, PreconditionUnmet, ValidationError
 from scripts.fleet.core.events import (
     acquire_lock,
     append,
+    append_batch,
     lock_path_for,
     read_all,
     release_lock,
@@ -412,3 +423,217 @@ class TestAppendPrecondition:
         result = append(log_path, _event("key-no-precondition"))
         assert result is not None
         assert len(read_all(log_path)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Increment O: `append_batch` (TC-O3, TC-O4, TC-O5, TC-O6)
+# ---------------------------------------------------------------------------
+
+
+def _reg_event(suffix: str, event_id: str | None = None) -> dict:
+    node_id = f"portable/ws/proj/racer-{suffix}"
+    return {
+        "schema_version": 1,
+        "event_id": event_id or f"eid-{suffix}",
+        "idempotency_key": f"register:{node_id}",
+        "ts": "2026-09-27T00:00:00Z",
+        "type": "session_registered",
+        "project_id": "proj-abc",
+        "node_id": node_id,
+        "writer_role": "Developer",
+        "payload": {},
+    }
+
+
+def _hammer_worker(log_path_str: str, stop_flag) -> None:  # pragma: no cover - runs in a subprocess
+    """Continuously append distinct events until `stop_flag` is set."""
+    i = 0
+    while not stop_flag.is_set():
+        append(log_path_str, _reg_event(f"hammer-{i}"))
+        i += 1
+
+
+class TestAppendBatchSingleLockHold:
+    """TC-O3: `append_batch`'s two lines are written under ONE lock hold —
+    a concurrent writer can never land between them.
+
+    A real, independent OS process hammers the same log with its own
+    `append()` calls, continuously, for the whole duration of many
+    `append_batch` calls from the main process. If `append_batch` ever
+    released the lock between its two lines (the revert-to-red mutation:
+    two sequential `append()` calls instead of one locked batch write), the
+    racer's tight retry loop is overwhelmingly likely to land a line in the
+    resulting gap across enough iterations.
+    """
+
+    def test_racer_write_never_lands_between_batch_lines(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        ctx = multiprocessing.get_context("spawn")
+        stop_flag = ctx.Event()
+        racer = ctx.Process(target=_hammer_worker, args=(str(log_path), stop_flag))
+        racer.start()
+        try:
+            for i in range(40):
+                first = _event(f"batch-a-{i}", event_id=f"eid-batch-a-{i}")
+                second = _event(f"batch-b-{i}", event_id=f"eid-batch-b-{i}")
+                written = append_batch(log_path, [first, second])
+                assert [e.idempotency_key for e in written] == [f"batch-a-{i}", f"batch-b-{i}"]
+
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+                positions = {
+                    json.loads(line)["idempotency_key"]: idx for idx, line in enumerate(lines)
+                }
+                idx_a = positions[f"batch-a-{i}"]
+                idx_b = positions[f"batch-b-{i}"]
+                assert idx_b == idx_a + 1, (
+                    f"batch lines for iteration {i} were not contiguous "
+                    f"(idx_a={idx_a}, idx_b={idx_b}) — a racer's write landed between them"
+                )
+        finally:
+            stop_flag.set()
+            racer.join(timeout=10)
+
+
+class TestAppendBatchDedupeAndPrecondition:
+    """TC-O4: per-event dedupe, precondition-once, all-present short-circuit."""
+
+    def test_all_present_short_circuits_without_running_precondition(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        first = _event("dup-a", event_id="eid-a")
+        second = _event("dup-b", event_id="eid-b")
+        append_batch(log_path, [first, second])
+
+        calls = {"n": 0}
+
+        def _never_should_run(existing: list[Event]) -> bool:
+            calls["n"] += 1
+            return True
+
+        result = append_batch(log_path, [first, second], precondition=_never_should_run)
+        assert result == []
+        assert calls["n"] == 0
+        assert len(read_all(log_path)) == 2
+
+    def test_none_present_runs_precondition_once_on_fresh_list(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _event("pre-existing", event_id="eid-pre"))
+
+        seen: list[list[str]] = []
+
+        def _record(existing: list[Event]) -> bool:
+            seen.append([e.idempotency_key for e in existing])
+            return True
+
+        written = append_batch(
+            log_path,
+            [_event("new-a", event_id="eid-new-a"), _event("new-b", event_id="eid-new-b")],
+            precondition=_record,
+        )
+        assert len(written) == 2
+        assert seen == [["pre-existing"]]
+
+    def test_one_present_writes_only_the_missing_event(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _event("half-a", event_id="eid-half-a"))
+
+        written = append_batch(
+            log_path,
+            [_event("half-a", event_id="eid-half-a"), _event("half-b", event_id="eid-half-b")],
+        )
+        assert [e.idempotency_key for e in written] == ["half-b"]
+        assert {e.idempotency_key for e in read_all(log_path)} == {"half-a", "half-b"}
+
+    def test_precondition_false_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(PreconditionUnmet):
+            append_batch(
+                log_path,
+                [_event("blocked-a", event_id="eid-blocked-a")],
+                precondition=lambda existing: False,
+            )
+        assert read_all(log_path) == []
+
+    def test_precondition_runs_before_the_dedupe_filter_is_a_bug(self, tmp_path: Path) -> None:
+        """Revert-to-red guard, expressed as a passing assertion: the
+        all-present case must never invoke `precondition`, which is exactly
+        what would happen if the dedupe filter ran AFTER the precondition
+        check instead of before."""
+        log_path = tmp_path / "events.jsonl"
+        event = _event("already-there", event_id="eid-already-there")
+        append_batch(log_path, [event])
+
+        calls = {"n": 0}
+
+        def _count(existing: list[Event]) -> bool:
+            calls["n"] += 1
+            return True
+
+        assert append_batch(log_path, [event], precondition=_count) == []
+        assert calls["n"] == 0
+
+
+class TestAppendBatchInBatchDuplicateKeyRejected:
+    """TC-O5: a batch with two events sharing one idempotency_key is rejected
+    before the lock; `append`'s own suite (this whole file) is unaffected by
+    `append_batch`'s addition — proven by this file's tests all still passing.
+    """
+
+    def test_in_batch_duplicate_key_raises_and_writes_nothing(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        colliding_a = _event("same-key", event_id="eid-1")
+        colliding_b = _event("same-key", event_id="eid-2")
+        with pytest.raises(ValueError):
+            append_batch(log_path, [colliding_a, colliding_b])
+        assert read_all(log_path) == []
+
+    def test_empty_batch_is_rejected(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(ValueError):
+            append_batch(log_path, [])
+
+    def test_a_malformed_event_in_the_batch_is_rejected_before_the_lock(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        good = _event("good-one", event_id="eid-good")
+        bad = _event("bad-one", event_id="eid-bad")
+        bad["type"] = "not_a_real_type"
+        with pytest.raises(ValidationError):
+            append_batch(log_path, [good, bad])
+        assert read_all(log_path) == []
+
+
+class TestAppendBatchTornLineTolerance:
+    """TC-O6: a torn (partial) batch write is tolerated — a re-run recovers."""
+
+    def test_torn_second_line_is_skipped_and_first_is_still_readable(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        first = _event("torn-a", event_id="eid-torn-a")
+        # Simulate a crash mid-write: only the first line ever landed.
+        log_path.write_text(json.dumps(_asdict_event(first)) + "\n", encoding="utf-8")
+
+        events = read_all(log_path)
+        assert [e.idempotency_key for e in events] == ["torn-a"]
+
+    def test_rerun_after_a_torn_first_line_completes_the_pair(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        first = _event("torn-a", event_id="eid-torn-a")
+        second = _event("torn-b", event_id="eid-torn-b")
+        # Simulate the crash: only the first line of what would have been a
+        # two-event append_batch call ever landed.
+        log_path.write_text(json.dumps(_asdict_event(first)) + "\n", encoding="utf-8")
+
+        # Re-running the same batch call: the first event dedupes (already
+        # present), and only the second is written — completing the pair.
+        written = append_batch(log_path, [first, second])
+        assert [e.idempotency_key for e in written] == ["torn-b"]
+        assert {e.idempotency_key for e in read_all(log_path)} == {"torn-a", "torn-b"}
+
+
+def _asdict_event(data: dict) -> dict:
+    """Return `data` with the same shape `_event_to_json_line` would serialize."""
+    return dict(data)
