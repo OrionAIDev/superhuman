@@ -470,6 +470,65 @@ class TestNoBroadCatchInOwnerModules:
 
         assert code == 0
 
+    @pytest.mark.parametrize("bad", ["missing", "malformed"])
+    def test_observe_verb_still_exits_0_with_an_unusable_sessions_json(
+        self, owner_project: tuple[Path, str], tmp_path: Path, bad: str
+    ) -> None:
+        """Decision A regression pin: an unusable `--sessions-json` on an
+        `observe` verb is journaled and swallowed, never a non-zero exit
+        (before `_load_sessions_json`, a missing file escaped as an OSError)."""
+        workspace, slug = owner_project
+        sessions = tmp_path / f"sessions-{bad}.json"
+        if bad == "malformed":
+            sessions.write_text("{not json", encoding="utf-8")
+
+        code = fleet_cli.main(
+            [
+                "observe",
+                "session-start",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "claude",
+                "--session-id",
+                "obs-1",
+                "--sessions-json",
+                str(sessions),
+            ]
+        )
+
+        assert code == 0
+
+
+class TestOwnerLockRetryAttemptsMustBePositive:
+    """Fix round 2: `--lock-retry-attempts` below 1 never calls core and used
+    to crash on an `assert`; it is now an argparse usage error (exit 2)."""
+
+    @pytest.mark.parametrize("verb", ["claim", "stand-down"])
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_non_positive_lock_retry_attempts_is_a_usage_error(
+        self, owner_project: tuple[Path, str], verb: str, value: str
+    ) -> None:
+        workspace, slug = owner_project
+        with pytest.raises(SystemExit) as exc_info:
+            fleet_cli.main(
+                [
+                    "owner",
+                    verb,
+                    "--workspace",
+                    str(workspace),
+                    "--slug",
+                    slug,
+                    "--writer-role",
+                    "pm",
+                    "--lock-retry-attempts",
+                    value,
+                ]
+            )
+        assert exc_info.value.code == 2
+
 
 class TestOwnerClaimLivenessMappingC1:
     """C1: the CLI must build liveness for every node registered in the

@@ -221,6 +221,29 @@ def _append_with_bounded_retry(
     raise last_exc
 
 
+def _positive_int(value: str) -> int:
+    """Argparse `type=` for a count that must be at least 1.
+
+    Args:
+        value: the raw command-line string.
+
+    Returns:
+        int: the parsed value.
+
+    Raises:
+        argparse.ArgumentTypeError: if `value` is not an integer >= 1, so
+            argparse reports a usage error (exit 2) instead of the retry
+            loop never calling core.
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {value!r}") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {parsed}")
+    return parsed
+
+
 def _call_with_bounded_lock_retry(
     call: Callable[[], Event | None], *, attempts: int, backoff: float
 ) -> Event | None:
@@ -2272,7 +2295,7 @@ def _add_owner_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "(must be given together with --prior-owner-notified)",
     )
     claim_parser.add_argument(
-        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+        "--lock-retry-attempts", type=_positive_int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     _add_harness_arguments(
         claim_parser,
@@ -2298,7 +2321,7 @@ def _add_owner_subparsers(subparsers: argparse._SubParsersAction) -> None:
     )
     stand_down_parser.add_argument("--reason", default=None, help="optional single-line free-text reason")
     stand_down_parser.add_argument(
-        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+        "--lock-retry-attempts", type=_positive_int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     _add_harness_arguments(
         stand_down_parser,
