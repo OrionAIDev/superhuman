@@ -45,9 +45,11 @@ _CTO_ROLE_NAMES: Final[frozenset[str]] = frozenset({"cto", "ceo"})
 #: through to the `FIELD_OWNERS` class check, so a direct `core.events.append`
 #: is bound the same as the (later) `fleet owner` CLI verb group — there is
 #: no fail-open path that skips this table.
+_OWNERSHIP_EVENT_WRITER_ALLOWLIST: Final[frozenset[str]] = frozenset({"pm"}) | _CTO_ROLE_NAMES
+
 _EVENT_WRITER_ROLES: Final[dict[str, frozenset[str]]] = {
-    "ownership_declared": frozenset({"pm", "cto", "ceo"}),
-    "ownership_stood_down": frozenset({"pm", "cto", "ceo"}),
+    "ownership_declared": _OWNERSHIP_EVENT_WRITER_ALLOWLIST,
+    "ownership_stood_down": _OWNERSHIP_EVENT_WRITER_ALLOWLIST,
 }
 
 

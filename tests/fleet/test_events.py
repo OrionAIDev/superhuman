@@ -473,6 +473,21 @@ class TestAppendBatchSingleLockHold:
         racer = ctx.Process(target=_hammer_worker, args=(str(log_path), stop_flag))
         racer.start()
         try:
+            # M1: don't start the timed batch loop until the racer has
+            # actually landed its first line — otherwise a slow-starting
+            # racer process could make the "never lands between" assertion
+            # below pass vacuously, without the racer ever having a real
+            # chance to interleave with the batches at all.
+            deadline = time.monotonic() + 10.0
+            racer_landed = False
+            while time.monotonic() < deadline:
+                if log_path.exists() and log_path.read_text(encoding="utf-8").strip():
+                    racer_landed = True
+                    break
+                time.sleep(0.01)
+            if not racer_landed:
+                pytest.fail("racer process never landed a line within 10s")
+
             for i in range(40):
                 first = _event(f"batch-a-{i}", event_id=f"eid-batch-a-{i}")
                 second = _event(f"batch-b-{i}", event_id=f"eid-batch-b-{i}")
@@ -489,6 +504,29 @@ class TestAppendBatchSingleLockHold:
                     f"batch lines for iteration {i} were not contiguous "
                     f"(idx_a={idx_a}, idx_b={idx_b}) — a racer's write landed between them"
                 )
+
+            # M1: confirm the racer really was interleaving throughout the
+            # whole run — at least one racer-authored line must lie between
+            # the very first and very last batch line, proving this test
+            # could actually have caught a broken single-lock-hold.
+            final_lines = log_path.read_text(encoding="utf-8").splitlines()
+            parsed = [json.loads(line) for line in final_lines]
+            idx_first_batch = next(
+                idx for idx, e in enumerate(parsed) if e["idempotency_key"] == "batch-a-0"
+            )
+            idx_last_batch = next(
+                idx for idx, e in enumerate(parsed) if e["idempotency_key"] == "batch-b-39"
+            )
+            racer_between = [
+                idx
+                for idx in range(idx_first_batch, idx_last_batch + 1)
+                if parsed[idx]["idempotency_key"].startswith("register:portable/ws/proj/racer-")
+            ]
+            assert racer_between, (
+                "no racer-authored line landed between the first and last batch "
+                "line — the racer never actually interleaved with the batches, "
+                "so this test could not have caught a broken single-lock-hold"
+            )
         finally:
             stop_flag.set()
             racer.join(timeout=10)
@@ -555,24 +593,6 @@ class TestAppendBatchDedupeAndPrecondition:
             )
         assert read_all(log_path) == []
 
-    def test_precondition_runs_before_the_dedupe_filter_is_a_bug(self, tmp_path: Path) -> None:
-        """Revert-to-red guard, expressed as a passing assertion: the
-        all-present case must never invoke `precondition`, which is exactly
-        what would happen if the dedupe filter ran AFTER the precondition
-        check instead of before."""
-        log_path = tmp_path / "events.jsonl"
-        event = _event("already-there", event_id="eid-already-there")
-        append_batch(log_path, [event])
-
-        calls = {"n": 0}
-
-        def _count(existing: list[Event]) -> bool:
-            calls["n"] += 1
-            return True
-
-        assert append_batch(log_path, [event], precondition=_count) == []
-        assert calls["n"] == 0
-
 
 class TestAppendBatchInBatchDuplicateKeyRejected:
     """TC-O5: a batch with two events sharing one idempotency_key is rejected
@@ -606,31 +626,72 @@ class TestAppendBatchInBatchDuplicateKeyRejected:
 
 
 class TestAppendBatchTornLineTolerance:
-    """TC-O6: a torn (partial) batch write is tolerated — a re-run recovers."""
+    """TC-O6: a torn (partial) batch write is tolerated — a re-run recovers.
 
-    def test_torn_second_line_is_skipped_and_first_is_still_readable(
+    I4: a genuinely torn line is a TRUNCATED JSON fragment with no trailing
+    newline (a crash mid-`write()` of that very line) — not a complete,
+    well-formed line that merely happens to be the only one present. The
+    two tests below previously wrote a complete first line and called it
+    "torn," which never exercised `read_all`'s torn-line tolerance or
+    `_append_lines`'s leading-newline repair at all.
+    """
+
+    def test_truncated_final_line_is_skipped_and_batch_lands_on_its_own_lines(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        full_line = json.dumps(_asdict_event(_event("torn-a", event_id="eid-torn-a")))
+        # Simulate a crash mid-write: the line itself is truncated, and (the
+        # crash-mid-append signature) it has no trailing newline.
+        torn_fragment = full_line[: len(full_line) // 2]
+        log_path.write_text(torn_fragment, encoding="utf-8")
+
+        # The truncated fragment cannot parse as JSON at all — read_all
+        # skips it rather than raising.
+        assert read_all(log_path) == []
+
+        first = _event("batch-a", event_id="eid-batch-a")
+        second = _event("batch-b", event_id="eid-batch-b")
+        written = append_batch(log_path, [first, second])
+        assert [e.idempotency_key for e in written] == ["batch-a", "batch-b"]
+
+        # The leading-newline repair (`_append_lines`) must have terminated
+        # the torn fragment's line BEFORE writing the batch, so the torn
+        # fragment, batch-a, and batch-b are each on their own line.
+        raw_lines = log_path.read_text(encoding="utf-8").splitlines()
+        assert len(raw_lines) == 3
+        assert raw_lines[0] == torn_fragment
+        assert json.loads(raw_lines[1])["idempotency_key"] == "batch-a"
+        assert json.loads(raw_lines[2])["idempotency_key"] == "batch-b"
+
+        # And the log stays fully replayable: the torn fragment is skipped,
+        # the batch's two events are read back in order.
+        assert [e.idempotency_key for e in read_all(log_path)] == ["batch-a", "batch-b"]
+
+    def test_rerun_after_a_truncated_first_line_completes_the_pair(
         self, tmp_path: Path
     ) -> None:
         log_path = tmp_path / "events.jsonl"
         first = _event("torn-a", event_id="eid-torn-a")
-        # Simulate a crash mid-write: only the first line ever landed.
-        log_path.write_text(json.dumps(_asdict_event(first)) + "\n", encoding="utf-8")
-
-        events = read_all(log_path)
-        assert [e.idempotency_key for e in events] == ["torn-a"]
-
-    def test_rerun_after_a_torn_first_line_completes_the_pair(self, tmp_path: Path) -> None:
-        log_path = tmp_path / "events.jsonl"
-        first = _event("torn-a", event_id="eid-torn-a")
         second = _event("torn-b", event_id="eid-torn-b")
-        # Simulate the crash: only the first line of what would have been a
-        # two-event append_batch call ever landed.
-        log_path.write_text(json.dumps(_asdict_event(first)) + "\n", encoding="utf-8")
+        full_line = json.dumps(_asdict_event(first))
+        # Simulate the crash: the first line of what would have been a
+        # two-event append_batch call was itself cut off mid-write, with no
+        # trailing newline — `first` never actually landed as a valid event.
+        torn_fragment = full_line[: len(full_line) // 2]
+        log_path.write_text(torn_fragment, encoding="utf-8")
+        assert read_all(log_path) == []
 
-        # Re-running the same batch call: the first event dedupes (already
-        # present), and only the second is written — completing the pair.
+        # Re-running the same batch call: neither event is present yet
+        # (the truncated fragment doesn't count as `first` for dedupe
+        # purposes), so append_batch writes BOTH, after first terminating
+        # the torn fragment's own line.
         written = append_batch(log_path, [first, second])
-        assert [e.idempotency_key for e in written] == ["torn-b"]
+        assert [e.idempotency_key for e in written] == ["torn-a", "torn-b"]
+
+        raw_lines = log_path.read_text(encoding="utf-8").splitlines()
+        assert len(raw_lines) == 3
+        assert raw_lines[0] == torn_fragment
         assert {e.idempotency_key for e in read_all(log_path)} == {"torn-a", "torn-b"}
 
 

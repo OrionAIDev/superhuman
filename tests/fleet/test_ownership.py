@@ -17,6 +17,7 @@ from scripts.fleet.core.ownership import (
     _role_class,
     assert_writer_may,
 )
+from scripts.fleet.core.schema import FIELD_OWNERS
 
 
 class TestSuperhumanOwnedField:
@@ -214,6 +215,19 @@ class TestCtoRoleName:
 
     def test_cto_may_write_the_shared_done_level_field(self) -> None:
         assert_writer_may("done_level", "CTO")  # must not raise
+
+
+class TestOwnershipEventTypesAreDocumentedSharedInFieldOwnersM6:
+    """M6: DESIGN O.2 documents `ownership_declared`/`ownership_stood_down`
+    as `FIELD_OWNERS["...] = "shared"` — the actual gate is still the role
+    ALLOWLIST (`_EVENT_WRITER_ROLES`, checked first), so adding these
+    entries must not change what is allowed (`TestOwnershipEventWriterAllowlist`
+    below stays green unmodified); this only makes the two types show up in
+    the table the way `done_level`'s own "shared" entry already does."""
+
+    @pytest.mark.parametrize("event_type", ["ownership_declared", "ownership_stood_down"])
+    def test_field_owners_marks_both_types_shared(self, event_type: str) -> None:
+        assert FIELD_OWNERS[event_type] == "shared"
 
 
 class TestOwnershipEventWriterAllowlist:

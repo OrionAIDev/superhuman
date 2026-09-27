@@ -149,6 +149,14 @@ FIELD_OWNERS: Final[dict[str, str]] = {
     "done_level": "shared",
     "observation": "cto",
     "recommendation": "cto",
+    # DESIGN O.2 Decision O2: both classes may write these event types in
+    # principle; the actual restriction to `pm`/`cto` is a role ALLOWLIST
+    # (`core.ownership._EVENT_WRITER_ROLES`), checked before this table is
+    # ever consulted, so this entry never changes what is actually allowed
+    # — it just keeps the two ownership event types documented here too,
+    # the way `done_level`'s "shared" entry documents its own dual writers.
+    "ownership_declared": "shared",
+    "ownership_stood_down": "shared",
 }
 
 #: writer_role denylist (NFR-6) — model/vendor names, never a role. Substring
@@ -499,12 +507,18 @@ def _assert_done_level_value_is_recognized(event_type: str, payload: dict[str, A
 
 
 def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
-    """Raise ValidationError unless `value` is a single-line string within `max_len`.
+    """Raise ValidationError unless `value` is a non-empty single-line string within `max_len`.
 
     Shared bound for free-text payload fields on the two ownership event
     types (increment O, O-NFR-2): `notified_via` and `reason` must each be
-    one line (no embedded `\\n`/`\\r`) and bounded, so a runaway or
-    multi-line value can never be persisted (NFR-7).
+    non-empty, one line, and bounded, so a runaway, blank, or multi-line
+    value can never be persisted (NFR-7).
+
+    The single-line check uses `len(value.splitlines()) > 1` rather than a
+    literal `"\\n" in value or "\\r" in value` search (M5): Python's
+    `str.splitlines()` also treats U+2028 LINE SEPARATOR, U+0085 NEL,
+    vertical tab (`\\v`), and form feed (`\\f`) as line breaks, so this
+    catches every one of those, not just `\\n`/`\\r`.
 
     Args:
         value: the candidate value.
@@ -512,13 +526,19 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
         max_len: the maximum allowed length, inclusive.
 
     Raises:
-        ValidationError: if `value` is not a string, contains a newline or
-            carriage return, or exceeds `max_len` characters.
+        ValidationError: if `value` is not a string, is empty/blank,
+            contains an embedded line break of any kind, or exceeds
+            `max_len` characters.
     """
     if not isinstance(value, str):
         raise ValidationError(f"{what} must be a string, got {value!r}")
-    if "\n" in value or "\r" in value:
-        raise ValidationError(f"{what} must be a single line (no embedded newline)")
+    if not value.strip():
+        raise ValidationError(f"{what} must not be empty")
+    if len(value.splitlines()) > 1:
+        raise ValidationError(
+            f"{what} must be a single line (no embedded line break, including "
+            "U+2028/U+0085/vertical-tab/form-feed)"
+        )
     if len(value) > max_len:
         raise ValidationError(f"{what} must be at most {max_len} characters, got {len(value)}")
 
@@ -574,6 +594,14 @@ def _assert_ownership_declared_payload(payload: dict[str, Any]) -> None:
         raise ValidationError(
             f"ownership_declared payload 'basis' must be one of {sorted(_CLAIM_BASIS_VALUES)}, "
             f"got {payload['basis']!r}"
+        )
+    if payload["basis"] == "unowned" and payload["prior_owner"] is not None:
+        raise ValidationError(
+            "ownership_declared payload basis='unowned' requires 'prior_owner' to be null"
+        )
+    if payload["prior_owner_kind"] == "none" and payload["prior_owner"] is not None:
+        raise ValidationError(
+            "ownership_declared payload prior_owner_kind='none' requires 'prior_owner' to be null"
         )
     liveness = payload["prior_owner_liveness"]
     if liveness is not None and liveness not in _LIVENESS_VALUES:
@@ -656,6 +684,16 @@ def _assert_ownership_stood_down_payload(payload: dict[str, Any]) -> None:
         raise ValidationError(
             "ownership_stood_down payload written_by='claimant' requires both "
             "'claimant' and 'claim_key' to be set"
+        )
+    if written_by == "self" and (payload["claimant"] is not None or payload["claim_key"] is not None):
+        raise ValidationError(
+            "ownership_stood_down payload written_by='self' requires both "
+            "'claimant' and 'claim_key' to be null"
+        )
+    if (payload["basis"] == "self") != (written_by == "self"):
+        raise ValidationError(
+            "ownership_stood_down payload basis='self' must go together with "
+            "written_by='self', and vice versa"
         )
     reason = payload["reason"]
     if reason is not None:

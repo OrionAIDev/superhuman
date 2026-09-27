@@ -87,6 +87,56 @@ class OwnerState:
     has_ownership_events: bool
 
 
+def _build_declared_index(events: list[Event], project_id: str) -> dict[str, str]:
+    """Map each `ownership_declared` event's `idempotency_key` to its `node_id`.
+
+    Shared by `fold_owner` and `resolve_legacy_owner` so both apply the exact
+    same "is this stand-down for real" test (I1/M7).
+
+    Args:
+        events: event-log entries, e.g. as read by `core.events.read_all`.
+        project_id: the project to index declarations for.
+
+    Returns:
+        dict[str, str]: `idempotency_key -> node_id` for every
+        `ownership_declared` event in `events` for `project_id`.
+    """
+    return {
+        e.idempotency_key: e.node_id
+        for e in events
+        if e.project_id == project_id and e.type == "ownership_declared"
+    }
+
+
+def _is_orphaned_standdown(event: Event, declared_index: dict[str, str]) -> bool:
+    """Return whether `event` is an orphaned on-behalf stand-down (DESIGN O.5, I1/M7).
+
+    An `ownership_stood_down` event with `payload["written_by"] ==
+    "claimant"` is orphaned — as if it never happened — unless its
+    `payload["claim_key"]` names a REAL `ownership_declared` event's
+    `idempotency_key` for this project AND that declaration's `node_id`
+    equals the stand-down's own `payload["claimant"]` (M7: a `claim_key`
+    that merely happens to match some unrelated declaration is a forged or
+    corrupted pairing, not a real one). This is what makes an interrupted
+    `append_batch` (a torn write leaving only the on-behalf stand-down half)
+    invisible to every reader — both `fold_owner` and `resolve_legacy_owner`
+    apply this exact same test, so neither one alone can disagree about
+    whether a given stand-down "really happened."
+
+    Args:
+        event: an `ownership_stood_down` event.
+        declared_index: this project's declared-event index, from
+            `_build_declared_index`.
+
+    Returns:
+        bool: True iff `event` is an orphan (must be skipped, as if absent).
+    """
+    payload = event.payload
+    if payload.get("written_by") != "claimant":
+        return False
+    return declared_index.get(payload.get("claim_key")) != payload.get("claimant")
+
+
 def fold_owner(events: list[Event], project_id: str) -> OwnerState:
     """Fold `events` into the current ownership state for `project_id` (O.6).
 
@@ -120,11 +170,7 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
         for this project folds to `owner=None, has_ownership_events=False,
         anchor="genesis"` (O-NFR-3).
     """
-    declared_keys = {
-        e.idempotency_key
-        for e in events
-        if e.project_id == project_id and e.type == "ownership_declared"
-    }
+    declared_index = _build_declared_index(events, project_id)
 
     owner: str | None = None
     declaring_event_id: str | None = None
@@ -149,8 +195,7 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
         if event.type != "ownership_stood_down":
             continue
 
-        payload = event.payload
-        if payload.get("written_by") == "claimant" and payload.get("claim_key") not in declared_keys:
+        if _is_orphaned_standdown(event, declared_index):
             continue  # orphaned on-behalf stand-down — invisible (DESIGN O.5)
 
         has_ownership_events = True
@@ -158,7 +203,7 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
         anchor_kind = "stood_down"
         anchor_node = event.node_id
 
-        if event.node_id == owner and payload.get("stood_down_from") == declaring_event_id:
+        if event.node_id == owner and event.payload.get("stood_down_from") == declaring_event_id:
             owner = None
             declaring_event_id = None
 
@@ -172,7 +217,9 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
     )
 
 
-def resolve_legacy_owner(events: list[Event], project_id: str) -> tuple[str, str] | None:
+def resolve_legacy_owner(
+    events: list[Event], project_id: str, claimant: str
+) -> tuple[str, str] | None:
     """Return the OQ-1 legacy prior owner for `project_id`, or `None` (DESIGN O.13 OQ-1).
 
     Only meaningful when `fold_owner(...).has_ownership_events` is `False`:
@@ -184,21 +231,36 @@ def resolve_legacy_owner(events: list[Event], project_id: str) -> tuple[str, str
     check only; `fold_owner` itself stays pure and untouched by this
     function (O-NFR-3).
 
+    PM ruling (2026-09-26, C1): the legacy prior owner is the newest
+    `relayed`/`manual` `pm` registration by a node OTHER than `claimant`. A
+    successor must coordinate with a prior (other) owner, never with itself
+    — so `claimant`'s own registration is never eligible here, even when it
+    is the newest one. If excluding it leaves no eligible registration, this
+    returns `None` (the claim is `CLAIM_UNOWNED`, not "coordinate with
+    yourself").
+
     Args:
         events: event-log entries, e.g. as read by `core.events.read_all`.
         project_id: the project to resolve a legacy owner for.
+        claimant: the node about to claim; its own registrations are
+            excluded from consideration.
 
     Returns:
         tuple[str, str] | None: `(node_id, event_id)` of the newest
-        `relayed`/`manual` `session_registered` event written by `pm` for
-        this project, unless a later `ownership_stood_down` names that
-        registration's `event_id` as `stood_down_from` (already vacated) —
-        in which case, or if no such registration exists, `None`.
+        `relayed`/`manual` `session_registered` event written by `pm`, by a
+        node other than `claimant`, for this project — unless a later valid
+        `ownership_stood_down` names that registration's `event_id` as
+        `stood_down_from` (already vacated; an orphaned on-behalf stand-down
+        does not count, per `_is_orphaned_standdown` — the same predicate
+        `fold_owner` uses, I1) — in which case, or if no such registration
+        exists, `None`.
     """
     registration: Event | None = None
     for event in events:
         if event.project_id != project_id or event.type != "session_registered":
             continue
+        if event.node_id == claimant:
+            continue  # C1: a claimant is never its own legacy prior owner
         if event.payload.get("origination") not in ("relayed", "manual"):
             continue
         if event.writer_role.strip().lower() != "pm":
@@ -208,9 +270,12 @@ def resolve_legacy_owner(events: list[Event], project_id: str) -> tuple[str, str
     if registration is None:
         return None
 
+    declared_index = _build_declared_index(events, project_id)
     for event in events:
         if event.project_id != project_id or event.type != "ownership_stood_down":
             continue
+        if _is_orphaned_standdown(event, declared_index):
+            continue  # an orphan vacates nothing (shared with fold_owner, I1)
         if event.payload.get("stood_down_from") == registration.event_id:
             return None  # already vacated — no legacy owner remains
 
@@ -537,7 +602,11 @@ def claim(
             raise OwnershipRefused("not_registered", current_owner=None)
 
         state = fold_owner(events, project_id)
-        legacy = None if state.has_ownership_events else resolve_legacy_owner(events, project_id)
+        legacy = (
+            None
+            if state.has_ownership_events
+            else resolve_legacy_owner(events, project_id, claimant)
+        )
         decision = decide_claim(state, claimant, liveness, attested_owner, legacy=legacy)
 
         if decision.outcome == NOOP_ALREADY_OWNER:
@@ -579,9 +648,26 @@ def claim(
             )
         batch.append(claim_event)
 
-        def _precondition(existing: list[Event], _state: OwnerState = state) -> bool:
-            """Return whether `existing`'s ownership state still matches the decision's snapshot."""
-            return fold_owner(existing, project_id) == _state
+        def _precondition(
+            existing: list[Event],
+            _state: OwnerState = state,
+            _legacy: tuple[str, str] | None = legacy,
+        ) -> bool:
+            """Return whether `existing` still matches the decision's snapshot.
+
+            Always re-checks `fold_owner`. When the decision was made against
+            an unowned project (`not _state.has_ownership_events`), it ALSO
+            re-checks `resolve_legacy_owner` (I2) — `fold_owner` alone cannot
+            see a `relayed`/`manual` `pm` registration by another node
+            landing between the unlocked read and this locked write, so
+            without this second check a stale `CLAIM_UNOWNED` (or a stale
+            legacy owner) could still be written.
+            """
+            if fold_owner(existing, project_id) != _state:
+                return False
+            if not _state.has_ownership_events:
+                return resolve_legacy_owner(existing, project_id, claimant) == _legacy
+            return True
 
         try:
             written = append_batch(
@@ -591,13 +677,17 @@ def claim(
             continue
 
         if not written:
-            # In-process retry with the exact same dicts (bounded-retry
-            # wrapper reusing the same batch across a lock timeout, DESIGN
-            # O.1's Option A "Retry of one call" cell): every event in the
-            # batch already exists — look our own claim event up by key.
+            # A retry of this exact call (e.g. the CLI's own bounded-retry
+            # wrapper around a lock timeout — that wrapper lives in the CLI,
+            # increment O2, not here): every event in the batch already
+            # exists — look our own claim event up by key.
             return _find_event(read_all(log_path), claim_event["idempotency_key"])
 
-        return next(e for e in written if e.type == "ownership_declared")
+        # `_find_event` (not a bare `next(...)`, M4): degrades to `None`
+        # instead of raising `StopIteration` in the defensive case where
+        # `written` reported events but somehow none of type
+        # "ownership_declared".
+        return _find_event(written, claim_event["idempotency_key"])
 
     raise OwnershipContended(
         f"claim of {project_id!r} by {claimant!r} exceeded {_MAX_REEVALUATIONS} "
