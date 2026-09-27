@@ -534,7 +534,9 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
         raise ValidationError(f"{what} must be a string, got {value!r}")
     if not value.strip():
         raise ValidationError(f"{what} must not be empty")
-    if len(value.splitlines()) > 1:
+    # `splitlines() != [value]`, not `len(...) > 1`: `splitlines()` drops a
+    # final terminator, so the length form would accept "abc\n".
+    if value.splitlines() != [value]:
         raise ValidationError(
             f"{what} must be a single line (no embedded line break, including "
             "U+2028/U+0085/vertical-tab/form-feed)"
@@ -602,6 +604,13 @@ def _assert_ownership_declared_payload(payload: dict[str, Any]) -> None:
     if payload["prior_owner_kind"] == "none" and payload["prior_owner"] is not None:
         raise ValidationError(
             "ownership_declared payload prior_owner_kind='none' requires 'prior_owner' to be null"
+        )
+    if payload["basis"] != "unowned" and (
+        payload["prior_owner"] is None or payload["prior_owner_kind"] == "none"
+    ):
+        raise ValidationError(
+            f"ownership_declared payload basis={payload['basis']!r} is a takeover and requires "
+            "a non-null 'prior_owner' with 'prior_owner_kind' other than 'none'"
         )
     liveness = payload["prior_owner_liveness"]
     if liveness is not None and liveness not in _LIVENESS_VALUES:

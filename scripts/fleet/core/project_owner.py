@@ -683,11 +683,13 @@ def claim(
             # exists — look our own claim event up by key.
             return _find_event(read_all(log_path), claim_event["idempotency_key"])
 
-        # `_find_event` (not a bare `next(...)`, M4): degrades to `None`
-        # instead of raising `StopIteration` in the defensive case where
-        # `written` reported events but somehow none of type
-        # "ownership_declared".
-        return _find_event(written, claim_event["idempotency_key"])
+        # `_find_event` (not a bare `next(...)`, M4). If `written` somehow
+        # lacks our claim (the claim half was already present), fall back to
+        # the log rather than return `None`, which is reserved for the
+        # already-owner no-op.
+        return _find_event(written, claim_event["idempotency_key"]) or _find_event(
+            read_all(log_path), claim_event["idempotency_key"]
+        )
 
     raise OwnershipContended(
         f"claim of {project_id!r} by {claimant!r} exceeded {_MAX_REEVALUATIONS} "

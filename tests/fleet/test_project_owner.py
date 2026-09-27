@@ -1039,7 +1039,12 @@ class TestClaimFindEventFallbackM4:
             writer_role="pm",
             liveness="archived",
         )
-        assert result is None  # graceful, not a crash
+        # Fix round 2: not a crash, and not an ambiguous `None` (which the
+        # docstring reserves for the already-owner no-op) — the landed claim
+        # is looked up from the log.
+        assert result is not None
+        assert result.type == "ownership_declared"
+        assert result.node_id == "nodeA"
         standdowns = [e for e in read_all(log_path) if e.type == "ownership_stood_down"]
         assert len(standdowns) == 1
 

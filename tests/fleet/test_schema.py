@@ -668,6 +668,38 @@ class TestOwnershipDeclaredPayloadValidation:
         with pytest.raises(ValidationError):
             validate_event(data)
 
+    @pytest.mark.parametrize("terminator", ["\n", "\r\n", "\r", " ", "\x85"])
+    def test_trailing_line_break_in_notified_via_is_rejected(self, terminator: str) -> None:
+        """Fix round 2: `splitlines()` drops a final terminator, so a
+        trailing break must be rejected too, not only an embedded one."""
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["prior_owner_kind"] = "declared"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "slack" + terminator,
+        }
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize("basis", ["notified", "archived", "deleted"])
+    def test_takeover_basis_with_null_prior_owner_is_rejected(self, basis: str) -> None:
+        """Fix round 2: a takeover basis must name the prior owner it displaced."""
+        data = _ownership_declared_event()
+        data["payload"]["basis"] = basis
+        data["payload"]["prior_owner_kind"] = "declared"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_takeover_basis_with_prior_owner_kind_none_is_rejected(self) -> None:
+        """Fix round 2: a takeover basis requires a prior-owner kind other than 'none'."""
+        data = _ownership_declared_event()
+        data["payload"]["basis"] = "archived"
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
     def test_malformed_variant_never_reaches_the_log(self, tmp_path: Path) -> None:
         log_path = tmp_path / "events.jsonl"
         data = _ownership_declared_event()
@@ -730,6 +762,14 @@ class TestOwnershipStoodDownPayloadValidation:
     def test_empty_string_reason_is_rejected(self) -> None:
         data = _ownership_stood_down_event()
         data["payload"]["reason"] = "   "
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize("terminator", ["\n", "\r\n", "\r", " "])
+    def test_trailing_line_break_in_reason_is_rejected(self, terminator: str) -> None:
+        """Fix round 2: a trailing line break in `reason` is rejected."""
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "done" + terminator
         with pytest.raises(ValidationError):
             validate_event(data)
 
