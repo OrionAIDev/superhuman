@@ -445,12 +445,21 @@ def _reg_event(suffix: str, event_id: str | None = None) -> dict:
     }
 
 
-def _hammer_worker(log_path_str: str, stop_flag) -> None:  # pragma: no cover - runs in a subprocess
-    """Continuously append distinct events until `stop_flag` is set."""
+def _hammer_worker(log_path_str: str, stop_flag, landed) -> None:  # pragma: no cover - runs in a subprocess
+    """Continuously append distinct events until `stop_flag` is set, bumping
+    the shared `landed` counter after each line is durably written.
+
+    The short pause after each line leaves the lock free most of the time;
+    without it this loop re-takes the lock the instant it releases it, and
+    the main process's polling acquire starves.
+    """
     i = 0
     while not stop_flag.is_set():
         append(log_path_str, _reg_event(f"hammer-{i}"))
+        with landed.get_lock():
+            landed.value += 1
         i += 1
+        time.sleep(0.005)
 
 
 class TestAppendBatchSingleLockHold:
@@ -462,31 +471,55 @@ class TestAppendBatchSingleLockHold:
     `append_batch` calls from the main process. If `append_batch` ever
     released the lock between its two lines (the revert-to-red mutation:
     two sequential `append()` calls instead of one locked batch write), the
-    racer's tight retry loop is overwhelmingly likely to land a line in the
-    resulting gap across enough iterations.
+    racer lands a line in the resulting gap.
+
+    That interleaving is forced, not left to the scheduler. The lock is a
+    non-blocking OS lock polled every `retry_interval`, so hand-off is
+    bursty: whoever just released it re-takes it at once while the loser
+    sleeps. Left alone, all 40 batches can run back-to-back inside one racer
+    sleep (seen on CI's py3.11 job and reproduced on 3.12), and a
+    broken batch's release-and-retake gap is far too short for a polling
+    racer to hit reliably. So every lock acquisition in this process first
+    waits until the racer has landed a fresh line: the racer is guaranteed
+    a line between every two batches, and inside any gap a broken batch
+    opens between its own lines.
     """
 
-    def test_racer_write_never_lands_between_batch_lines(self, tmp_path: Path) -> None:
+    def test_racer_write_never_lands_between_batch_lines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         log_path = tmp_path / "events.jsonl"
         ctx = multiprocessing.get_context("spawn")
         stop_flag = ctx.Event()
-        racer = ctx.Process(target=_hammer_worker, args=(str(log_path), stop_flag))
+        landed = ctx.Value("q", 0)
+        racer = ctx.Process(target=_hammer_worker, args=(str(log_path), stop_flag, landed))
         racer.start()
+
+        def _wait_for_racer_line(since: int, timeout: float) -> None:
+            deadline = time.monotonic() + timeout
+            while landed.value <= since:
+                if not racer.is_alive():
+                    pytest.fail(f"racer process died (exitcode={racer.exitcode})")
+                if time.monotonic() >= deadline:
+                    pytest.fail(f"racer landed no new line within {timeout}s")
+                time.sleep(0.001)
+
+        real_acquire_lock = events_mod.acquire_lock
+
+        def _acquire_after_racer_line(*args, **kwargs):
+            _wait_for_racer_line(landed.value, timeout=10.0)
+            return real_acquire_lock(*args, **kwargs)
+
         try:
-            # M1: don't start the timed batch loop until the racer has
-            # actually landed its first line — otherwise a slow-starting
-            # racer process could make the "never lands between" assertion
-            # below pass vacuously, without the racer ever having a real
-            # chance to interleave with the batches at all.
-            deadline = time.monotonic() + 10.0
-            racer_landed = False
-            while time.monotonic() < deadline:
-                if log_path.exists() and log_path.read_text(encoding="utf-8").strip():
-                    racer_landed = True
-                    break
-                time.sleep(0.01)
-            if not racer_landed:
-                pytest.fail("racer process never landed a line within 10s")
+            # M1: don't start the batch loop until the racer has actually
+            # landed its first line — spawn start-up (a fresh interpreter
+            # importing this module) is slow and varies by Python version
+            # and runner load.
+            _wait_for_racer_line(0, timeout=30.0)
+
+            # Only this process's lock acquisitions are gated; the spawned
+            # racer imports its own, unpatched copy of the module.
+            monkeypatch.setattr(events_mod, "acquire_lock", _acquire_after_racer_line)
 
             for i in range(40):
                 first = _event(f"batch-a-{i}", event_id=f"eid-batch-a-{i}")
