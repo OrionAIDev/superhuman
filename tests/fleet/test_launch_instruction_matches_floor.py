@@ -298,6 +298,19 @@ def _removed_lines(base_text: str, head_text: str) -> list[str]:
     ]
 
 
+#: Removals that a later fix makes on purpose, each naming its reason.
+#: superhuman#43 rewrites the session-start sentence to carry `--harness
+#: claude`/`--local-id` (the bare line registered a phantom `portable/<pid>`
+#: node); these are the two lines it replaces. Matched verbatim, so any
+#: other removal still fails.
+_INTENDED_LAUNCH_INSTRUCTION_REMOVALS = frozenset(
+    {
+        "-    \"--handoff-id <the id above>` as your first action (see SKILL.md's \"\n",
+        "-    \"first-action step). Run it from the superhuman skill root — the checkout \"\n",
+    }
+)
+
+
 def _launch_instruction_block(source: str) -> str:
     """Extract the `_LAUNCH_INSTRUCTION = ( ... )` block from `adapter/base.py` source.
 
@@ -474,7 +487,11 @@ class TestZeroDeletionCheckIncrementO:
 
         base_block = _launch_instruction_block(base_source)
         head_block = _launch_instruction_block(head_source)
-        removed = _removed_lines(base_block, head_block)
+        removed = [
+            line
+            for line in _removed_lines(base_block, head_block)
+            if line not in _INTENDED_LAUNCH_INSTRUCTION_REMOVALS
+        ]
         assert removed == [], (
             "adapter/base.py: `_LAUNCH_INSTRUCTION` block has unexpected removed line(s):\n"
             + "".join(removed)

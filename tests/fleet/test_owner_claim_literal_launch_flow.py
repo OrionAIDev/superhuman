@@ -33,10 +33,10 @@ hand-written-argv version this replaces, which could drift from the real
 instruction text without any test noticing.
 
 The `observe session-start` command, as the instruction actually spells it,
-carries no `--harness` flag at all (it defaults to `portable`) -- this
-module deliberately does not add one for the claude variant either; doing
-so would test a flag combination the instruction never tells a launched
-session to run.
+ends in `--harness claude` (superhuman#43: a bare line registered a phantom
+`portable/<pid>` node). The portable variant swaps that tail for the
+instruction's own `--harness <h> --local-id <...>` wording, exactly as the
+claim step does.
 """
 
 from __future__ import annotations
@@ -352,21 +352,20 @@ class TestLiteralLaunchFlowClaudeHarness:
             f"stdout={claim.stdout!r} stderr={claim.stderr!r}"
         )
 
-        # O14-a: the claim register-if-absent path must have written the
-        # claimant's own `session_registered` event, origination "manual".
+        # superhuman#43: session-start now carries `--harness claude`, so it
+        # registers the claimant under its real session id, and the claim
+        # resolves that SAME node -- one registered node in total, never a
+        # phantom `portable/<pid>` beside it. (A claim with no prior
+        # session-start still registers itself, O14-a: see
+        # TestLiteralFlowWithoutSessionStartStillWorks.)
         log_path = _fleet_log_path(workspace, slug)
-        registrations = [
-            e
+        registered_nodes = {
+            str(e.get("node_id", ""))
             for e in _events(log_path)
             if e.get("type") == "session_registered"
-            and str(e.get("node_id", "")).endswith(f"/{session_id}")
-            and e.get("payload", {}).get("origination") == "manual"
-        ]
-        assert registrations, (
-            "O14-a: expected a `session_registered` event with "
-            f"origination=manual for the claimant ({session_id!r}) in "
-            f"{log_path}, found none"
-        )
+        }
+        assert len(registered_nodes) == 1, registered_nodes
+        assert next(iter(registered_nodes)).endswith(f"/{session_id}"), registered_nodes
 
         show = _run_cli(
             "-m",
@@ -403,6 +402,11 @@ class TestLiteralLaunchFlowPortableHarness:
             workspace=workspace,
             slug=slug,
             handoff_id=handoff_id,
+        )
+        session_start_base, session_start_tail = session_start_cmd.rsplit(" --harness claude", 1)
+        assert session_start_tail == "", "unexpected trailing text after '--harness claude'"
+        session_start_cmd = (
+            f"{session_start_base} --harness portable --local-id {stable_local_id}"
         )
         session_start = _run_cli(*_argv_from_command(session_start_cmd, workspace=workspace), profile=profile)
         assert session_start.returncode == 0, session_start.stderr
@@ -467,3 +471,18 @@ class TestLiteralFlowWithoutSessionStartStillWorks:
             extra_env={"CLAUDE_CODE_SESSION_ID": "never-session-started"},
         )
         assert claim.returncode == 0, claim.stderr
+
+        # O14-a: the claim register-if-absent path must have written the
+        # claimant's own `session_registered` event, origination "manual".
+        log_path = _fleet_log_path(workspace, slug)
+        registrations = [
+            e
+            for e in _events(log_path)
+            if e.get("type") == "session_registered"
+            and str(e.get("node_id", "")).endswith("/never-session-started")
+            and e.get("payload", {}).get("origination") == "manual"
+        ]
+        assert registrations, (
+            "O14-a: expected a `session_registered` event with "
+            f"origination=manual for the claimant in {log_path}, found none"
+        )
