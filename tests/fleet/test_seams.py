@@ -436,3 +436,185 @@ class TestFleetObservationDocContent:
         text = _FLEET_OBSERVATION_DOC.read_text(encoding="utf-8")
         hits = find_tokens(text, _operator_tokens())
         assert not hits, f"docs/fleet-observation.md: operator token(s) found: {hits!r}"
+
+
+# --- TC-O23: `docs/fleet-observation.md`'s new "Declaring ownership" section
+# covers every required topic (increment O, Chunk O3, O-FR-8/O-NFR-2) ------
+#
+# Scoped to the new section specifically (not the whole document): several
+# of these markers (e.g. "exit 0") already appear elsewhere in the shipped
+# doc for unrelated reasons, so a whole-document check would pass trivially
+# without the new content ever existing.
+
+#: The exact O-NFR-2 sentence DESIGN O.7 requires, "stated plainly".
+_O_NFR_2_LIMIT_SENTENCE = (
+    "records the attestation and does not and cannot verify that the message was delivered"
+)
+
+#: Phrase-level markers (not bare single words like "read"/"coordination"/
+#: "never", each of which can trivially match unrelated prose elsewhere in
+#: the section) for the read rule, the coordination rule, and the
+#: deleted-reachability note, so each check can actually fail (a developer
+#: caught this in review: single-word markers made these three checks
+#: pass on text that never said any of this).
+_READ_RULE_MARKERS = ("in log order",)
+_COORDINATION_RULE_MARKERS = ("coordination rule", "coordination required")
+_NEVER_INFERS_DELETED_MARKERS = ("never infers",)
+
+
+def _declaring_ownership_section_text() -> str:
+    """Extract `docs/fleet-observation.md`'s new "Declaring ownership" section."""
+    return _new_subsection_text_by_heading(_FLEET_OBSERVATION_DOC, "declaring ownership")
+
+
+class TestDeclaringOwnershipDocSectionContent:
+    """TC-O23: the new section covers the two event types and the read rule,
+    every owner exit code and its meaning, the coordination rule, the
+    O-NFR-2 limit stated plainly, the `unknown`-counts-as-active rule, and
+    the `deleted`-reachability note; carries no operator token.
+    """
+
+    def test_section_exists(self) -> None:
+        section = _declaring_ownership_section_text()
+        assert section, "docs/fleet-observation.md: 'Declaring ownership' section is empty"
+
+    def test_section_names_the_two_event_types_and_the_read_rule(self) -> None:
+        section = _declaring_ownership_section_text()
+        assert "ownership_declared" in section
+        assert "ownership_stood_down" in section
+        # Collapse whitespace: markdown's line-wrapping can put a newline
+        # where a multi-word marker phrase wraps (same rationale as the
+        # O-NFR-2 sentence check below).
+        lowered = re.sub(r"\s+", " ", section.lower())
+        assert any(marker in lowered for marker in _READ_RULE_MARKERS), (
+            "'Declaring ownership' section names the event types but states no read rule "
+            f"(expected one of {_READ_RULE_MARKERS!r})"
+        )
+
+    def test_section_covers_every_owner_exit_code(self) -> None:
+        lowered = _declaring_ownership_section_text().lower()
+        for code in ("exit 0", "exit 1", "exit 3", "exit 4", "exit 5"):
+            assert code in lowered, f"'Declaring ownership' section never mentions {code}"
+
+    def test_section_states_the_coordination_rule(self) -> None:
+        lowered = re.sub(r"\s+", " ", _declaring_ownership_section_text().lower())
+        assert any(marker in lowered for marker in _COORDINATION_RULE_MARKERS), (
+            "'Declaring ownership' section never states the coordination rule "
+            f"(expected one of {_COORDINATION_RULE_MARKERS!r})"
+        )
+
+    def test_section_states_the_o_nfr_2_limit_plainly(self) -> None:
+        # Collapse whitespace: markdown's natural line-wrapping inside a
+        # paragraph can put a newline where this exact phrase wraps.
+        lowered = re.sub(r"\s+", " ", _declaring_ownership_section_text().lower())
+        assert _O_NFR_2_LIMIT_SENTENCE in lowered, (
+            "'Declaring ownership' section does not state the O-NFR-2 limit plainly: "
+            f"expected the phrase {_O_NFR_2_LIMIT_SENTENCE!r}"
+        )
+
+    def test_section_states_unknown_counts_as_active(self) -> None:
+        lowered = _declaring_ownership_section_text().lower()
+        assert "unknown" in lowered and "active" in lowered
+
+    def test_section_states_the_deleted_reachability_note(self) -> None:
+        lowered = re.sub(r"\s+", " ", _declaring_ownership_section_text().lower())
+        assert "deleted" in lowered
+        assert any(marker in lowered for marker in _NEVER_INFERS_DELETED_MARKERS), (
+            "'Declaring ownership' section mentions 'deleted' but never states the "
+            f"reachability note (expected one of {_NEVER_INFERS_DELETED_MARKERS!r})"
+        )
+
+    def test_section_contains_no_operator_token(self) -> None:
+        section = _declaring_ownership_section_text()
+        hits = find_tokens(section, _operator_tokens())
+        assert not hits, f"'Declaring ownership' section: operator token(s) found: {hits!r}"
+
+
+class TestFleetObservationDocStatedLimitationsBullet:
+    def test_stated_limitations_gained_a_new_bullet_about_ownership(self) -> None:
+        """TC-O23: a new numbered bullet under 'Stated limitations' covers the
+        ownership-declaration surface (DESIGN O.7's 'It also gets a new bullet
+        under "Stated limitations."')."""
+        lines, start, end = _find_heading_containing(_FLEET_OBSERVATION_DOC, "stated limitations")
+        section = "\n".join(lines[start:end])
+        numbered_bullets = re.findall(r"^\d+\. \*\*", section, flags=re.MULTILINE)
+        assert len(numbered_bullets) >= 11, (
+            "docs/fleet-observation.md 'Stated limitations' does not appear to have "
+            f"gained a new numbered bullet (found {len(numbered_bullets)}, expected >= 11)"
+        )
+        lowered = section.lower()
+        assert "owner" in lowered and ("claim" in lowered or "attestation" in lowered), (
+            "docs/fleet-observation.md 'Stated limitations' has no bullet that reads as "
+            "being about ownership declaration"
+        )
+
+
+# --- TC-O21: `roles/pm.md`'s "Ownership stand-down at handoff" subsection --
+# present, additive, non-gating (increment O, Chunk O3, O-FR-8) ------------
+
+#: The literal command shape the new subsection must name (DESIGN O.7).
+_OWNER_STAND_DOWN_COMMAND_RE = re.compile(
+    r"python -m scripts\.fleet\.cli owner stand-down\s+--workspace \.\.\.\s+--slug \.\.\.\s+<identity>"
+)
+
+#: Phrases proving the subsection states, in its own words, that a refusal
+#: or failure is reported (not ignored) and that the step is non-gating
+#: (never changes a gate's meaning, order, or pass condition) -- DESIGN O.7.
+_REPORTED_NOT_IGNORED_MARKERS = ("reported, not ignored", "reported — not ignored")
+_NEVER_CHANGES_GATE_MARKERS = (
+    "never changes a gate's meaning, order",
+    "never changes a gate's meaning, order, or pass condition",
+)
+_NAME_BY_TITLE_MARKERS = ("by its title, not its id", "by its title, not its node id")
+
+
+def _pm_stand_down_subsection_text() -> str:
+    """Extract `roles/pm.md`'s new "Ownership stand-down at handoff" subsection."""
+    return _new_subsection_text_by_heading(
+        _REPO_ROOT / "roles" / "pm.md", "ownership stand-down", "handoff"
+    )
+
+
+class TestOwnerStandDownAtHandoffSeamContent:
+    """TC-O21: the new subsection exists, names the literal `owner stand-down`
+    command shape, states the failure is reported (not ignored) and that the
+    step never changes a gate's meaning/order/pass condition, instructs
+    naming the owner by session title (not node id), and carries no
+    operator token.
+    """
+
+    def test_subsection_names_the_literal_command_shape(self) -> None:
+        subsection = _pm_stand_down_subsection_text()
+        assert _OWNER_STAND_DOWN_COMMAND_RE.search(subsection), (
+            "roles/pm.md: 'Ownership stand-down at handoff' subsection does not name the "
+            "literal command shape 'python -m scripts.fleet.cli owner stand-down "
+            "--workspace ... --slug ... <identity>'"
+        )
+
+    def test_subsection_states_a_failure_is_reported_not_ignored(self) -> None:
+        subsection = _pm_stand_down_subsection_text().lower()
+        assert any(marker in subsection for marker in _REPORTED_NOT_IGNORED_MARKERS), (
+            "roles/pm.md: 'Ownership stand-down at handoff' subsection never states a "
+            "refusal or failure is reported, not ignored"
+        )
+
+    def test_subsection_states_it_never_changes_a_gates_meaning_order_or_pass_condition(
+        self,
+    ) -> None:
+        subsection = _pm_stand_down_subsection_text().lower()
+        assert any(marker in subsection for marker in _NEVER_CHANGES_GATE_MARKERS), (
+            "roles/pm.md: 'Ownership stand-down at handoff' subsection never states it "
+            "never changes a gate's meaning, order, or pass condition"
+        )
+
+    def test_subsection_instructs_naming_the_owner_by_title_not_id(self) -> None:
+        subsection = _pm_stand_down_subsection_text().lower()
+        assert any(marker in subsection for marker in _NAME_BY_TITLE_MARKERS), (
+            "roles/pm.md: 'Ownership stand-down at handoff' subsection never instructs "
+            "naming the owner by session title, not its id, when reporting to a person"
+        )
+
+    def test_subsection_contains_no_operator_token(self) -> None:
+        subsection = _pm_stand_down_subsection_text()
+        hits = find_tokens(subsection, _operator_tokens())
+        assert not hits, f"roles/pm.md 'Ownership stand-down at handoff': operator token(s) found: {hits!r}"

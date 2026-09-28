@@ -12,14 +12,14 @@ import argparse
 import ast
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from scripts.fleet import cli as fleet_cli
 from scripts.fleet.adapter.base import SessionInfo
+from scripts.fleet.adapter.claude import ClaudeAdapter
 from scripts.fleet.adapter.portable import PortableAdapter
-from scripts.fleet.core.errors import LockTimeoutError, OwnershipRefused
+from scripts.fleet.core.errors import LockTimeoutError
 from scripts.fleet.core.events import append, read_all
 from scripts.fleet.core.nodes import make_node_id
 from scripts.fleet.core.project_owner import claim as core_claim
@@ -87,6 +87,35 @@ def _register_claude(
     )
     append(_log_path(workspace, slug), event_dict)
     return node_id
+
+
+def _register_claude_cli_identity(
+    workspace: Path,
+    slug: str,
+    session_id: str,
+    *,
+    writer_role: str = "developer",
+    origination: str = "spawned",
+) -> str:
+    """Register a `harness="claude"` session via the REAL `ClaudeAdapter`
+    identity resolution and return its `node_id`.
+
+    Unlike `_register_claude` (which fabricates `node_id` with
+    `make_node_id("claude", str(workspace), ...)`, a shortcut good enough
+    for liveness-matching-by-`sessionId` tests), this builds the
+    `SessionInfo` the same way `_build_adapter`/`ClaudeAdapter.current_session`
+    does for a real `--harness claude --session-id <id>` CLI call
+    (`workspace_component(workspace)`, not the raw path). Needed whenever a
+    test later drives `fleet owner claim|stand-down --harness claude
+    --session-id <id>` against THIS SAME node and needs the two to resolve
+    to the identical `node_id`.
+    """
+    session = ClaudeAdapter(workspace, slug, current_session_id=session_id).current_session()
+    event_dict = fleet_cli.build_session_registered_event(
+        session, origination=origination, project_id=PROJECT_ID, writer_role=writer_role
+    )
+    append(_log_path(workspace, slug), event_dict)
+    return session.node_id
 
 
 @pytest.fixture
@@ -267,7 +296,13 @@ class TestOwnerClaimExitCodes:
 
         assert code == 4
 
-    def test_claim_by_an_unregistered_node_is_refused_exit_4(self, owner_project: tuple[Path, str]) -> None:
+    def test_self_claim_by_an_unregistered_node_now_registers_and_succeeds(
+        self, owner_project: tuple[Path, str]
+    ) -> None:
+        """O14-a: the self path always has the CLI's own adapter-resolved
+        session facts on hand, so `not_registered` is no longer reachable
+        here -- the CLI registers the node in the same locked write as the
+        claim, instead of refusing exit 4."""
         workspace, slug = owner_project
 
         code = fleet_cli.main(
@@ -282,6 +317,38 @@ class TestOwnerClaimExitCodes:
                 "portable",
                 "--local-id",
                 "never-registered",
+            ]
+        )
+
+        assert code == 0
+        events = read_all(_log_path(workspace, slug))
+        registrations = [e for e in events if e.type == "session_registered"]
+        assert len(registrations) == 1
+        assert registrations[0].payload["local_id"] == "never-registered"
+        assert registrations[0].payload["origination"] == "manual"
+        declared = [e for e in events if e.type == "ownership_declared"]
+        assert len(declared) == 1
+
+    def test_on_behalf_claim_by_an_unregistered_node_is_still_refused_exit_4(
+        self, owner_project: tuple[Path, str]
+    ) -> None:
+        """O14-a is explicitly scoped to the self path: the CLI has no
+        adapter for an on-behalf `--node-id` target, so it can supply no
+        session facts to register with -- `not_registered` still applies."""
+        workspace, slug = owner_project
+
+        code = fleet_cli.main(
+            [
+                "owner",
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--node-id",
+                "portable/some-ws/demo-project/never-registered",
+                "--writer-role",
+                "cto",
             ]
         )
 
@@ -500,6 +567,18 @@ class TestNoBroadCatchInOwnerModules:
         )
 
         assert code == 0
+
+        # O2 review carry-over: the swallowed failure must still be
+        # journaled (W-FR-8/W-NFR-1: "recorded, not swallowed silently"),
+        # not just printed to stderr and dropped -- `SessionsJsonUnusable`
+        # is a `ValueError` subclass, so `_safe_build_adapter_for_observe`
+        # catches it and routes it through
+        # `observe.journal_adapter_construction_failure`.
+        journal = (default_fleet_dir(workspace, slug) / "observe-failures.log").read_text(
+            encoding="utf-8"
+        )
+        assert '"error_class": "adapter_construction_failed"' in journal
+        assert '"event": "session-start"' in journal
 
 
 class TestOwnerLockRetryAttemptsMustBePositive:
@@ -894,6 +973,78 @@ class TestOwnerClaimLegacyOwnerLivenessI2:
         assert declared[0].payload["basis"] == "archived"
         assert declared[0].payload["prior_owner_kind"] == "legacy"
         assert declared[0].payload["attestation"] is None
+
+
+class TestOwnerCliLegacyStandDownThenSuccessorClaimO14c:
+    """CLI-level coverage of the O14-c pm.md flow (the reviewer flagged this
+    as covered only at `core.project_owner` level, in
+    `test_project_owner.py::TestLegacyStandDownO14c` -- this exercises the
+    identical scenario through `fleet_cli.main`, per DESIGN O.8's
+    integration tier): a legacy `relayed`/`manual` `pm` registration stands
+    ITSELF down via `fleet owner stand-down`, and a successor's `fleet owner
+    claim` then lands uncontested, `basis="unowned"`."""
+
+    def test_legacy_pm_registration_stands_down_then_successor_claims_unowned(
+        self, owner_project: tuple[Path, str]
+    ) -> None:
+        workspace, slug = owner_project
+        legacy_session_id = "legacy-pm-cli"
+        # A relayed `pm` registration with no `ownership_declared` event yet
+        # is the OQ-1 legacy prior owner (resolve_legacy_owner_unrestricted).
+        # Registered via the same identity resolution `--harness claude
+        # --session-id <id>` uses, so the stand-down below resolves to this
+        # SAME node_id, not a fabricated one.
+        legacy_node = _register_claude_cli_identity(
+            workspace, slug, legacy_session_id, writer_role="pm", origination="relayed"
+        )
+
+        stand_down_code = fleet_cli.main(
+            [
+                "owner",
+                "stand-down",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "claude",
+                "--session-id",
+                legacy_session_id,
+            ]
+        )
+        assert stand_down_code == 0
+
+        log_path = _log_path(workspace, slug)
+        standdowns = [e for e in read_all(log_path) if e.type == "ownership_stood_down"]
+        assert len(standdowns) == 1
+        assert standdowns[0].node_id == legacy_node
+        assert standdowns[0].payload["basis"] == "self"
+
+        successor_node = _register(workspace, slug, "successor-a")
+        claim_code = fleet_cli.main(
+            [
+                "owner",
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "portable",
+                "--local-id",
+                "successor-a",
+            ]
+        )
+        assert claim_code == 0
+
+        declared = [
+            e
+            for e in read_all(log_path)
+            if e.type == "ownership_declared" and e.node_id == successor_node
+        ]
+        assert len(declared) == 1
+        assert declared[0].payload["basis"] == "unowned"
+        assert declared[0].payload["prior_owner"] is None
 
 
 class TestOwnerClaimBoundedLockRetryI3:
@@ -1658,3 +1809,183 @@ class TestExit3HeadingPlainHyphenM7:
         stderr = capsys.readouterr().err
         assert "\u2014" not in stderr
         assert "refused - coordination required" in stderr
+
+
+class TestOwnerIdentityFlagsO14b:
+    """O14-b: `fleet owner claim`/`stand-down` require an explicit,
+    cross-process-stable identity for the self path -- exit 2 when it is
+    missing, and `CLAUDE_CODE_SESSION_ID` is an accepted fallback for
+    `--harness claude`."""
+
+    def test_claude_harness_with_no_session_id_and_no_env_var_exits_2(
+        self,
+        owner_project: tuple[Path, str],
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace, slug = owner_project
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+        code = fleet_cli.main(
+            [
+                "owner",
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "claude",
+            ]
+        )
+
+        assert code == 2
+        stderr = capsys.readouterr().err
+        assert "--session-id" in stderr
+        assert "CLAUDE_CODE_SESSION_ID" in stderr
+
+    def test_claude_harness_falls_back_to_the_environment_variable(
+        self,
+        owner_project: tuple[Path, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace, slug = owner_project
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "env-session-1")
+
+        code = fleet_cli.main(
+            [
+                "owner",
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "claude",
+            ]
+        )
+
+        assert code == 0
+        declared = [
+            e for e in read_all(_log_path(workspace, slug)) if e.type == "ownership_declared"
+        ]
+        assert len(declared) == 1
+        assert declared[0].node_id.endswith("/env-session-1")
+
+    def test_explicit_session_id_takes_precedence_over_the_environment_variable(
+        self,
+        owner_project: tuple[Path, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace, slug = owner_project
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "env-session-1")
+
+        code = fleet_cli.main(
+            [
+                "owner",
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "claude",
+                "--session-id",
+                "explicit-session",
+            ]
+        )
+
+        assert code == 0
+        declared = [
+            e for e in read_all(_log_path(workspace, slug)) if e.type == "ownership_declared"
+        ]
+        assert declared[0].node_id.endswith("/explicit-session")
+
+    def test_portable_harness_with_no_local_id_exits_2(
+        self, owner_project: tuple[Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace, slug = owner_project
+
+        code = fleet_cli.main(
+            ["owner", "claim", "--workspace", str(workspace), "--slug", slug, "--harness", "portable"]
+        )
+
+        assert code == 2
+        stderr = capsys.readouterr().err
+        assert "--local-id" in stderr
+
+    def test_subagent_harness_with_no_local_id_exits_2(
+        self, owner_project: tuple[Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace, slug = owner_project
+
+        code = fleet_cli.main(
+            ["owner", "claim", "--workspace", str(workspace), "--slug", slug, "--harness", "subagent"]
+        )
+
+        assert code == 2
+        stderr = capsys.readouterr().err
+        assert "--local-id" in stderr
+
+    def test_stand_down_portable_harness_with_no_local_id_exits_2(
+        self, owner_project: tuple[Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace, slug = owner_project
+
+        code = fleet_cli.main(
+            [
+                "owner",
+                "stand-down",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--harness",
+                "portable",
+            ]
+        )
+
+        assert code == 2
+        stderr = capsys.readouterr().err
+        assert "--local-id" in stderr
+
+    def test_on_behalf_node_id_path_is_unaffected_by_identity_flag_checks(
+        self, owner_project: tuple[Path, str]
+    ) -> None:
+        """The on-behalf path names its target directly via --node-id and has
+        no self-identity flags to validate -- O14-b must not touch it."""
+        workspace, slug = owner_project
+        node_id = _register(workspace, slug, "target-1")
+
+        code = fleet_cli.main(
+            [
+                "owner",
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--slug",
+                slug,
+                "--node-id",
+                node_id,
+                "--writer-role",
+                "cto",
+            ]
+        )
+
+        assert code == 0
+
+    def test_disabled_fleet_still_exits_5_before_any_identity_check(
+        self, disabled_project: tuple[Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`_resolve_owner_manifest`'s exit-5 short-circuit must still fire
+        BEFORE O14-b's identity-flag validation -- a disabled workspace with
+        no --local-id must not surface a confusing identity error."""
+        workspace, slug = disabled_project
+
+        code = fleet_cli.main(
+            ["owner", "claim", "--workspace", str(workspace), "--slug", slug, "--harness", "portable"]
+        )
+
+        assert code == 5
+        stderr = capsys.readouterr().err
+        assert "--local-id" not in stderr

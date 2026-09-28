@@ -35,6 +35,7 @@ from scripts.fleet.core.project_owner import (  # noqa: E402
     decide_claim,
     fold_owner,
     resolve_legacy_owner,
+    resolve_legacy_owner_unrestricted,
     stand_down,
 )
 from scripts.fleet.core.schema import Event
@@ -151,9 +152,8 @@ class TestFoldOwnerTruthTable:
         )
 
     def test_events_from_other_projects_are_ignored(self) -> None:
-        other_project_events = _events(_declared("nodeZ", "e-other"))
-        # The above event lives under PROJECT_ID (the helper hard-codes it),
-        # so build a genuinely different-project event by hand instead.
+        # `_declared` hard-codes PROJECT_ID, so build a genuinely
+        # different-project event by hand instead.
         from scripts.fleet.core.schema import validate_event
 
         other = validate_event(
@@ -1185,3 +1185,302 @@ class TestRebuildIdentityONFR3:
         assert frags_without.keys() == frags_with.keys()
         for node_id in frags_without:
             assert frags_without[node_id] == frags_with[node_id]
+
+
+_CLAIMANT_SESSION = {
+    "harness": "claude",
+    "workspace": "/workspace/demo",
+    "local_id": "sess-xyz",
+    "branch": "main",
+}
+
+
+class TestRegisterIfAbsentO14a:
+    """O14-a: `claim` registers an unregistered claimant in the SAME locked
+    write as the claim itself, when `claimant_session` is supplied."""
+
+    def test_claimant_session_none_preserves_not_registered_refusal(
+        self, tmp_path: Path
+    ) -> None:
+        """Backward compatibility: omitting `claimant_session` (the default,
+        `None`) must behave exactly as before O14-a -- `not_registered`,
+        nothing written."""
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(OwnershipRefused) as exc_info:
+            claim(log_path, project_id=PROJECT_ID, claimant="ghost", writer_role="pm")
+        assert exc_info.value.code == "not_registered"
+        assert read_all(log_path) == []
+
+    def test_unregistered_claimant_with_session_lands_registration_and_claim(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+
+        event = claim(
+            log_path,
+            project_id=PROJECT_ID,
+            claimant="freshNode",
+            writer_role="pm",
+            claimant_session=_CLAIMANT_SESSION,
+        )
+
+        assert event is not None
+        assert event.type == "ownership_declared"
+        events = read_all(log_path)
+        registrations = [e for e in events if e.type == "session_registered"]
+        assert len(registrations) == 1
+        reg = registrations[0]
+        assert reg.node_id == "freshNode"
+        assert reg.writer_role == "pm"
+        assert reg.idempotency_key == "register:freshNode"
+        assert reg.payload["harness"] == "claude"
+        assert reg.payload["workspace"] == "/workspace/demo"
+        assert reg.payload["local_id"] == "sess-xyz"
+        assert reg.payload["branch"] == "main"
+        assert reg.payload["origination"] == "manual"
+        # the registration must land BEFORE the claim in the log.
+        types_in_order = [e.type for e in events]
+        assert types_in_order.index("session_registered") < types_in_order.index(
+            "ownership_declared"
+        )
+
+    def test_registration_is_written_in_the_same_batch_as_a_coordinated_takeover(
+        self, tmp_path: Path
+    ) -> None:
+        """The registration, the on-behalf stand-down, and the claim all land
+        in ONE call -- three new events from one `claim()` invocation."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("owner-a"))
+        claim(log_path, project_id=PROJECT_ID, claimant="owner-a", writer_role="pm")
+        before = read_all(log_path)
+
+        claim(
+            log_path,
+            project_id=PROJECT_ID,
+            claimant="freshNode",
+            writer_role="pm",
+            claimant_session=_CLAIMANT_SESSION,
+            liveness={"owner-a": "archived"},
+        )
+
+        after = read_all(log_path)
+        assert len(after) == len(before) + 3
+        new_types = [e.type for e in after[len(before) :]]
+        assert new_types == [
+            "session_registered",
+            "ownership_stood_down",
+            "ownership_declared",
+        ]
+
+    def test_already_registered_claimant_never_gets_a_second_registration(
+        self, tmp_path: Path
+    ) -> None:
+        """A claimant already registered must not get a spurious second
+        `session_registered` event even when `claimant_session` is supplied
+        (it is simply unused -- registration is already satisfied)."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA", origination="observed"))
+
+        claim(
+            log_path,
+            project_id=PROJECT_ID,
+            claimant="nodeA",
+            writer_role="pm",
+            claimant_session=_CLAIMANT_SESSION,
+        )
+
+        registrations = [e for e in read_all(log_path) if e.type == "session_registered"]
+        assert len(registrations) == 1
+        assert registrations[0].payload["origination"] == "observed"
+
+    def test_registration_written_this_way_is_never_its_own_legacy_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """O14-a's requirement, verified directly: because the claim's own
+        `ownership_declared` event lands in the SAME batch, `has_ownership_events`
+        is True from that point on, so `resolve_legacy_owner` (gated on `not
+        has_ownership_events`) can never resolve this registration as a
+        legacy owner for a later claimant."""
+        log_path = tmp_path / "events.jsonl"
+        claim(
+            log_path,
+            project_id=PROJECT_ID,
+            claimant="freshNode",
+            writer_role="pm",
+            claimant_session=_CLAIMANT_SESSION,
+        )
+        events = read_all(log_path)
+        state = fold_owner(events, PROJECT_ID)
+        assert state.has_ownership_events is True
+        assert state.owner == "freshNode"
+        # `claim()` only ever consults `resolve_legacy_owner` when
+        # `not state.has_ownership_events` -- and that is now permanently
+        # False for this project (the claim's own `ownership_declared` event
+        # is in the same batch as the registration). Proven behaviorally: a
+        # second claimant is coordinated against "freshNode" as a real
+        # DECLARED owner, never waved through as an uncoordinated legacy
+        # takeover -- even though the registration's own shape (origination
+        # "manual", writer_role "pm") would otherwise be eligible
+        # `resolve_legacy_owner` input.
+        append(log_path, _register("someone-else"))
+        with pytest.raises(OwnershipRefused) as exc_info:
+            claim(log_path, project_id=PROJECT_ID, claimant="someone-else", writer_role="pm")
+        assert exc_info.value.code == "coordination_required"
+        assert exc_info.value.current_owner == "freshNode"
+
+    def test_coordination_required_refusal_writes_nothing_even_with_claimant_session(
+        self, tmp_path: Path
+    ) -> None:
+        """A refused claim must write NOTHING -- not the claim, and not the
+        O14-a register-if-absent registration either, even though
+        `claimant_session` is supplied and the batch would otherwise be
+        buildable. `claim` raises before the batch is ever built when the
+        decision is a REFUSE_* outcome (see the `decision.outcome ==
+        REFUSE_*` checks preceding the `batch = []` construction)."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("owner-a"))
+        claim(log_path, project_id=PROJECT_ID, claimant="owner-a", writer_role="pm")
+        before = read_all(log_path)
+
+        with pytest.raises(OwnershipRefused) as exc_info:
+            claim(
+                log_path,
+                project_id=PROJECT_ID,
+                claimant="freshNode",
+                writer_role="pm",
+                claimant_session=_CLAIMANT_SESSION,
+                # no liveness supplied -> "owner-a" resolves to "unknown",
+                # which counts as active (O-FR-5) -- coordination required.
+            )
+        assert exc_info.value.code == "coordination_required"
+        assert exc_info.value.current_owner == "owner-a"
+        assert read_all(log_path) == before
+
+    def test_attestation_mismatch_refusal_writes_nothing_even_with_claimant_session(
+        self, tmp_path: Path
+    ) -> None:
+        """Same guarantee as the coordination_required case above, for the
+        other REFUSE_* outcome: an attestation naming a node other than the
+        real prior owner refuses before the batch (registration + claim) is
+        ever built -- the log is byte-unchanged."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("owner-a"))
+        claim(log_path, project_id=PROJECT_ID, claimant="owner-a", writer_role="pm")
+        before = read_all(log_path)
+
+        with pytest.raises(OwnershipRefused) as exc_info:
+            claim(
+                log_path,
+                project_id=PROJECT_ID,
+                claimant="freshNode",
+                writer_role="pm",
+                claimant_session=_CLAIMANT_SESSION,
+                attested_owner="someone-not-the-owner",
+                notified_via="x",
+            )
+        assert exc_info.value.code == "attestation_mismatch"
+        assert exc_info.value.current_owner == "owner-a"
+        assert read_all(log_path) == before
+
+
+class TestLegacyStandDownO14c:
+    """O14-c: a node that IS the OQ-1 legacy owner (a `relayed`/`manual` `pm`
+    registration, with no `ownership_declared` event yet) can stand itself
+    down, and the vacated registration then lets a successor claim uncontested.
+    """
+
+    def test_legacy_owner_can_stand_itself_down(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("legacyPM", writer_role="pm", origination="relayed"))
+
+        event = stand_down(log_path, project_id=PROJECT_ID, node="legacyPM", writer_role="pm")
+
+        assert event is not None
+        assert event.type == "ownership_stood_down"
+        assert event.payload["written_by"] == "self"
+        assert event.payload["basis"] == "self"
+        registration_event_id = _register("legacyPM", writer_role="pm", origination="relayed")[
+            "event_id"
+        ]
+        assert event.payload["stood_down_from"] == registration_event_id
+
+        state = fold_owner(read_all(log_path), PROJECT_ID)
+        assert state.has_ownership_events is True
+        assert state.owner is None
+
+    def test_successor_claim_after_legacy_standdown_is_uncontested(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("legacyPM", writer_role="pm", origination="relayed"))
+        append(log_path, _register("nodeA"))
+
+        stand_down(log_path, project_id=PROJECT_ID, node="legacyPM", writer_role="pm")
+        event = claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+
+        assert event is not None
+        assert event.payload["basis"] == "unowned"
+        assert event.payload["prior_owner"] is None
+
+    def test_standing_down_twice_as_legacy_owner_is_a_noop_the_second_time(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("legacyPM", writer_role="pm", origination="relayed"))
+        first = stand_down(log_path, project_id=PROJECT_ID, node="legacyPM", writer_role="pm")
+        assert first is not None
+        second = stand_down(log_path, project_id=PROJECT_ID, node="legacyPM", writer_role="pm")
+        assert second is None
+        standdowns = [e for e in read_all(log_path) if e.type == "ownership_stood_down"]
+        assert len(standdowns) == 1
+
+    def test_a_node_that_is_neither_declared_nor_legacy_owner_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("legacyPM", writer_role="pm", origination="relayed"))
+        append(log_path, _register("bystander"))
+        before = read_all(log_path)
+
+        with pytest.raises(OwnershipRefused) as exc_info:
+            stand_down(log_path, project_id=PROJECT_ID, node="bystander", writer_role="pm")
+        assert exc_info.value.code == "not_current_owner"
+        assert read_all(log_path) == before
+
+    def test_resolve_legacy_owner_unrestricted_does_not_exclude_anyone(
+        self, tmp_path: Path
+    ) -> None:
+        events = _events(_register("legacyPM", writer_role="pm", origination="relayed"))
+        # `resolve_legacy_owner` excludes the asking node (claim's semantics) --
+        # a lone relayed pm registrant is never ITS OWN legacy owner there.
+        assert resolve_legacy_owner(events, PROJECT_ID, "legacyPM") is None
+        # `resolve_legacy_owner_unrestricted` excludes no one (O14-c) -- the
+        # same node can be told it IS the legacy owner, for stand-down/show.
+        assert resolve_legacy_owner_unrestricted(events, PROJECT_ID) == (
+            "legacyPM",
+            "eid-reg-legacyPM",
+        )
+
+    def test_declared_owner_takes_precedence_over_a_stale_legacy_standdown_path(
+        self, tmp_path: Path
+    ) -> None:
+        """Once a real `ownership_declared` event exists, `has_ownership_events`
+        is True, so the legacy stand-down branch is never consulted -- the
+        ordinary declared-owner rules apply exactly as before O14-c."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("legacyPM", writer_role="pm", origination="relayed"))
+        append(log_path, _register("nodeA"))
+        claim(
+            log_path,
+            project_id=PROJECT_ID,
+            claimant="nodeA",
+            writer_role="pm",
+            attested_owner="legacyPM",
+            notified_via="x",
+        )
+        before = read_all(log_path)
+
+        with pytest.raises(OwnershipRefused) as exc_info:
+            stand_down(log_path, project_id=PROJECT_ID, node="legacyPM", writer_role="pm")
+        assert exc_info.value.code == "not_current_owner"
+        assert read_all(log_path) == before

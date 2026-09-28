@@ -218,6 +218,76 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
     )
 
 
+def _newest_pm_registration(
+    events: list[Event], project_id: str, *, exclude: str | None
+) -> Event | None:
+    """Return the newest `relayed`/`manual` `pm` registration for `project_id`.
+
+    Shared lookup behind `resolve_legacy_owner` (excludes the claimant, O.13
+    OQ-1/C1) and `resolve_legacy_owner_unrestricted` (excludes no one,
+    O14-c) — the two callers differ only in whether a node is allowed to be
+    its own answer, so the scan itself lives once.
+
+    Args:
+        events: event-log entries, e.g. as read by `core.events.read_all`.
+        project_id: the project to search.
+        exclude: a `node_id` to skip regardless of otherwise matching, or
+            `None` to exclude no one.
+
+    Returns:
+        Event | None: the last (newest, by log order) matching
+        `session_registered` event, or `None`.
+    """
+    registration: Event | None = None
+    for event in events:
+        if event.project_id != project_id or event.type != "session_registered":
+            continue
+        if exclude is not None and event.node_id == exclude:
+            continue
+        if event.payload.get("origination") not in ("relayed", "manual"):
+            continue
+        if event.writer_role.strip().lower() != "pm":
+            continue
+        registration = event  # last one wins — newest by log order
+    return registration
+
+
+def _legacy_owner_if_not_vacated(
+    events: list[Event], project_id: str, registration: Event | None
+) -> tuple[str, str] | None:
+    """Return `registration` as a `(node_id, event_id)` legacy owner, unless vacated.
+
+    Shared vacate-check behind `resolve_legacy_owner` and
+    `resolve_legacy_owner_unrestricted` (O14-c) — both apply the exact same
+    "has this registration already been stood down" test.
+
+    Args:
+        events: event-log entries.
+        project_id: the project being resolved.
+        registration: the candidate registration, or `None` (no candidate).
+
+    Returns:
+        tuple[str, str] | None: `(registration.node_id, registration.event_id)`
+        unless `registration` is `None`, or a later valid
+        `ownership_stood_down` names its `event_id` as `stood_down_from`
+        (already vacated; an orphaned on-behalf stand-down does not count,
+        per `_is_orphaned_standdown` — the same predicate `fold_owner` uses).
+    """
+    if registration is None:
+        return None
+
+    declared_index = _build_declared_index(events, project_id)
+    for event in events:
+        if event.project_id != project_id or event.type != "ownership_stood_down":
+            continue
+        if _is_orphaned_standdown(event, declared_index):
+            continue  # an orphan vacates nothing (shared with fold_owner, I1)
+        if event.payload.get("stood_down_from") == registration.event_id:
+            return None  # already vacated — no legacy owner remains
+
+    return (registration.node_id, registration.event_id)
+
+
 def resolve_legacy_owner(
     events: list[Event], project_id: str, claimant: str
 ) -> tuple[str, str] | None:
@@ -238,7 +308,8 @@ def resolve_legacy_owner(
     — so `claimant`'s own registration is never eligible here, even when it
     is the newest one. If excluding it leaves no eligible registration, this
     returns `None` (the claim is `CLAIM_UNOWNED`, not "coordinate with
-    yourself").
+    yourself"). See `resolve_legacy_owner_unrestricted` for the opposite
+    (unexcluded) question a self-standdown must ask (O14-c).
 
     Args:
         events: event-log entries, e.g. as read by `core.events.read_all`.
@@ -256,31 +327,37 @@ def resolve_legacy_owner(
         `fold_owner` uses, I1) — in which case, or if no such registration
         exists, `None`.
     """
-    registration: Event | None = None
-    for event in events:
-        if event.project_id != project_id or event.type != "session_registered":
-            continue
-        if event.node_id == claimant:
-            continue  # C1: a claimant is never its own legacy prior owner
-        if event.payload.get("origination") not in ("relayed", "manual"):
-            continue
-        if event.writer_role.strip().lower() != "pm":
-            continue
-        registration = event  # last one wins — newest by log order
+    registration = _newest_pm_registration(events, project_id, exclude=claimant)
+    return _legacy_owner_if_not_vacated(events, project_id, registration)
 
-    if registration is None:
-        return None
 
-    declared_index = _build_declared_index(events, project_id)
-    for event in events:
-        if event.project_id != project_id or event.type != "ownership_stood_down":
-            continue
-        if _is_orphaned_standdown(event, declared_index):
-            continue  # an orphan vacates nothing (shared with fold_owner, I1)
-        if event.payload.get("stood_down_from") == registration.event_id:
-            return None  # already vacated — no legacy owner remains
+def resolve_legacy_owner_unrestricted(
+    events: list[Event], project_id: str
+) -> tuple[str, str] | None:
+    """Return the OQ-1 legacy owner for `project_id`, excluding no one (O14-c).
 
-    return (registration.node_id, registration.event_id)
+    `resolve_legacy_owner` deliberately excludes the asking node — a
+    successor must coordinate with someone else, never with itself
+    (O.13 OQ-1/C1). Two callers need the unexcluded answer instead: a self
+    stand-down asking "am *I* the legacy owner this project's log implies?"
+    (`core.project_owner.stand_down`, O14-c — a node registered as the sole
+    `relayed`/`manual` `pm` registrant must be ELIGIBLE to be its own
+    answer, or it could never stand itself down under the operator's ruling,
+    G6 option A), and `fleet owner show`, which simply displays whichever
+    legacy owner exists, unrestricted by who is asking.
+
+    Args:
+        events: event-log entries, e.g. as read by `core.events.read_all`.
+        project_id: the project to resolve a legacy owner for.
+
+    Returns:
+        tuple[str, str] | None: `(node_id, event_id)` of the newest
+        `relayed`/`manual` `pm` registration for this project, unless
+        already vacated by a later valid stand-down naming its `event_id`,
+        or no such registration exists.
+    """
+    registration = _newest_pm_registration(events, project_id, exclude=None)
+    return _legacy_owner_if_not_vacated(events, project_id, registration)
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,6 +612,57 @@ def _build_standdown_event(
     }
 
 
+def _build_registration_event(
+    *,
+    project_id: str,
+    node_id: str,
+    writer_role: str,
+    session: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a `session_registered` event dict for O14-a's register-if-absent path.
+
+    Mirrors `cli.build_session_registered_event`'s exact shape (same field
+    names, same `register:<node_id>` idempotency key) so a claim-triggered
+    registration reads back indistinguishably from one `fleet register`
+    would have produced. Built locally rather than imported from `cli.py`
+    (which itself imports this module — a cycle) or any adapter module —
+    `core/` never imports a harness-aware module (W-NFR-2); the CLI passes
+    the claimant's already-resolved session facts in as plain data.
+
+    Args:
+        project_id: the owning project's id.
+        node_id: the claimant's node id.
+        writer_role: the writer role recording this event — the SAME role
+            passed to `claim` (O14-a: "writer_role = the claim's").
+        session: the claimant's own session facts (`harness`, `workspace`,
+            `local_id`, and optionally `branch`), as supplied via `claim`'s
+            `claimant_session` argument.
+
+    Returns:
+        dict[str, Any]: a raw event dict ready for `core.events.append_batch`
+        (validated there, not here). `origination="manual"`: the claim
+        itself is the origination signal here: there is no FR-1
+        "spawned"/"relayed" story for a registration minted this way.
+    """
+    return {
+        "schema_version": 1,
+        "event_id": str(uuid4()),
+        "idempotency_key": f"register:{node_id}",
+        "ts": _now_iso(),
+        "type": "session_registered",
+        "project_id": project_id,
+        "node_id": node_id,
+        "writer_role": writer_role,
+        "payload": {
+            "harness": session.get("harness", ""),
+            "workspace": session.get("workspace", ""),
+            "local_id": session.get("local_id", ""),
+            "branch": session.get("branch") or "",
+            "origination": "manual",
+        },
+    }
+
+
 def _find_event(events: list[Event], idempotency_key: str) -> Event | None:
     """Return the event in `events` with `idempotency_key`, or `None`.
 
@@ -563,6 +691,7 @@ def claim(
     notified_via: str | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
     retry_interval: float = _DEFAULT_RETRY_INTERVAL,
+    claimant_session: Mapping[str, Any] | None = None,
 ) -> Event | None:
     """Claim ownership of `project_id` on behalf of `claimant` (O-FR-1/3/4/6).
 
@@ -595,6 +724,19 @@ def claim(
         notified_via: required together with `attested_owner`.
         timeout: seconds to keep retrying lock acquisition per attempt.
         retry_interval: seconds to sleep between lock-acquisition retries.
+        claimant_session: `claimant`'s own session facts (`harness`,
+            `workspace`, `local_id`, optionally `branch`), or `None`.
+            **O14-a (register-if-absent):** when `claimant` has no
+            `session_registered` event in this project and this is
+            supplied, a registration is prepended to the SAME locked
+            `append_batch` write as the claim (and any on-behalf
+            stand-down), under the same precondition — `not_registered` is
+            then unreachable for this call. `None` (the default) preserves
+            the pre-O14 behavior exactly: `not_registered` is raised and
+            nothing is written. Only the self-claim path can honestly supply
+            this (the CLI has no adapter for an on-behalf `--node-id`
+            target); an on-behalf claim over an unregistered node still
+            raises `not_registered`.
 
     Returns:
         Event | None: the appended `ownership_declared` event, or `None` if
@@ -603,10 +745,11 @@ def claim(
 
     Raises:
         OwnershipRefused: `code="not_registered"` if `claimant` has no
-            `session_registered` event in this project; `code=
-            "coordination_required"` if an active prior owner exists with no
-            attestation; `code="attestation_mismatch"` if the attestation
-            names a node other than the current owner. Nothing is written.
+            `session_registered` event in this project and `claimant_session`
+            was not supplied; `code="coordination_required"` if an active
+            prior owner exists with no attestation; `code=
+            "attestation_mismatch"` if the attestation names a node other
+            than the current owner. Nothing is written.
         OwnershipContended: if the ownership state changed under the lock on
             every one of `_MAX_REEVALUATIONS` retries. Nothing is written.
         ValidationError, OwnershipError, LockTimeoutError: as raised by
@@ -617,7 +760,8 @@ def claim(
     for _ in range(_MAX_REEVALUATIONS + 1):
         events = read_all(log_path)
 
-        if not _is_registered(events, project_id, claimant):
+        already_registered = _is_registered(events, project_id, claimant)
+        if not already_registered and claimant_session is None:
             raise OwnershipRefused("not_registered", current_owner=None)
 
         state = fold_owner(events, project_id)
@@ -653,6 +797,26 @@ def claim(
         )
 
         batch = []
+        if not already_registered:
+            # O14-a: register-if-absent, in the SAME locked write as the
+            # claim (and any on-behalf stand-down below). `claimant_session`
+            # is non-None here (the `not already_registered and
+            # claimant_session is None` branch above already raised
+            # otherwise). Prepended first, per the operator ruling. If a
+            # concurrent writer registers this exact node between our
+            # unlocked read and the locked write, `append_batch`'s per-event
+            # dedupe on `register:<claimant>` silently drops this duplicate
+            # — harmless, and needs no precondition of its own (registration
+            # is monotonic and this decision does not depend on WHO
+            # registered `claimant`, only that they now are).
+            batch.append(
+                _build_registration_event(
+                    project_id=project_id,
+                    node_id=claimant,
+                    writer_role=writer_role,
+                    session=claimant_session,
+                )
+            )
         if decision.outcome == CLAIM_OVER:
             stood_down_from = (
                 decision.prior_owner_registration_event_id
@@ -747,10 +911,24 @@ def stand_down(
         if `node` had already stood down (the newest valid ownership event
         for the project is already `node`'s own stand-down) — a safe no-op.
 
+    **O14-c (legacy stand-down):** when the project has no `ownership_declared`
+    event at all AND `node` IS the OQ-1 legacy prior owner (the newest
+    `relayed`/`manual` `pm` registration, resolved WITHOUT excluding `node`
+    itself — `resolve_legacy_owner_unrestricted`, unlike `resolve_legacy_owner`,
+    which a claim uses and which excludes the claimant on purpose), this
+    writes a self stand-down naming that registration's `event_id` as
+    `stood_down_from`. `fold_owner` then reports `has_ownership_events=True`
+    and `owner=None`, and `resolve_legacy_owner` (the claim-side lookup)
+    treats the registration as vacated — a successor's claim is
+    `CLAIM_UNOWNED`, uncontested. A node that is neither the current declared
+    owner nor the legacy owner is still refused (`not_current_owner`, exit 4
+    at the CLI).
+
     Raises:
-        OwnershipRefused: `code="not_current_owner"` if `node` is not the
-            project's current owner and has not already stood down. Nothing
-            is written.
+        OwnershipRefused: `code="not_current_owner"` if `node` is neither the
+            project's current declared owner nor (when the project has no
+            ownership events) its legacy owner, and has not already stood
+            down. Nothing is written.
         OwnershipContended: if the ownership state changed under the lock on
             every one of `_MAX_REEVALUATIONS` retries. Nothing is written.
         ValidationError, OwnershipError, LockTimeoutError: as raised by
@@ -763,6 +941,44 @@ def stand_down(
         if state.owner != node:
             if state.anchor_kind == "stood_down" and state.anchor_node == node:
                 return None  # already stood down — safe no-op
+
+            if not state.has_ownership_events:
+                legacy = resolve_legacy_owner_unrestricted(events, project_id)
+                if legacy is not None and legacy[0] == node:
+                    legacy_event_id = legacy[1]
+                    event_dict = _build_standdown_event(
+                        project_id=project_id,
+                        node=node,
+                        writer_role=writer_role,
+                        stood_down_from=legacy_event_id,
+                        written_by="self",
+                        basis="self",
+                        reason=reason,
+                    )
+
+                    def _legacy_precondition(
+                        existing: list[Event], _state: OwnerState = state, _legacy: tuple[str, str] = legacy
+                    ) -> bool:
+                        """Return whether `existing` still matches the legacy-standdown snapshot."""
+                        if fold_owner(existing, project_id) != _state:
+                            return False
+                        return resolve_legacy_owner_unrestricted(existing, project_id) == _legacy
+
+                    try:
+                        written = append_batch(
+                            log_path,
+                            [event_dict],
+                            timeout=timeout,
+                            retry_interval=retry_interval,
+                            precondition=_legacy_precondition,
+                        )
+                    except PreconditionUnmet:
+                        continue
+
+                    if not written:
+                        return _find_event(read_all(log_path), event_dict["idempotency_key"])
+                    return written[0]
+
             raise OwnershipRefused("not_current_owner", current_owner=state.owner)
 
         event_dict = _build_standdown_event(

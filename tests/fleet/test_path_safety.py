@@ -7,6 +7,7 @@ it, the same class of defect standing unfixed in a sibling module).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 

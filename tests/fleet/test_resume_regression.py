@@ -67,14 +67,17 @@ def _merge_base_with_main() -> str | None:
     while `MERGE_HEAD` exists, this returns it directly rather than the
     stale pre-merge value, matching what the post-commit answer will be.
     """
-    merge_head = subprocess.run(
-        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
-        cwd=_REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
+    try:
+        merge_head = subprocess.run(
+            ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
     if merge_head.returncode == 0 and merge_head.stdout.strip():
         return merge_head.stdout.strip()
 
@@ -219,6 +222,24 @@ def _recipes_at(commit: str) -> dict[str, str] | None:
             return None
         recipes[rel] = show.stdout
     return recipes
+
+
+class TestMergeBaseWithMainGuardsBothSubprocessCalls:
+    """`_merge_base_with_main`'s FIRST `subprocess.run` (the `MERGE_HEAD`
+    rev-parse) must be guarded exactly like the second one -- an environment
+    with no `git` on `PATH` (or any other `OSError`/`SubprocessError`) must
+    return `None` cleanly, never raise, so every caller's `pytest.skip` path
+    is reachable instead of crashing test collection/execution."""
+
+    def test_oserror_on_the_first_subprocess_call_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise OSError("git not found (forced for this test)")
+
+        monkeypatch.setattr(subprocess, "run", _raise)
+
+        assert _merge_base_with_main() is None
 
 
 class TestGatesFrontMatterInvariance:

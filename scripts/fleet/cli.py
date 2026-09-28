@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -60,6 +61,7 @@ from .core.nodes import parse_node_id
 from .core.projection import project_event, rebuild
 from .core.project_owner import claim as owner_claim
 from .core.project_owner import fold_owner as owner_fold_owner
+from .core.project_owner import resolve_legacy_owner_unrestricted as owner_legacy_owner
 from .core.project_owner import stand_down as owner_stand_down
 from .core.query import edges_of
 from .core.schema import Event, Fragment, validate_event
@@ -232,8 +234,9 @@ def _positive_int(value: str) -> int:
 
     Raises:
         argparse.ArgumentTypeError: if `value` is not an integer >= 1, so
-            argparse reports a usage error (exit 2) instead of the retry
-            loop never calling core.
+            argparse reports a usage error (exit 2) instead of an
+            AssertionError from `_call_with_bounded_lock_retry`, which
+            never calls core when attempts < 1.
     """
     try:
         parsed = int(value)
@@ -1889,6 +1892,127 @@ def _resolve_owner_identity(args: argparse.Namespace, *, verb: str) -> str | Non
         return None
 
 
+#: `fleet owner claim`/`stand-down`'s own usage-error exit code (O14-b),
+#: reusing argparse's reserved `2` the same way the existing
+#: `--prior-owner-notified`/`--node-id` usage checks in `_cmd_owner_claim`
+#: already do -- a missing/unusable self-identity flag is a usage error, not
+#: a write failure (`1`) or a refusal (`3`/`4`/`5`).
+_OWNER_EXIT_USAGE_ERROR = 2
+
+
+def _resolve_owner_self_identity_flags(args: argparse.Namespace, *, verb: str) -> int | None:
+    """Validate/complete an owner verb's SELF-identity flags before adapter construction (O14-b).
+
+    Run the launch instruction literally in two separate processes (the
+    session-start hook process, then a later `owner claim` process) surfaced
+    a real defect: the session-start line registers `portable/<ws>/<slug>/<pid>`
+    (no `--harness`, so `PortableAdapter`'s pid-fallback `local_id` wins),
+    but the claim line then resolved a DIFFERENT node -- the claiming
+    process's OWN pid (a new process, a new pid), or, on `--harness claude`
+    with no `--session-id`, an id the model was never told to supply. Either
+    way `owner claim` hit `not_registered` on every default path. The fix is
+    at this layer, never in `core/`: an owner verb requires an EXPLICIT,
+    cross-process-stable identity, resolved here before `_build_adapter` is
+    ever called.
+
+    Only the self path matters (`--node-id` unset) -- the on-behalf path
+    (`--node-id` + `--writer-role cto`) names its target directly and has no
+    adapter to construct for itself.
+
+    Args:
+        args: parsed CLI arguments. For `--harness claude` with no
+            `--session-id`, `args.session_id` is filled in from the
+            `CLAUDE_CODE_SESSION_ID` environment variable when present --
+            the one Claude-Code-exposed carrier of "which session am I" a
+            plain Python process can read (see `adapter/claude.py`'s module
+            docstring for why nothing else is available).
+        verb: `"claim"` or `"stand-down"`, for the printed message only.
+
+    Returns:
+        int | None: `_OWNER_EXIT_USAGE_ERROR` (`2`), with one stderr line
+        already printed, if a required self-identity flag is missing and
+        could not be filled in; `None` if the self-identity flags are usable
+        (including the on-behalf path, which has nothing to check here).
+    """
+    if args.node_id is not None:
+        return None  # on-behalf path: no self-identity flags to validate
+
+    if args.harness == "claude":
+        if args.session_id and args.session_id.strip():
+            return None
+        env_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+        if env_session_id:
+            args.session_id = env_session_id
+            return None
+        print(
+            f"fleet owner {verb}: --harness claude requires --session-id, or "
+            "CLAUDE_CODE_SESSION_ID in the environment -- neither was found",
+            file=sys.stderr,
+        )
+        return _OWNER_EXIT_USAGE_ERROR
+
+    if args.local_id and args.local_id.strip():
+        return None
+    print(
+        f"fleet owner {verb}: --harness {args.harness} requires --local-id -- a bare "
+        "process id is not a stable identity across the claim/stand-down pair (it is a "
+        "NEW process every invocation)",
+        file=sys.stderr,
+    )
+    return _OWNER_EXIT_USAGE_ERROR
+
+
+def _resolve_claimant_identity(
+    args: argparse.Namespace,
+) -> tuple[str, dict[str, Any] | None] | None:
+    """Resolve `fleet owner claim`'s claimant node id, plus session facts (O14-a).
+
+    Unlike `_resolve_owner_identity` (shared with `stand-down`, which never
+    needs to register anyone), this also returns the claimant's own session
+    facts when resolving for self, so `core.project_owner.claim` can
+    register the claimant in the SAME locked write if it has no prior
+    `session_registered` event, instead of refusing `not_registered` (O14-a).
+    The on-behalf (`--node-id`) path has no adapter for the target -- this
+    process never learns that node's harness/workspace/local_id -- so it
+    returns `(node_id, None)`: the pre-O14 `not_registered` refusal (exit 4)
+    still applies there.
+
+    Args:
+        args: parsed CLI arguments carrying `node_id`/`writer_role`, plus
+            the harness-identity flags when acting for self.
+
+    Returns:
+        tuple[str, dict[str, Any] | None] | None: `(node_id, session_facts)`,
+        or `None` if resolution failed (the caller maps this the same way
+        `_resolve_owner_identity`'s `None` return already is: exit `1` for a
+        self-identity failure, exit `4` for `--node-id` without
+        `--writer-role cto`).
+    """
+    if args.node_id is not None:
+        if args.writer_role.strip().lower() != "cto":
+            print("fleet owner claim: --node-id requires --writer-role cto", file=sys.stderr)
+            return None
+        return args.node_id, None
+
+    try:
+        adapter = _build_adapter(args)
+        session = adapter.current_session()
+    except SessionsJsonUnusable as exc:
+        print(f"fleet owner claim: --sessions-json unusable: {exc}", file=sys.stderr)
+        return None
+    except (ValueError, SessionIdentityUnresolved) as exc:
+        print(f"fleet owner claim: could not resolve identity: {exc}", file=sys.stderr)
+        return None
+
+    session_facts = {
+        "harness": session.harness,
+        "workspace": session.workspace,
+        "local_id": session.local_id,
+        "branch": session.branch,
+    }
+    return session.node_id, session_facts
+
+
 def _find_latest_registration(events: list[Event], project_id: str, node_id: str) -> Event | None:
     """Return the newest `session_registered` event for `node_id`, or `None`.
 
@@ -2004,8 +2128,12 @@ def _cmd_owner_claim(args: argparse.Namespace) -> int:
         int: `0` written, or an already-owner no-op; `1` could not write
             (lock timeout after bounded retry, validation/ownership error,
             re-evaluation budget exhausted, adapter-construction/identity
-            failure, an I/O error); `2` if `--prior-owner-notified` and
-            `--notified-via` were not given together; `3` refused,
+            failure, an I/O error); `2` a usage error -- `--prior-owner-notified`
+            and `--notified-via` were not given together, `--node-id` was
+            combined with a self-identity flag, or a required self-identity
+            flag is missing (`--harness claude` with no `--session-id`/
+            `CLAUDE_CODE_SESSION_ID`, or a non-claude harness with no
+            `--local-id`, O14-b); `3` refused,
             coordination required (an active prior owner with no or
             mismatched attestation); `4` refused, state is not what was
             assumed (`--node-id` without `--writer-role cto`, or the
@@ -2034,9 +2162,14 @@ def _cmd_owner_claim(args: argparse.Namespace) -> int:
         return _OWNER_EXIT_NOT_APPLICABLE
     log_path, project_id = resolved
 
-    claimant = _resolve_owner_identity(args, verb="claim")
-    if claimant is None:
+    identity_flags_exit = _resolve_owner_self_identity_flags(args, verb="claim")
+    if identity_flags_exit is not None:
+        return identity_flags_exit
+
+    resolved_identity = _resolve_claimant_identity(args)
+    if resolved_identity is None:
         return 1 if args.node_id is None else _OWNER_EXIT_STATE_MISMATCH
+    claimant, claimant_session = resolved_identity
 
     sessions: list[dict[str, Any]] | None = None
     if args.sessions_json is not None:
@@ -2078,6 +2211,7 @@ def _cmd_owner_claim(args: argparse.Namespace) -> int:
                 liveness_source=liveness_source,
                 attested_owner=args.prior_owner_notified,
                 notified_via=args.notified_via,
+                claimant_session=claimant_session,
             ),
             attempts=args.lock_retry_attempts,
             backoff=_DEFAULT_LOCK_RETRY_BACKOFF,
@@ -2122,8 +2256,11 @@ def _cmd_owner_stand_down(args: argparse.Namespace) -> int:
         int: `0` written, or an already-stood-down no-op; `1` could not
             write (lock timeout, validation/ownership error, re-evaluation
             budget exhausted, adapter-construction/identity failure, an I/O
-            error); `4` refused (`--node-id` without `--writer-role cto`,
-            or `node` is not the project's current owner); `5` not
+            error); `2` a usage error -- `--node-id` was combined with a
+            self-identity flag, or a required self-identity flag is missing
+            (O14-b, same rule as `claim`); `4` refused (`--node-id` without
+            `--writer-role cto`, or `node` is neither the project's current
+            declared owner nor its legacy owner -- O14-c); `5` not
             applicable (fleet disabled, an invalid slug, or the project
             identity could not be resolved).
     """
@@ -2139,6 +2276,10 @@ def _cmd_owner_stand_down(args: argparse.Namespace) -> int:
     if resolved is None:
         return _OWNER_EXIT_NOT_APPLICABLE
     log_path, project_id = resolved
+
+    identity_flags_exit = _resolve_owner_self_identity_flags(args, verb="stand-down")
+    if identity_flags_exit is not None:
+        return identity_flags_exit
 
     node = _resolve_owner_identity(args, verb="stand-down")
     if node is None:
@@ -2213,6 +2354,16 @@ def _cmd_owner_show(args: argparse.Namespace) -> int:
     prior_owner = declaring_event.payload.get("prior_owner") if declaring_event is not None else None
     attestation = declaring_event.payload.get("attestation") if declaring_event is not None else None
 
+    # O14-c: when the project has no ownership events at all, name the OQ-1
+    # legacy owner (if any) too -- the FR-28-style coordination target a
+    # claim would need to notify or a stand-down could vacate, even though
+    # neither is a real `ownership_declared`/`ownership_stood_down` event
+    # yet. `resolve_legacy_owner_unrestricted` excludes no one, matching
+    # what "show" (an observer, not a claimant) should report.
+    legacy_owner = (
+        owner_legacy_owner(events, project_id) if not state.has_ownership_events else None
+    )
+
     if args.json:
         print(
             json.dumps(
@@ -2225,13 +2376,21 @@ def _cmd_owner_show(args: argparse.Namespace) -> int:
                     "basis": basis,
                     "prior_owner": prior_owner,
                     "attestation": attestation,
+                    "legacy_owner": legacy_owner[0] if legacy_owner is not None else None,
                 }
             )
         )
         return 0
 
     if not state.has_ownership_events:
-        print("no declared owner (no ownership events)")
+        if legacy_owner is not None:
+            print(
+                f"no declared owner (no ownership events); legacy owner: {legacy_owner[0]} "
+                "(a prior relayed/manual pm registration -- a claim over this project must "
+                "coordinate with it unless it is stood down first)"
+            )
+        else:
+            print("no declared owner (no ownership events)")
         return 0
     if state.owner is None:
         print(f"no declared owner (stood down; last anchor={state.anchor})")

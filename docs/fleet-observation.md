@@ -487,6 +487,101 @@ actually unlaunched. If a handoff you know was emitted is missing from `fleet ha
 did not expect it to have launched yet, that is worth checking too, not just the rows the command
 actually lists.
 
+## Declaring ownership (`fleet owner`)
+
+Unlike every `observe` verb, `fleet owner claim|stand-down|show` is a **deliberate act**: it fails
+loudly with a stated, non-zero exit rather than the fail-soft façade's always-exits-0 contract, and
+a refused or failed call leaves the manifest log byte-unchanged.
+
+**The two events and the read rule.** A claim writes an `ownership_declared` event; a stand-down
+writes an `ownership_stood_down` event. Read ownership by folding these two event types in log
+order — the most recent one for a project names the current owner (or "no declared owner" after a
+stand-down), never by counting or assuming pairing between them. A stand-down clears the owner only
+when it is written for the owner's OWN declaration (its `stood_down_from` names that exact
+declaration's event id) — an orphaned on-behalf stand-down (one naming a declaration that is no
+longer the current one) is skipped and vacates nothing. `fleet owner show` performs this read for
+you and also prints the basis and attestation of the claim that made the current owner current.
+
+**Exit codes.**
+- **Exit 0** — the claim or stand-down was written (or was already a no-op, e.g. re-claiming your
+  own existing ownership).
+- **Exit 1** — could not write: a lock timeout after bounded retry, a validation/ownership error,
+  the bounded re-evaluation budget exhausted against a changing ownership state, an
+  adapter-construction/identity failure, an unusable `--sessions-json` (missing, unreadable, not
+  JSON, or not a list of objects), or an I/O error reading/writing the manifest.
+- **Exit 2** — a usage error: `--prior-owner-notified` and `--notified-via` were not given
+  together, `--node-id` was combined with a self-identity flag, or a required self-identity flag is
+  missing (`--harness claude` with no `--session-id`/`CLAUDE_CODE_SESSION_ID`, or a non-claude
+  harness with no `--local-id` — see "Identity" below); these hand-checked cases are printed and
+  returned the same way every other refusal is, never routed through argparse's own usage path. A
+  plain argparse-level usage error (e.g. `--lock-retry-attempts` given a value below 1) still exits
+  2 as well, via argparse's own path, before any of this project's own checks run.
+- **Exit 3** — coordination required: an active prior owner exists with no or mismatched
+  attestation. The message names the current owner's node id; re-run adding
+  `--prior-owner-notified <that node id> --notified-via <how you reached it>` once you have told
+  that session.
+- **Exit 4** — refused: state is not what was assumed (`--node-id` given without
+  `--writer-role cto`, the claimant/node is not registered in this project when no session facts
+  could be supplied to register it — see "Claim registers the session if needed" below —, or a
+  stand-down was attempted by a node that is neither the project's current declared owner nor its
+  legacy owner).
+- **Exit 5** — not applicable: fleet is disabled, the slug is invalid, or the project identity
+  could not be resolved. Skip it and proceed.
+
+**The coordination rule.** A claim over an *active* prior owner is refused (exit 3) unless the
+claimant attests it notified that owner — `--prior-owner-notified`/`--notified-via` together. This
+is what makes takeover a deliberate, coordinated act rather than a silent race.
+
+**The legacy-owner coordination rule.** A project with no `ownership_declared` event yet is not
+automatically unowned for coordination purposes: if it has a `relayed`/`manual` registration
+written by `pm` for a node other than the claimant, that registration counts as a *legacy* prior
+owner, and claiming over it needs the same coordination (or the same liveness-based exception) a
+real declared owner would. Only the NEWEST such qualifying registration counts — if more than one
+node was ever registered this way for the project, every earlier one is irrelevant to this rule,
+never coordinated with. `fleet owner show` says so — a project with no ownership events at all
+still names its legacy owner (and notes it is not a real declared owner yet) when one exists,
+instead of silently reporting "no declared owner" as if the project had never been touched.
+
+**Claim registers the session if needed.** A claimant with no prior `session_registered` event in
+the project is no longer refused outright: `fleet owner claim`'s self path (not the `--node-id`
+on-behalf path, which has no session facts to offer) registers the claimant in the SAME write as
+the claim itself, using the identity it already resolved. This closes the gap where a session
+started with the plain `observe session-start` line (no `--harness`, so it registered under a
+different, process-lifetime-only identity) could never satisfy a later `owner claim` under its real
+harness identity — see "Identity" just below for why that gap existed.
+
+**Identity.** An owner verb needs an identity that is stable ACROSS separate process invocations,
+not just within one — a claim and its later stand-down are always two different processes.
+`--harness claude` reads `--session-id` if given, else the `CLAUDE_CODE_SESSION_ID` environment
+variable; if neither is present, the verb refuses with exit 2 rather than guessing. Every other
+harness (`portable`, `subagent`) requires an explicit `--local-id` — a bare process id is a new
+value on every invocation and is therefore useless as a repeatable identity. The on-behalf
+`--node-id` path (paired with `--writer-role cto`) names its target directly and has none of this
+to resolve.
+
+**Legacy stand-down.** A node that IS the legacy prior owner described above (the newest
+`relayed`/`manual` `pm` registration, with no `ownership_declared` event yet for the project) can
+stand itself down the same way a real declared owner would, even though no one has formally claimed
+the project yet. That stand-down is recorded as a real `ownership_stood_down` event, so the project
+now shows its ownership as vacated, and a successor's claim lands uncontested rather than needing to
+coordinate with a registration that was never a real claim to begin with.
+
+**The O-NFR-2 limit, stated plainly: the fleet records the attestation and does not and cannot
+verify that the message was delivered.** `--prior-owner-notified`/`--notified-via` are taken at
+face value and stored with the claim; nothing in this project confirms the named prior owner ever
+actually saw the notification.
+
+**The `unknown`-counts-as-active rule.** Liveness is read only from records supplied via
+`--sessions-json` (DESIGN O.4); when no record matches a node — or no `--sessions-json` was given
+at all — its liveness is `unknown`, and `unknown` counts as **active** for the coordination rule
+above. This is the conservative default: it is always safer to ask for coordination when liveness
+can't be confirmed than to let an unconfirmed takeover through.
+
+**The `deleted`-reachability note.** Liveness resolution never infers `deleted` from a session's
+absence in `--sessions-json` — an absent or ambiguous match always resolves to `unknown`, never
+`deleted`. `deleted` (were it ever produced) would mean positive evidence the harness reports the
+session gone, not merely "not found in this snapshot."
+
 ## Stated limitations
 
 This project is deliberately honest about where it does not reach, rather than presenting a
@@ -538,6 +633,11 @@ confident-looking surface that quietly covers less than it appears to.
     the full list), and every fault in its own machinery already lets the dispatch through by
     design. Treat a passing gate as evidence of an honest mistake avoided, never as proof against a
     determined attempt.
+11. **An `owner claim`'s attestation is recorded, not verified.** `--prior-owner-notified`/
+    `--notified-via` are taken at face value — the fleet has no way to confirm the named prior
+    owner ever actually received the notification (O-NFR-2). Both the successor's launch-instruction
+    claim step and PM's own stand-down-at-handoff step are, in addition, reachable only through
+    prose a launched session or PM must act on — see "Declaring ownership" above.
 
 ## Manual-smoke log
 

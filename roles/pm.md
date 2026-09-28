@@ -480,6 +480,29 @@ and the project being observed is normally a different directory from the skill 
 
 ---
 
+## Ownership stand-down at handoff
+
+When PM emits a handoff that hands the project to a successor session (not a side task), PM runs
+`python -m scripts.fleet.cli owner stand-down --workspace ... --slug ... <identity>` after the
+prompt is produced, where `<identity>` is `--harness claude` (no id flag needed — PM's own session
+id is read from its environment automatically) for a Claude PM session, or `--harness <h>
+--local-id <the same stable name this PM session used to claim>` for any other harness. Standing
+down first is what makes the successor's later `owner claim` land without needing the coordination
+step; skipping it does not block anything — it just means the successor's claim will hit exit 3
+(an active prior owner) and go through `--prior-owner-notified`/`--notified-via` instead.
+
+Exit 4 here means PM holds no ownership to begin with — there is nothing to stand down, not a
+failure to report as a defect (exit 5 means fleet is not in use here and is skipped; other
+refusals, e.g. exit 1/2, are still reported, per the paragraph below).
+
+This is non-gating: it never changes a gate's meaning, order, or pass condition. A refusal or
+failure is reported, not ignored — but the gate outcome never depends on it, and PM's own
+progression continues unaffected either way.
+
+When reporting an owner to a person, name the session by its title, not its node id.
+
+---
+
 ## Fleet dispatch observation (spawned path)
 
 After PM issues a subagent dispatch — any `<dispatch:agent>` call whose prompt leads with a

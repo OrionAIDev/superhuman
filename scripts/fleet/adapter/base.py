@@ -88,6 +88,18 @@ _LAUNCH_INSTRUCTION = (
     "project's root is what --workspace names. This is best-effort: if "
     "fleet observation is disabled, unavailable, or the command fails, skip "
     "it and proceed with the work above regardless — it never blocks."
+    " Then, if this handoff makes you the project's owning session, run "
+    "`python -m scripts.fleet.cli owner claim --workspace <this project's root> "
+    "--slug <this project's slug> --harness claude` from the same skill root if you "
+    "are a Claude session (no id flag needed — it is read from your own environment "
+    "automatically), or add `--harness <h> --local-id <one stable name you choose, "
+    "reused for the matching stand-down>` for any other harness — a bare process id "
+    "is not a stable identity across separate commands. Unlike the step above, this "
+    "command reports refusals: Exit 3 names the current owner — notify that session "
+    "first, then re-run adding `--prior-owner-notified <the node id it printed> "
+    "--notified-via <how you reached it>`, and continue the work meanwhile. Exit 5 "
+    "means fleet is not in use here; skip it. Any other failure: report it, but do "
+    "not let it block the work above."
 )
 
 
