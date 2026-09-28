@@ -77,13 +77,12 @@ def default_fleet_dir(workspace: Path | str, slug: str) -> Path:
     """Return the slug-validated default per-project fleet manifest directory.
 
     The single shared, validated home for `<workspace>/docs/superhuman/<slug>/
-    fleet` (Phase 3.3 preflight FIX 4). `observe.py`'s `_default_fleet_dir`
-    delegates to this function; `cli.py`'s own `_default_fleet_dir` does
-    **not** (it predates this validation and is unchanged — DESIGN O.3: "Do
-    not reuse `cli._default_fleet_dir`: it lacks FIX 4's slug validation").
-    Any new caller that resolves a fleet manifest directory from a
-    caller-supplied `slug` — the `fleet owner` verb group, increment O —
-    must call this one, not build the path itself.
+    fleet` (Phase 3.3 preflight FIX 4). Callers resolving a verb's manifest
+    directory go through `resolve_fleet_dir` below, which applies the
+    operator's `fleet.manifest_dir` override first and falls back to this.
+    `cli.py`'s old unvalidated `_default_fleet_dir` (DESIGN O.3: "Do not
+    reuse `cli._default_fleet_dir`: it lacks FIX 4's slug validation") is
+    gone; no caller builds this path itself any more.
 
     Args:
         workspace: the project's working tree root.
@@ -116,3 +115,38 @@ def default_fleet_dir(workspace: Path | str, slug: str) -> Path:
     if not fleet_dir.resolve().is_relative_to(expected_root):
         raise InvalidSlug(f"slug {slug!r} resolves outside the workspace ({workspace_path})")
     return fleet_dir
+
+
+def resolve_fleet_dir(workspace: Path | str, slug: str, manifest_dir: Path | None) -> Path:
+    """Return the fleet manifest directory every verb family must agree on.
+
+    One resolution order for the `owner` verbs, the `observe` façade, and
+    the older write/read verbs (`register`, `handoff`, `done`, `query`,
+    `status`, `gen-view`): an operator's `fleet.manifest_dir` override when
+    set, else the slug-validated default. Before this helper those older
+    verbs ignored the override, so a `pm` registered through `fleet
+    register` landed in a different log from the one `fleet owner claim`
+    reads, and the legacy-owner coordination rule found no prior owner.
+
+    The slug is validated first, override or not (the owner verbs' M6
+    rule): callers still build paths from the raw slug elsewhere (the
+    `SUPERHUMAN.md` identity read, `FLEET.md`), so an override must not
+    switch that check off. A caller's own explicit `--fleet-dir` flag is
+    applied before this function, not inside it.
+
+    Args:
+        workspace: the project's working tree root.
+        slug: the superhuman project slug.
+        manifest_dir: `FleetConfig.manifest_dir` — `None` when the profile
+            sets no override (or fleet is disabled).
+
+    Returns:
+        Path: `manifest_dir` if set, else `default_fleet_dir(workspace, slug)`.
+
+    Raises:
+        InvalidSlug: if `slug` fails `slug_is_safe`, or the default path
+            fails `default_fleet_dir`'s confinement check.
+    """
+    if not slug_is_safe(slug):
+        raise InvalidSlug(f"invalid slug {slug!r}: path separators and '..' are not permitted")
+    return manifest_dir or default_fleet_dir(workspace, slug)

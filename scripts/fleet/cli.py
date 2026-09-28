@@ -393,18 +393,33 @@ def register_session(
         return fragments[session.node_id]
 
 
-def _default_fleet_dir(workspace: Path, slug: str) -> Path:
-    """Return the default per-project fleet manifest directory.
+def _resolve_verb_fleet_dir(args: argparse.Namespace, verb: str) -> Path | None:
+    """Resolve the manifest directory for one of the older fleet verbs.
+
+    `--fleet-dir` when given, else `path_safety.resolve_fleet_dir`: the
+    profile's `fleet.manifest_dir` override, then the slug-validated
+    default — the same directory the `owner` verbs and the `observe`
+    façade use. These verbs used to skip the override (and the slug check)
+    entirely.
 
     Args:
-        workspace: the project's working tree root.
-        slug: the superhuman project slug.
+        args: parsed CLI arguments carrying `fleet_dir`, `workspace`, `slug`.
+        verb: the verb's name as the user typed it (e.g. `"handoff emit"`),
+            for the one-line rejection.
 
     Returns:
-        Path: `<workspace>/docs/superhuman/<slug>/fleet`, per DESIGN's
-        storage layout.
+        Path | None: the directory, or `None` after printing one
+        `fleet <verb>: rejected: ...` stderr line for an unsafe slug; the
+        caller must then return `1` without touching the manifest.
     """
-    return workspace / "docs" / "superhuman" / slug / "fleet"
+    if args.fleet_dir is not None:
+        return Path(args.fleet_dir)
+    cfg = fleet_config.resolve_fleet_config(args.workspace)
+    try:
+        return fleet_path_safety.resolve_fleet_dir(args.workspace, args.slug, cfg.manifest_dir)
+    except fleet_path_safety.InvalidSlug as exc:
+        print(f"fleet {verb}: rejected: {exc}", file=sys.stderr)
+        return None
 
 
 def _resolved_git_timeout_override(workspace: Path | str) -> float | None:
@@ -590,7 +605,9 @@ def _cmd_register(args: argparse.Namespace) -> int:
         int: `0` on success; `1` if the registration was rejected or the
         manifest lock could not be acquired.
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "register")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -630,7 +647,9 @@ def _cmd_handoff_emit(args: argparse.Namespace) -> int:
         int: `0` on success; `1` if the write was rejected or the manifest
         lock could not be acquired.
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "handoff emit")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
     cwd = args.cwd or args.workspace
@@ -679,7 +698,9 @@ def _cmd_handoff_cancel(args: argparse.Namespace) -> int:
         int: `0` on success; `1` if the write was rejected or the manifest
         lock could not be acquired.
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "handoff cancel")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -711,9 +732,12 @@ def _cmd_handoff_stale(args: argparse.Namespace) -> int:
         args: parsed CLI arguments.
 
     Returns:
-        int: always `0` — listing is read-only and has nothing to reject.
+        int: `0`; `1` only if the slug is unsafe and no `--fleet-dir` was
+        given (listing is otherwise read-only and has nothing to reject).
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "handoff stale")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -759,7 +783,9 @@ def _cmd_handoff_self_register(args: argparse.Namespace) -> int:
         `2` if the fuzzy match was ambiguous — refused, never auto-picked,
         with every candidate printed for human/PM disambiguation.
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "handoff self-register")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -952,7 +978,9 @@ def _cmd_done_advance(args: argparse.Namespace) -> int:
         validation, ownership, or an unrecognized level) or the manifest
         lock could not be acquired.
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "done advance")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -1033,9 +1061,12 @@ def _cmd_query_edges(args: argparse.Namespace) -> int:
         args: parsed CLI arguments.
 
     Returns:
-        int: always `0` — a read-only query has nothing to reject.
+        int: `0`; `1` only if the slug is unsafe and no `--fleet-dir` was
+        given (a read-only query otherwise has nothing to reject).
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "query edges")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
 
     if args.node:
@@ -1075,9 +1106,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         args: parsed CLI arguments.
 
     Returns:
-        int: always `0` — a read-only view has nothing to reject.
+        int: `0`; `1` only if the slug is unsafe and no `--fleet-dir` was
+        given (a read-only view otherwise has nothing to reject).
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "status")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -1097,9 +1131,12 @@ def _cmd_gen_view(args: argparse.Namespace) -> int:
         args: parsed CLI arguments.
 
     Returns:
-        int: always `0` — generating a read-only view has nothing to reject.
+        int: `0`; `1` only if the slug is unsafe and no `--fleet-dir` was
+        given (generating a read-only view otherwise has nothing to reject).
     """
-    fleet_dir = args.fleet_dir or _default_fleet_dir(args.workspace, args.slug)
+    fleet_dir = _resolve_verb_fleet_dir(args, "gen-view")
+    if fleet_dir is None:
+        return 1
     log_path = fleet_dir / "events.jsonl"
     sessions_dir = fleet_dir / "sessions"
 
@@ -1797,22 +1834,13 @@ def _resolve_owner_manifest(args: argparse.Namespace) -> tuple[Path, str] | None
         print(f"fleet owner: not applicable: {cfg.reason}", file=sys.stderr)
         return None
 
-    # M6: validate the slug even when an operator `manifest_dir` override
-    # means `default_fleet_dir` (the usual validator, below) is never
-    # reached — `read_project_identity` builds a path from this same raw
-    # slug regardless of `cfg.manifest_dir`, so an unsafe slug must be
-    # rejected before that call every time, not only when there is no
-    # override.
-    if not fleet_path_safety.slug_is_safe(args.slug):
-        print(
-            f"fleet owner: not applicable: invalid slug {args.slug!r}: "
-            "path separators and '..' are not permitted",
-            file=sys.stderr,
-        )
-        return None
-
+    # M6: `resolve_fleet_dir` validates the slug even when an operator
+    # `manifest_dir` override means `default_fleet_dir` is never reached —
+    # `read_project_identity` builds a path from this same raw slug
+    # regardless of `cfg.manifest_dir`, so an unsafe slug must be rejected
+    # before that call every time, not only when there is no override.
     try:
-        fleet_dir = cfg.manifest_dir or fleet_path_safety.default_fleet_dir(args.workspace, args.slug)
+        fleet_dir = fleet_path_safety.resolve_fleet_dir(args.workspace, args.slug, cfg.manifest_dir)
     except fleet_path_safety.InvalidSlug as exc:
         print(f"fleet owner: not applicable: {exc}", file=sys.stderr)
         return None
@@ -2694,8 +2722,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     register_parser.add_argument(
         "--lock-retry-attempts",
@@ -3228,8 +3256,8 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     emit_parser.add_argument(
         "--output-file",
@@ -3256,8 +3284,8 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     cancel_parser.add_argument(
         "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
@@ -3273,8 +3301,8 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     stale_parser.add_argument(
         "--expiry-seconds",
@@ -3355,8 +3383,8 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     self_register_parser.add_argument(
         "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
@@ -3418,8 +3446,8 @@ def _add_done_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     advance_parser.set_defaults(func=_cmd_done_advance)
 
@@ -3445,8 +3473,8 @@ def _add_query_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     edges_parser.set_defaults(func=_cmd_query_edges)
 
@@ -3475,8 +3503,8 @@ def _add_view_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     status_parser.set_defaults(func=_cmd_status)
 
@@ -3495,8 +3523,8 @@ def _add_view_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "--fleet-dir",
         type=Path,
         default=None,
-        help="override the fleet manifest directory "
-        "(defaults to <workspace>/docs/superhuman/<slug>/fleet)",
+        help="override the fleet manifest directory (defaults to the profile's "
+        "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     gen_view_parser.set_defaults(func=_cmd_gen_view)
 

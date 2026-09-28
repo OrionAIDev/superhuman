@@ -41,7 +41,7 @@ from . import project as fleet_project
 from .adapter.base import SessionAdapter
 from .bounded_journal import append_bounded_line
 from .path_safety import InvalidSlug
-from .path_safety import default_fleet_dir as _validated_default_fleet_dir
+from .path_safety import resolve_fleet_dir as _shared_resolve_fleet_dir
 from .core.errors import LockTimeoutError, OwnershipError, SessionIdentityUnresolved, ValidationError
 from .handoff import emit as handoff_emit_impl
 from .handoff import extract_handoff_id
@@ -75,39 +75,42 @@ _SELF_IGNORE_CONTENT = "*\n"
 _EVENTS_FILENAME = "events.jsonl"
 
 
-def _default_fleet_dir(workspace: Path | str, slug: str) -> Path:
-    """Return the default per-project fleet manifest directory.
+def _resolve_fleet_dir(cfg: fleet_config.FleetConfig, workspace: Path | str, slug: str) -> Path:
+    """Return the fleet manifest directory for one observe call.
 
-    Thin wrapper over the shared, slug-validated `path_safety.default_fleet_dir`
-    (Phase 3.3 preflight FIX 4; extracted to `path_safety` in increment O so
-    the `fleet owner` verb group can resolve the identical, validated
-    location without importing this module's fail-soft machinery — DESIGN
-    O.3). `cli.py` imports this module to wire the `observe` verb group, so
-    this module must not import `cli.py` at module-load time (it does
-    import `cli.register_session` lazily, inside function bodies, for
-    exactly this reason — see `_observe_register`).
+    Delegates to the shared `path_safety.resolve_fleet_dir` — the one
+    resolution order (operator `fleet.manifest_dir` override, else the
+    slug-validated default) that the `owner` verbs and the older CLI verbs
+    use too, so every verb family reads and writes the same log. The slug
+    is validated even when the override is set: `read_project_identity`
+    still builds a path from the raw slug, and before this an override
+    let an unsafe slug through to it, and on to an uncaught `_Disabled`
+    from the identity-unresolved journal fallback — breaking Decision A.
+
+    `cli.py` imports this module to wire the `observe` verb group, so this
+    module must not import `cli.py` at module-load time (it does import
+    `cli.register_session` lazily, inside function bodies, for exactly this
+    reason — see `_observe_register`).
 
     Args:
+        cfg: the resolved fleet configuration for `workspace`.
         workspace: the project's working tree root.
         slug: the superhuman project slug.
 
     Returns:
-        Path: `<workspace>/docs/superhuman/<slug>/fleet`.
+        Path: `cfg.manifest_dir` if set, else `<workspace>/docs/superhuman/<slug>/fleet`.
 
     Raises:
         _Disabled: if `slug` fails validation (FIX 4) — a
             path-traversal-shaped slug is rejected here, before any path is
             built or any I/O happens. Also raised (Phase 3.3 preflight
-            RE-RUN item E) if the built path does not actually resolve
+            RE-RUN item E) if the default path does not actually resolve
             inside `<workspace>/docs/superhuman/<slug>/` -- defense in
             depth against a symlinked `fleet` subdirectory pointing
-            outside the project tree, mirroring `role_block.py`'s
-            identical `resolve()`/`is_relative_to()` confinement check for
-            `record_role_gate_decision` (which this module previously had
-            no equivalent of).
+            outside the project tree.
     """
     try:
-        return _validated_default_fleet_dir(workspace, slug)
+        return _shared_resolve_fleet_dir(workspace, slug, cfg.manifest_dir)
     except InvalidSlug as exc:
         raise _Disabled(str(exc)) from exc
 
@@ -183,6 +186,17 @@ class _IdentityUnresolved(Exception):
     Unlike `_Disabled`, fleet IS enabled here, so the caller journals
     `identity_unresolved` before returning (W-FR-6 — never invents an id).
     """
+
+    def __init__(self, message: str, fleet_dir: Path) -> None:
+        """Carry the already-resolved manifest directory to the journal write.
+
+        Args:
+            message: what could not be read, for the journal line.
+            fleet_dir: where the caller must journal — the same directory
+                `observe_status` reads, override included.
+        """
+        super().__init__(message)
+        self.fleet_dir = fleet_dir
 
 
 class _DeadlineExceeded(Exception):
@@ -359,13 +373,14 @@ def _resolve_context(workspace: Path | str, slug: str) -> _ObserveContext:
     if not cfg.enabled:
         raise _Disabled(cfg.reason)
 
-    fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+    fleet_dir = _resolve_fleet_dir(cfg, workspace, slug)
     _ensure_self_ignored(workspace, fleet_dir, timeout=cfg.git_timeout_seconds)
     identity = fleet_project.read_project_identity(workspace, slug)
     if identity is None:
         raise _IdentityUnresolved(
             f"could not read Project-id/Slug from {workspace}'s SUPERHUMAN.md "
-            f"for slug {slug!r}"
+            f"for slug {slug!r}",
+            fleet_dir,
         )
     project_id, file_slug = identity
     return _ObserveContext(
@@ -576,7 +591,7 @@ def _observe_register(
         return ObserveResult(ok=False, disabled=True, reason=exc.reason)
     except _IdentityUnresolved as exc:
         _write_journal(
-            _default_fleet_dir(workspace, slug),
+            exc.fleet_dir,
             event=event,
             error_class="identity_unresolved",
             error_text=str(exc),
@@ -726,7 +741,7 @@ def observe_handoff_emit(
         )
     except _IdentityUnresolved as exc:
         _write_journal(
-            _default_fleet_dir(workspace, slug),
+            exc.fleet_dir,
             event="handoff-emit",
             error_class="identity_unresolved",
             error_text=str(exc),
@@ -817,7 +832,7 @@ def observe_launch(
         return ObserveResult(ok=False, disabled=True, reason=exc.reason)
     except _IdentityUnresolved as exc:
         _write_journal(
-            _default_fleet_dir(workspace, slug),
+            exc.fleet_dir,
             event="launch",
             error_class="identity_unresolved",
             error_text=str(exc),
@@ -1041,7 +1056,7 @@ def journal_early_cli_failure(
         cfg = fleet_config.resolve_fleet_config(workspace)
         if not cfg.enabled:
             return
-        fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+        fleet_dir = _resolve_fleet_dir(cfg, workspace, slug)
         _write_journal(
             fleet_dir,
             event=event,
@@ -1132,7 +1147,7 @@ def observe_status(workspace: Path | str, slug: str) -> str:
         return f"not configured: {cfg.reason}"
 
     try:
-        fleet_dir = cfg.manifest_dir or _default_fleet_dir(workspace, slug)
+        fleet_dir = _resolve_fleet_dir(cfg, workspace, slug)
     except _Disabled as exc:
         return f"not configured: {exc.reason}"
     journal_path = _journal_path(fleet_dir)

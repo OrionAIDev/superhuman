@@ -20,6 +20,7 @@ from scripts.fleet import observe
 from scripts.fleet.adapter.claude import ClaudeAdapter
 from scripts.fleet.adapter.portable import PortableAdapter
 from scripts.fleet.cli import build_parser
+from scripts.fleet.config import FleetConfig
 from scripts.fleet.core.errors import LockTimeoutError, OwnershipError, ValidationError
 from scripts.fleet.core.nodes import parse_node_id
 from scripts.fleet.core.store import read_fragment
@@ -1438,7 +1439,7 @@ class TestObserveStatusSlugValidation:
         missed a Windows drive-relative slug entirely -- `"C:evil"`
         contains none of `/`, `\\`, or `..`, but joining it onto ANY base
         path with `pathlib` silently REPLACES that base path, landing
-        `_default_fleet_dir` completely outside `git_repo`. Confirms the
+        the default fleet dir completely outside `git_repo`. Confirms the
         fixed `slug_is_safe` closes this end to end through the same
         `observe_status` entry point `TestObserveStatusSlugValidation`'s
         sibling tests use for the `..`-traversal shape."""
@@ -1479,7 +1480,9 @@ class TestObserveStatusSlugValidation:
         monkeypatch.setattr(Path, "resolve", _fake_resolve)
 
         with pytest.raises(observe._Disabled):
-            observe._default_fleet_dir(workspace, "demo-slug")
+            observe._resolve_fleet_dir(
+                FleetConfig(enabled=True, reason="test"), workspace, "demo-slug"
+            )
 
 
 class TestSelfIgnoringManifestDir:
