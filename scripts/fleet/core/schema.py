@@ -552,6 +552,15 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
     them (ESC and BEL do not end a line), so a value like `"done\\x1b[31mred"`
     would otherwise pass every check above and be persisted verbatim.
 
+    Item 6: any Unicode "Cf" (format) character is rejected too — bidi
+    overrides (U+202E RIGHT-TO-LEFT OVERRIDE and the rest of the
+    directional-formatting block) and zero-width characters (U+200B
+    ZERO WIDTH SPACE, U+2066 LEFT-TO-RIGHT ISOLATE, etc.). None of these are
+    "Cc" controls, so the check above never caught them, yet a bidi override
+    can visually reorder a rendered value (e.g. to disguise its content in a
+    terminal or log viewer) without tripping the control-character or
+    line-break checks at all.
+
     Args:
         value: the candidate value.
         what: noun/description used in the error message.
@@ -560,8 +569,8 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
     Raises:
         ValidationError: if `value` is not a string, is empty/blank,
             contains an embedded line break of any kind, contains any
-            Unicode control ("Cc" category) character, or exceeds
-            `max_len` characters.
+            Unicode control ("Cc" category) or format ("Cf" category)
+            character, or exceeds `max_len` characters.
     """
     if not isinstance(value, str):
         raise ValidationError(f"{what} must be a string, got {value!r}")
@@ -576,6 +585,11 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
         )
     if any(unicodedata.category(ch) == "Cc" for ch in value):
         raise ValidationError(f"{what} must not contain a control character (e.g. ESC, BEL)")
+    if any(unicodedata.category(ch) == "Cf" for ch in value):
+        raise ValidationError(
+            f"{what} must not contain a Unicode format character (e.g. a bidi override or "
+            "zero-width character)"
+        )
     if len(value) > max_len:
         raise ValidationError(f"{what} must be at most {max_len} characters, got {len(value)}")
 

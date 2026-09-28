@@ -493,6 +493,7 @@ session id is read from its environment automatically) for a Claude PM session, 
 down first is what makes the successor's later `owner claim` land without needing the coordination
 step; skipping it does not block anything — it just means the successor's claim will hit exit 3
 (an active prior owner) and go through `--prior-owner-notified`/`--notified-via` instead.
+(If you never ran `owner claim`, use the `--workspace` you passed to `observe session-start`.)
 
 Exit 4 here means THIS identity (the exact `--workspace`/harness/id combination just used) holds no
 ownership — either PM never actually claimed, or it claimed under a different `--workspace` or

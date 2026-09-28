@@ -121,7 +121,8 @@ class OwnerState:
         anchor_node: the `node_id` on the event `anchor` refers to, or
             `None` when `anchor_kind == "genesis"`.
         has_ownership_events: whether this project has any valid ownership
-            event at all (an orphaned on-behalf stand-down does not count).
+            event at all (an orphaned claimant-written (takeover) stand-down
+            does not count).
     """
 
     owner: str | None
@@ -154,7 +155,7 @@ def _build_declared_index(events: list[Event], project_id: str) -> dict[str, str
 
 
 def _is_orphaned_standdown(event: Event, declared_index: dict[str, str]) -> bool:
-    """Return whether `event` is an orphaned on-behalf stand-down (DESIGN O.5, I1/M7).
+    """Return whether `event` is an orphaned claimant-written (takeover) stand-down (DESIGN O.5, I1/M7).
 
     An `ownership_stood_down` event with `payload["written_by"] ==
     "claimant"` is orphaned — as if it never happened — unless its
@@ -163,8 +164,8 @@ def _is_orphaned_standdown(event: Event, declared_index: dict[str, str]) -> bool
     equals the stand-down's own `payload["claimant"]` (M7: a `claim_key`
     that merely happens to match some unrelated declaration is a forged or
     corrupted pairing, not a real one). This is what makes an interrupted
-    `append_batch` (a torn write leaving only the on-behalf stand-down half)
-    invisible to every reader — both `fold_owner` and `resolve_legacy_owner`
+    `append_batch` (a torn write leaving only the claimant-written (takeover)
+    stand-down half) invisible to every reader — both `fold_owner` and `resolve_legacy_owner`
     apply this exact same test, so neither one alone can disagree about
     whether a given stand-down "really happened."
 
@@ -194,8 +195,8 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
     `payload["claim_key"]` matches the `idempotency_key` of some
     `ownership_declared` event anywhere in `events` for this project — this
     is what makes an interrupted `append_batch` (a torn write leaving only
-    the on-behalf stand-down half) invisible to every reader (DESIGN O.5's
-    "Torn batches" / Material debt #2).
+    the claimant-written (takeover) stand-down half) invisible to every
+    reader (DESIGN O.5's "Torn batches" / Material debt #2).
 
     A declaration always makes its `node_id` the new owner, even displacing
     a prior owner with no stand-down in between (O.6: "A newer declaration
@@ -241,7 +242,7 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
             continue
 
         if _is_orphaned_standdown(event, declared_index):
-            continue  # orphaned on-behalf stand-down — invisible (DESIGN O.5)
+            continue  # orphaned claimant-written (takeover) stand-down — invisible (DESIGN O.5)
 
         has_ownership_events = True
         anchor = event.event_id
@@ -314,8 +315,9 @@ def _legacy_owner_if_not_vacated(
         tuple[str, str] | None: `(registration.node_id, registration.event_id)`
         unless `registration` is `None`, or a later valid
         `ownership_stood_down` names its `event_id` as `stood_down_from`
-        (already vacated; an orphaned on-behalf stand-down does not count,
-        per `_is_orphaned_standdown` — the same predicate `fold_owner` uses).
+        (already vacated; an orphaned claimant-written (takeover) stand-down
+        does not count, per `_is_orphaned_standdown` — the same predicate
+        `fold_owner` uses).
     """
     if registration is None:
         return None
@@ -366,10 +368,10 @@ def resolve_legacy_owner(
         `relayed`/`manual` `session_registered` event written by `pm`, by a
         node other than `claimant`, for this project — unless a later valid
         `ownership_stood_down` names that registration's `event_id` as
-        `stood_down_from` (already vacated; an orphaned on-behalf stand-down
-        does not count, per `_is_orphaned_standdown` — the same predicate
-        `fold_owner` uses, I1) — in which case, or if no such registration
-        exists, `None`.
+        `stood_down_from` (already vacated; an orphaned claimant-written
+        (takeover) stand-down does not count, per `_is_orphaned_standdown`
+        — the same predicate `fold_owner` uses, I1) — in which case, or if
+        no such registration exists, `None`.
     """
     registration = _newest_pm_registration(events, project_id, exclude=claimant)
     return _legacy_owner_if_not_vacated(events, project_id, registration)

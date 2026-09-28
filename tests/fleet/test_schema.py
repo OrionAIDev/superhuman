@@ -830,6 +830,27 @@ class TestOwnershipStoodDownPayloadValidation:
         with pytest.raises(ValidationError):
             validate_event(data)
 
+    @pytest.mark.parametrize(
+        "char, label",
+        [
+            ("‮", "U+202E RIGHT-TO-LEFT OVERRIDE"),
+            ("​", "U+200B ZERO WIDTH SPACE"),
+            ("⁦", "U+2066 LEFT-TO-RIGHT ISOLATE"),
+        ],
+        ids=["u202e-bidi-override", "u200b-zero-width-space", "u2066-lr-isolate"],
+    )
+    def test_cf_format_character_in_reason_is_rejected(self, char: str, label: str) -> None:
+        """Item 6: `unicodedata.category(ch) == "Cf"` catches a Unicode
+        format character embedded mid-string -- a bidi override or a
+        zero-width character -- none of which are "Cc" controls, so the F2
+        check above never caught them, and none of them are line-break
+        characters either, so they would otherwise slip through the
+        single-line check unbounded."""
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = f"done{char}red"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
     def test_written_by_self_with_non_null_claimant_is_rejected(self) -> None:
         """M5: `written_by="self"` (the default fixture) asserts the OWNER
         stood itself down — a non-null `claimant`/`claim_key` alongside it

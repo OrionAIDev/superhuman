@@ -501,9 +501,15 @@ pairing between the two event types. The fold's actual rules:
 - A declaration always makes its node the current owner — even displacing a prior owner with no
   stand-down in between, so a forged or legacy sequence still has exactly one answer.
 - A stand-down clears the owner only when it names that owner's own declaring `event_id` as its
-  `stood_down_from` — or, on a project with no `ownership_declared` event at all, the OQ-1 legacy
-  owner's `session_registered` event id. Any other valid stand-down still moves the fold's anchor
-  (so `fleet owner show` reflects it happened) but leaves the current owner unchanged.
+  `stood_down_from`. On a project with no `ownership_declared` event at all there is no declared
+  owner to clear, so this never fires there — but any valid stand-down still counts as an
+  ownership event (`has_ownership_events` becomes `True`), and in that no-declaration case the
+  only stand-down `fleet owner stand-down` permits at all is the legacy owner's own. So the
+  practical effect there is not "clearing the owner" but ending OQ-1 legacy-owner resolution
+  (which only runs while `has_ownership_events` is `False`) — after it, `fold_owner` reports
+  `owner=None` on its own, with no legacy fallback. Any other valid stand-down (one that does not
+  match the current owner's declaring `event_id`) still moves the fold's anchor (so `fleet owner
+  show` reflects it happened) but leaves the current owner unchanged.
 - A stand-down written `written_by="claimant"` (the paired takeover stand-down a claim writes for
   the prior owner) is skipped entirely — as if it never happened, an *orphan* — unless its
   `claim_key` matches the `idempotency_key` of some real `ownership_declared` event by that exact
@@ -658,14 +664,23 @@ confident-looking surface that quietly covers less than it appears to.
     `isArchived`/`isDeleted` flag is taken from whatever the caller supplied, not independently
     confirmed against the harness; a caller could supply a stale or fabricated snapshot and a claim
     would take it at face value the same way it takes an attestation at face value.
-12. **An `owner stand-down --node-id` records ITS OWN honest `written_by`/`basis` value,
-    `"on_behalf"` — distinct from `"self"` (R1).** Before this, every stand-down through the CLI,
-    including the `--node-id` on-behalf path, was recorded identically as `written_by="self"`,
-    misreporting a third party's action as the standing-down node's own voluntary choice.
-    `fold_owner` treats `"on_behalf"` exactly like `"self"` for clearing ownership (never subject to
-    the orphan check that only applies to `written_by="claimant"`); only the recorded `written_by`/
-    `basis`/`reason` differ. `--node-id` requires `--reason` (exit 2 if missing) precisely because
-    this is now a distinguishable, audited act.
+12. **An `owner stand-down --node-id` records its own `written_by`/`basis` value, `"on_behalf"` —
+    distinct from `"self"` (R1) — but this is a coordination aid, not an access control.** Before
+    this, every stand-down through the CLI, including the `--node-id` on-behalf path, was recorded
+    identically as `written_by="self"`, misreporting a third party's action as the standing-down
+    node's own voluntary choice. `fold_owner` treats `"on_behalf"` exactly like `"self"` for
+    clearing ownership (never subject to the orphan check that only applies to
+    `written_by="claimant"`); only the recorded `written_by`/`basis`/`reason` differ. `--node-id`
+    requires `--reason` (exit 2 if missing) and `--writer-role cto` — but self-identity flags
+    (`--session-id`, `--local-id`, `CLAUDE_CODE_SESSION_ID`) and `--writer-role` are asserted by
+    the caller, not independently verified: `written_by` records which CLI path was used, not a
+    verified actor, and the `cto`-writer-role gate on `--node-id` guards against an honest mistake
+    (an ordinary session accidentally acting on another's behalf), not a deliberate misuse by a
+    caller willing to pass `--writer-role cto`. The asymmetry runs the other way for `owner claim`:
+    an on-behalf claim (`owner claim --node-id`) carries no `on_behalf` marker in its payload at
+    all, so there is no distinguishable record for a claim made on another node's behalf, only for
+    a stand-down. Ownership here is a coordination aid among cooperating sessions, not an
+    access-control boundary.
 13. **`fleet owner show` names the OQ-1 legacy owner when the project has no `ownership_declared`
     event at all**, the same as a claim's own coordination check would — read its output (or the
     `legacy_owner` field in `--json` mode), not just `owner`, before assuming "no declared owner"
