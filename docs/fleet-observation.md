@@ -53,7 +53,8 @@ project's profile YAML (the same profile file the deployment ladder already read
 fleet:
   enabled: true
   # All of the following are optional.
-  # manifest_dir: <workspace>/docs/superhuman/<slug>/fleet
+  # manifest_dir: <workspace>/docs/superhuman/<slug>/fleet   (every fleet verb uses it;
+  #                                                           --fleet-dir still wins)
   # observe_deadline_seconds: 5.0
   # git_timeout_seconds: <unset by default -- the git-facts adapters use their own 30s timeout
   #                        unless you deliberately override it here>

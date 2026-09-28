@@ -169,6 +169,19 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **Every fleet verb now reads and writes the same manifest directory.** `fleet register`,
+  `fleet handoff emit|cancel|stale|self-register`, `fleet done advance`, `fleet query edges`,
+  `fleet status` and `fleet gen-view` ignored the profile's `fleet.manifest_dir` override; only
+  `fleet owner` and `fleet observe` honoured it. With an override set, a `pm` registered through
+  `fleet register` landed in a different log from the one `fleet owner claim` reads, so the claim
+  found no prior owner to coordinate with. All of them now resolve `--fleet-dir` (where the verb has
+  one), then `fleet.manifest_dir`, then the default, through one helper
+  (`path_safety.resolve_fleet_dir`). Without `--fleet-dir`, these verbs now refuse an unsafe slug
+  (exit 1) instead of building a path from it. The `observe` verbs stay fail-soft: with an override
+  set, an unsafe slug is now a quiet "disabled" result rather than an uncaught exception, and an
+  unresolved project identity is journaled in the override directory, where `fleet observe status`
+  looks for it, rather than in the default one.
+
 - **`models install-agents` and `models set` now read the same profile as `doctor` (roadmap#275
   follow-up).** Without `--profile`, both hardcoded `~/.superhuman/profile.yaml` and ignored
   `$SUPERHUMAN_PROFILE` and the project walk. On a host that sets `SUPERHUMAN_PROFILE` and has no
