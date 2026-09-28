@@ -21,7 +21,7 @@ _SKILL_ROOT = Path(__file__).resolve().parents[2]
 if str(_SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(_SKILL_ROOT))
 
-from scripts.fleet.core.errors import OwnershipRefused  # noqa: E402
+from scripts.fleet.core.errors import OwnershipRefused, ValidationError  # noqa: E402
 from scripts.fleet.core.events import append, read_all  # noqa: E402
 from scripts.fleet.core.projection import rebuild  # noqa: E402
 from scripts.fleet.core.project_owner import (  # noqa: E402
@@ -724,6 +724,96 @@ class TestStandDown:
         second = stand_down(log_path, project_id=PROJECT_ID, node="nodeA", writer_role="pm")
         assert second is None
         assert len([e for e in read_all(log_path) if e.type == "ownership_stood_down"]) == 1
+
+
+class TestOnBehalfStandDownR1:
+    """R1: an on-behalf stand-down (`acting_on_behalf=True`, the CLI's
+    `--node-id` path) is honestly recorded — never as `node`'s own voluntary
+    self stand-down — while still clearing ownership exactly like a self
+    stand-down does."""
+
+    def test_on_behalf_standdown_is_not_written_by_self(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA"))
+        claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+
+        event = stand_down(
+            log_path,
+            project_id=PROJECT_ID,
+            node="nodeA",
+            writer_role="cto",
+            reason="nodeA is unreachable during a maintenance window",
+            acting_on_behalf=True,
+        )
+
+        assert event is not None
+        assert event.payload["written_by"] == "on_behalf"
+        assert event.payload["basis"] == "on_behalf"
+        assert event.payload["reason"] == "nodeA is unreachable during a maintenance window"
+        assert event.payload["claimant"] is None
+        assert event.payload["claim_key"] is None
+
+    def test_on_behalf_standdown_clears_ownership(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA"))
+        claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+
+        stand_down(
+            log_path,
+            project_id=PROJECT_ID,
+            node="nodeA",
+            writer_role="cto",
+            reason="handing off",
+            acting_on_behalf=True,
+        )
+
+        state = fold_owner(read_all(log_path), PROJECT_ID)
+        assert state.owner is None
+        assert state.has_ownership_events is True
+
+    def test_on_behalf_standdown_is_never_an_orphan(self, tmp_path: Path) -> None:
+        """`fold_owner`'s orphan check (`_is_orphaned_standdown`) only
+        special-cases `written_by == "claimant"` — an on-behalf stand-down
+        must clear ownership the same way a self stand-down does, with no
+        `claim_key` pairing required."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA"))
+        declared = claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+        assert declared is not None
+
+        stand_down(
+            log_path,
+            project_id=PROJECT_ID,
+            node="nodeA",
+            writer_role="cto",
+            reason="handing off",
+            acting_on_behalf=True,
+        )
+
+        events = read_all(log_path)
+        standdown = next(e for e in events if e.type == "ownership_stood_down")
+        assert standdown.payload["stood_down_from"] == declared.event_id
+        state = fold_owner(events, PROJECT_ID)
+        assert state.owner is None  # not treated as an orphan
+
+    def test_on_behalf_standdown_missing_reason_raises_validation_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Core-level defense in depth: `core.schema` requires a non-null
+        `reason` for `written_by='on_behalf'` even if a caller bypasses the
+        CLI's own `--reason` usage check."""
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA"))
+        claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+
+        with pytest.raises(ValidationError):
+            stand_down(
+                log_path,
+                project_id=PROJECT_ID,
+                node="nodeA",
+                writer_role="cto",
+                acting_on_behalf=True,
+            )
 
 
 class TestOQ1LegacyOwnerCoordination:
@@ -1484,3 +1574,69 @@ class TestLegacyStandDownO14c:
             stand_down(log_path, project_id=PROJECT_ID, node="legacyPM", writer_role="pm")
         assert exc_info.value.code == "not_current_owner"
         assert read_all(log_path) == before
+
+
+class TestExportedVocabularyF1:
+    """F1: `core.project_owner` re-exports the anchor-kind and payload-enum
+    vocabulary a consumer outside this package needs to interpret ownership
+    events without hand-copying `core.schema`'s private sets."""
+
+    def test_genesis_constant_matches_fold_owner_default_anchor(self) -> None:
+        from scripts.fleet.core.project_owner import GENESIS
+
+        assert GENESIS == "genesis"
+        assert fold_owner([], PROJECT_ID).anchor == GENESIS
+
+    def test_anchor_kind_constants_match_fold_owner_output(self, tmp_path: Path) -> None:
+        from scripts.fleet.core.project_owner import (
+            ANCHOR_DECLARED,
+            ANCHOR_GENESIS,
+            ANCHOR_STOOD_DOWN,
+        )
+
+        assert ANCHOR_GENESIS == "genesis"
+        assert fold_owner([], PROJECT_ID).anchor_kind == ANCHOR_GENESIS
+
+        log_path = tmp_path / "events.jsonl"
+        append(log_path, _register("nodeA"))
+        claim(log_path, project_id=PROJECT_ID, claimant="nodeA", writer_role="pm")
+        state = fold_owner(read_all(log_path), PROJECT_ID)
+        assert state.anchor_kind == ANCHOR_DECLARED
+
+        stand_down(log_path, project_id=PROJECT_ID, node="nodeA", writer_role="pm")
+        state = fold_owner(read_all(log_path), PROJECT_ID)
+        assert state.anchor_kind == ANCHOR_STOOD_DOWN
+
+    def test_enum_frozensets_are_exported_and_match_schema(self) -> None:
+        from scripts.fleet.core import schema
+        from scripts.fleet.core.project_owner import (
+            CLAIM_BASES,
+            PRIOR_OWNER_KINDS,
+            STANDDOWN_BASES,
+            STANDDOWN_WRITTEN_BY,
+        )
+
+        assert PRIOR_OWNER_KINDS == schema.PRIOR_OWNER_KINDS
+        assert CLAIM_BASES == schema.CLAIM_BASES
+        assert STANDDOWN_BASES == schema.STANDDOWN_BASES
+        assert STANDDOWN_WRITTEN_BY == schema.STANDDOWN_WRITTEN_BY
+        assert "on_behalf" in STANDDOWN_WRITTEN_BY
+        assert "on_behalf" in STANDDOWN_BASES
+
+    def test_dunder_all_names_the_public_surface(self) -> None:
+        import scripts.fleet.core.project_owner as project_owner_module
+
+        for name in (
+            "GENESIS",
+            "ANCHOR_GENESIS",
+            "ANCHOR_DECLARED",
+            "ANCHOR_STOOD_DOWN",
+            "PRIOR_OWNER_KINDS",
+            "CLAIM_BASES",
+            "STANDDOWN_BASES",
+            "STANDDOWN_WRITTEN_BY",
+            "fold_owner",
+            "claim",
+            "stand_down",
+        ):
+            assert name in project_owner_module.__all__

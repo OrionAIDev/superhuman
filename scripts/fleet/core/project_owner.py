@@ -28,7 +28,42 @@ from uuid import uuid4
 
 from .errors import OwnershipContended, OwnershipRefused, PreconditionUnmet
 from .events import append_batch, read_all
-from .schema import Event
+from .schema import (
+    CLAIM_BASES,
+    PRIOR_OWNER_KINDS,
+    STANDDOWN_BASES,
+    STANDDOWN_WRITTEN_BY,
+    Event,
+)
+
+#: F1: the public surface a consumer outside this package (e.g.
+#: `superhuman-cto`'s FR-29, which imports `fold_owner`) should import from —
+#: the anchor-kind/enum constants below, plus the read/write functions
+#: already defined throughout this module. Kept in sync by hand; a new
+#: public name added anywhere in this module should be added here too.
+__all__ = [
+    "GENESIS",
+    "ANCHOR_GENESIS",
+    "ANCHOR_DECLARED",
+    "ANCHOR_STOOD_DOWN",
+    "PRIOR_OWNER_KINDS",
+    "CLAIM_BASES",
+    "STANDDOWN_BASES",
+    "STANDDOWN_WRITTEN_BY",
+    "NOOP_ALREADY_OWNER",
+    "CLAIM_UNOWNED",
+    "CLAIM_OVER",
+    "REFUSE_COORDINATION_REQUIRED",
+    "REFUSE_ATTESTATION_MISMATCH",
+    "OwnerState",
+    "ClaimDecision",
+    "fold_owner",
+    "resolve_legacy_owner",
+    "resolve_legacy_owner_unrestricted",
+    "decide_claim",
+    "claim",
+    "stand_down",
+]
 
 #: Bounded re-evaluation budget for a claim/stand-down whose precondition is
 #: rejected by a concurrent writer (O-FR-6, DESIGN O.5 step 6): "at most 3
@@ -44,6 +79,15 @@ CLAIM_UNOWNED: Final[str] = "CLAIM_UNOWNED"
 CLAIM_OVER: Final[str] = "CLAIM_OVER"
 REFUSE_COORDINATION_REQUIRED: Final[str] = "REFUSE_COORDINATION_REQUIRED"
 REFUSE_ATTESTATION_MISMATCH: Final[str] = "REFUSE_ATTESTATION_MISMATCH"
+
+#: F1: `OwnerState.anchor`'s literal "no ownership events yet" value, and the
+#: three values `OwnerState.anchor_kind` takes — exported so a consumer can
+#: compare against these instead of hand-copying the literal strings
+#: `fold_owner` produces.
+GENESIS: Final[str] = "genesis"
+ANCHOR_GENESIS: Final[str] = "genesis"
+ANCHOR_DECLARED: Final[str] = "declared"
+ANCHOR_STOOD_DOWN: Final[str] = "stood_down"
 
 #: Liveness values that make a prior owner's ownership legitimately over
 #: without any coordination step (O-FR-5).
@@ -175,8 +219,8 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
 
     owner: str | None = None
     declaring_event_id: str | None = None
-    anchor = "genesis"
-    anchor_kind = "genesis"
+    anchor = ANCHOR_GENESIS
+    anchor_kind = ANCHOR_GENESIS
     anchor_node: str | None = None
     has_ownership_events = False
 
@@ -188,7 +232,7 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
             owner = event.node_id
             declaring_event_id = event.event_id
             anchor = event.event_id
-            anchor_kind = "declared"
+            anchor_kind = ANCHOR_DECLARED
             anchor_node = event.node_id
             has_ownership_events = True
             continue
@@ -201,7 +245,7 @@ def fold_owner(events: list[Event], project_id: str) -> OwnerState:
 
         has_ownership_events = True
         anchor = event.event_id
-        anchor_kind = "stood_down"
+        anchor_kind = ANCHOR_STOOD_DOWN
         anchor_node = event.node_id
 
         if event.node_id == owner and event.payload.get("stood_down_from") == declaring_event_id:
@@ -567,17 +611,27 @@ def _build_standdown_event(
 
     Args:
         project_id: the owning project.
-        node: the node standing down (the prior owner).
+        node: the node standing down (the prior owner) — for `written_by ==
+            "on_behalf"` this is the TARGET being stood down, not the caller
+            recording the event (the caller's own identity is not part of
+            this event at all; only `writer_role` and the required `reason`
+            are).
         writer_role: the writer role recording this event.
         stood_down_from: `event_id` of the `ownership_declared` (or, for a
             legacy owner, the `session_registered`) event being ended.
-        written_by: `"self"` or `"claimant"`.
-        basis: `"self"`, `"notified"`, `"archived"`, or `"deleted"`.
+        written_by: `"self"`, `"claimant"`, or `"on_behalf"` (R1: an honest
+            record that a caller other than `node` recorded this
+            stand-down — the CLI's `--node-id` path — distinct from `node`
+            voluntarily standing itself down).
+        basis: `"self"`, `"on_behalf"`, `"notified"`, `"archived"`, or
+            `"deleted"`.
         claim_event: the paired claim event dict, required when
             `written_by == "claimant"` — supplies `claimant`/`claim_key` and
             the key's own `:by:<claimant>` suffix.
-        reason: optional free-text reason (self stand-down only, by
-            convention; not enforced here).
+        reason: free-text reason. Required (non-`None`) when `written_by ==
+            "on_behalf"` (enforced by `core.schema`, not here — the CLI also
+            requires `--reason` up front, exit 2, before this is ever
+            built); optional by convention for a self stand-down.
 
     Returns:
         dict[str, Any]: a raw event dict ready for `core.events.append_batch`.
@@ -587,6 +641,10 @@ def _build_standdown_event(
         claimant = claim_event["node_id"]
         claim_key = claim_event["idempotency_key"]
         key = f"standdown:{project_id}:{node}:from:{stood_down_from}:by:{claimant}"
+    elif written_by == "on_behalf":
+        claimant = None
+        claim_key = None
+        key = f"standdown:{project_id}:{node}:from:{stood_down_from}:on-behalf"
     else:
         claimant = None
         claim_key = None
@@ -623,11 +681,23 @@ def _build_registration_event(
 
     Mirrors `cli.build_session_registered_event`'s exact shape (same field
     names, same `register:<node_id>` idempotency key) so a claim-triggered
-    registration reads back indistinguishably from one `fleet register`
-    would have produced. Built locally rather than imported from `cli.py`
-    (which itself imports this module — a cycle) or any adapter module —
-    `core/` never imports a harness-aware module (W-NFR-2); the CLI passes
-    the claimant's already-resolved session facts in as plain data.
+    registration's LOG ENTRY reads back indistinguishably from one `fleet
+    register` would have produced — i.e. `core.events.read_all` returns the
+    identical shape either way. Built locally rather than imported from
+    `cli.py` (which itself imports this module — a cycle) or any adapter
+    module — `core/` never imports a harness-aware module (W-NFR-2); the CLI
+    passes the claimant's already-resolved session facts in as plain data.
+
+    **R2 correction:** an identical log entry does NOT by itself make the
+    claimant appear in `list_sessions`/fleet fragment queries — this
+    function only builds the raw event dict; nothing here projects it into a
+    fragment (`core.projection.project_event`/`rebuild`). That projection is
+    the CALLER's job, the same way `cli.register_session` projects the event
+    it builds for `fleet register`. Before the fix that added this note, the
+    CLI's `owner claim` command built and appended this event but never
+    projected it, so a claimant registered this way was durably recorded in
+    the log yet silently missing from every fragment-backed query until an
+    unrelated `rebuild()` happened to run.
 
     Args:
         project_id: the owning project's id.
@@ -892,6 +962,7 @@ def stand_down(
     node: str,
     writer_role: str,
     reason: str | None = None,
+    acting_on_behalf: bool = False,
     timeout: float = _DEFAULT_TIMEOUT,
     retry_interval: float = _DEFAULT_RETRY_INTERVAL,
 ) -> Event | None:
@@ -902,7 +973,18 @@ def stand_down(
         project_id: the project to stand down from.
         node: the standing-down node's `node_id`; must be the current owner.
         writer_role: `"pm"`, or `"cto"` (Decision O2 allowlist).
-        reason: optional single-line free-text reason.
+        reason: single-line free-text reason. Required (non-`None`) when
+            `acting_on_behalf` is `True` — `core.schema` enforces this;
+            nothing is written if it is missing (the CLI also checks this
+            up front, exit 2, before calling in).
+        acting_on_behalf: `True` when the caller recording this stand-down
+            is NOT `node` itself (the CLI's `--node-id` path: a `cto` writer
+            standing a different node down) — R1. Records `written_by`/
+            `basis` as `"on_behalf"` instead of `"self"`, so the event never
+            misreports a third party's action as `node`'s own voluntary
+            choice. `fold_owner` treats an on-behalf stand-down exactly like
+            a self stand-down for clearing ownership (never an orphan) —
+            only `written_by`/`basis`/`reason` differ from the self path.
         timeout: seconds to keep retrying lock acquisition per attempt.
         retry_interval: seconds to sleep between lock-acquisition retries.
 
@@ -934,12 +1016,14 @@ def stand_down(
         ValidationError, OwnershipError, LockTimeoutError: as raised by
             `core.events.append_batch`.
     """
+    _written_by = "on_behalf" if acting_on_behalf else "self"
+
     for _ in range(_MAX_REEVALUATIONS + 1):
         events = read_all(log_path)
         state = fold_owner(events, project_id)
 
         if state.owner != node:
-            if state.anchor_kind == "stood_down" and state.anchor_node == node:
+            if state.anchor_kind == ANCHOR_STOOD_DOWN and state.anchor_node == node:
                 return None  # already stood down — safe no-op
 
             if not state.has_ownership_events:
@@ -951,8 +1035,8 @@ def stand_down(
                         node=node,
                         writer_role=writer_role,
                         stood_down_from=legacy_event_id,
-                        written_by="self",
-                        basis="self",
+                        written_by=_written_by,
+                        basis=_written_by,
                         reason=reason,
                     )
 
@@ -986,8 +1070,8 @@ def stand_down(
             node=node,
             writer_role=writer_role,
             stood_down_from=state.declaring_event_id,
-            written_by="self",
-            basis="self",
+            written_by=_written_by,
+            basis=_written_by,
             reason=reason,
         )
 

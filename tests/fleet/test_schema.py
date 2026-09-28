@@ -726,6 +726,47 @@ class TestOwnershipStoodDownPayloadValidation:
         event = validate_event(data)
         assert event.payload["claimant"] == "portable/ws/proj/local-2"
 
+    def test_well_formed_on_behalf_stand_down_written_by_is_accepted(self) -> None:
+        """R1: an honest on-behalf stand-down (`--node-id`, distinct from the
+        acting identity) is its own `written_by`/`basis` value — never
+        misreported as the target's own voluntary self stand-down."""
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "on_behalf"
+        data["payload"]["reason"] = "handing off before a maintenance window"
+        event = validate_event(data)
+        assert event.payload["written_by"] == "on_behalf"
+        assert event.payload["basis"] == "on_behalf"
+        assert event.payload["claimant"] is None
+        assert event.payload["claim_key"] is None
+
+    def test_on_behalf_stand_down_requires_a_reason(self) -> None:
+        """R1: `--node-id`'s CLI usage check requires `--reason`; the schema
+        enforces the same rule for any direct `core.events.append` caller."""
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "on_behalf"
+        data["payload"]["reason"] = None
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_on_behalf_with_non_null_claimant_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "on_behalf"
+        data["payload"]["reason"] = "handing off"
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_on_behalf_basis_written_by_mismatch_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "self"
+        data["payload"]["reason"] = "handing off"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
     def test_missing_stood_down_from_is_rejected(self) -> None:
         data = _ownership_stood_down_event()
         del data["payload"]["stood_down_from"]
@@ -776,6 +817,16 @@ class TestOwnershipStoodDownPayloadValidation:
     def test_line_separator_u2028_in_reason_is_rejected(self) -> None:
         data = _ownership_stood_down_event()
         data["payload"]["reason"] = "line one line two"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_c0_control_character_in_reason_is_rejected(self) -> None:
+        """F2: `unicodedata.category(ch) == "Cc"` catches a C0/C1 control
+        character embedded mid-string (e.g. ESC, BEL) that `splitlines()`
+        does not treat as a line break, so it would otherwise slip through
+        the single-line check unbounded."""
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "done[31mred"
         with pytest.raises(ValidationError):
             validate_event(data)
 

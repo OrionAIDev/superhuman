@@ -94,10 +94,19 @@ def default_fleet_dir(workspace: Path | str, slug: str) -> Path:
 
     Raises:
         InvalidSlug: if `slug` contains `/`, `\\`, `..`, or a Windows drive
-            segment (`slug_is_safe` is `False`), or if the built path does
-            not actually resolve inside `<workspace>/docs/superhuman/<slug>/`
-            — defense in depth against a symlinked `fleet` subdirectory
-            pointing outside the project tree.
+            segment (`slug_is_safe` is `False`), or if the final `fleet`
+            path component itself resolves outside
+            `<workspace>/docs/superhuman/<slug>/` — defense in depth
+            against `fleet` specifically being (or being replaced by) a
+            symlink pointing elsewhere. F8: this check is scoped to that one
+            component; it does NOT defend against `workspace`, `docs`,
+            `superhuman`, or `<slug>` themselves being symlinks elsewhere on
+            disk (both `fleet_dir` and `expected_root` below are built from,
+            and resolve through, the SAME unresolved `workspace_path`, so a
+            symlink earlier in the path is followed consistently by both
+            sides and never trips this check either way) — a caller passing
+            an attacker-influenced `workspace` is a distinct, unaddressed
+            concern.
     """
     if not slug_is_safe(slug):
         raise InvalidSlug(f"invalid slug {slug!r}: path separators and '..' are not permitted")

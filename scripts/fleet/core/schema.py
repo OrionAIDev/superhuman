@@ -10,6 +10,7 @@ collapsing enum, and a caller cannot smuggle one in.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, fields
 from typing import Any, Final
 
@@ -91,10 +92,34 @@ _CLAIM_BASIS_VALUES: Final[frozenset[str]] = frozenset(
 )
 _LIVENESS_VALUES: Final[frozenset[str]] = frozenset({"active", "unknown", "archived", "deleted"})
 _LIVENESS_SOURCE_VALUES: Final[frozenset[str]] = frozenset({"sessions-json", "not-supplied"})
-_STANDDOWN_WRITTEN_BY_VALUES: Final[frozenset[str]] = frozenset({"self", "claimant"})
+#: R1 (increment O amendment): `"on_behalf"` is an HONEST third `written_by`
+#: value for a stand-down recorded by a caller other than the standing-down
+#: node itself (the CLI's `--node-id` path) — distinct from `"self"` (the
+#: node stood itself down) and `"claimant"` (a claim's own paired takeover
+#: stand-down). Before this, `--node-id` on-behalf stand-downs were written
+#: `written_by="self"`, misreporting a third party's action as the node's
+#: own voluntary choice.
+_STANDDOWN_WRITTEN_BY_VALUES: Final[frozenset[str]] = frozenset({"self", "claimant", "on_behalf"})
+#: `basis="on_behalf"` is the sole basis value paired with
+#: `written_by="on_behalf"` (mirroring `basis="self"` <-> `written_by="self"`,
+#: below) — chosen over reusing `basis="self"` because that would still say
+#: the SAME thing R1 exists to stop saying.
 _STANDDOWN_BASIS_VALUES: Final[frozenset[str]] = frozenset(
-    {"self", "notified", "archived", "deleted"}
+    {"self", "on_behalf", "notified", "archived", "deleted"}
 )
+
+#: F1: public aliases of the four enum vocabularies above, for a consumer
+#: outside this package that needs to interpret the two ownership event
+#: types' payloads (e.g. `superhuman-cto`'s FR-29, which imports
+#: `core.project_owner.fold_owner`) without hand-copying this module's own
+#: private vocabulary. `core.project_owner` re-exports these under the same
+#: names (see its own module-level `__all__`); this module is the one
+#: source of truth both places read from.
+PRIOR_OWNER_KINDS: Final[frozenset[str]] = _PRIOR_OWNER_KINDS
+CLAIM_BASES: Final[frozenset[str]] = _CLAIM_BASIS_VALUES
+STANDDOWN_WRITTEN_BY: Final[frozenset[str]] = _STANDDOWN_WRITTEN_BY_VALUES
+STANDDOWN_BASES: Final[frozenset[str]] = _STANDDOWN_BASIS_VALUES
+
 _ATTESTATION_REQUIRED_KEYS: Final[frozenset[str]] = frozenset({"notified_owner", "notified_via"})
 _NOTIFIED_VIA_MAX_LEN: Final[int] = 200
 _REASON_MAX_LEN: Final[int] = 1000
@@ -520,6 +545,13 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
     vertical tab (`\\v`), and form feed (`\\f`) as line breaks, so this
     catches every one of those, not just `\\n`/`\\r`.
 
+    F2: separately, any remaining Unicode "Cc" (control) character — ESC
+    (`\\x1b`), BEL (`\\x07`), and the rest of the C0/C1 control ranges — is
+    rejected too. `splitlines()` above only catches the control characters
+    Python treats as line terminators; most C0/C1 controls are not among
+    them (ESC and BEL do not end a line), so a value like `"done\\x1b[31mred"`
+    would otherwise pass every check above and be persisted verbatim.
+
     Args:
         value: the candidate value.
         what: noun/description used in the error message.
@@ -527,7 +559,8 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
 
     Raises:
         ValidationError: if `value` is not a string, is empty/blank,
-            contains an embedded line break of any kind, or exceeds
+            contains an embedded line break of any kind, contains any
+            Unicode control ("Cc" category) character, or exceeds
             `max_len` characters.
     """
     if not isinstance(value, str):
@@ -541,6 +574,8 @@ def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
             f"{what} must be a single line (no embedded line break, including "
             "U+2028/U+0085/vertical-tab/form-feed)"
         )
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        raise ValidationError(f"{what} must not contain a control character (e.g. ESC, BEL)")
     if len(value) > max_len:
         raise ValidationError(f"{what} must be at most {max_len} characters, got {len(value)}")
 
@@ -694,17 +729,35 @@ def _assert_ownership_stood_down_payload(payload: dict[str, Any]) -> None:
             "ownership_stood_down payload written_by='claimant' requires both "
             "'claimant' and 'claim_key' to be set"
         )
-    if written_by == "self" and (payload["claimant"] is not None or payload["claim_key"] is not None):
+    if written_by != "claimant" and (
+        payload["claimant"] is not None or payload["claim_key"] is not None
+    ):
         raise ValidationError(
-            "ownership_stood_down payload written_by='self' requires both "
+            f"ownership_stood_down payload written_by={written_by!r} requires both "
             "'claimant' and 'claim_key' to be null"
         )
-    if (payload["basis"] == "self") != (written_by == "self"):
+    # R1: `"self"`/`"on_behalf"` each pair with the identically-named basis
+    # value (a self stand-down is basis='self'; an honest on-behalf
+    # stand-down is basis='on_behalf' — never basis='self', which would be
+    # exactly the misreport R1 exists to stop). `written_by='claimant'`
+    # instead pairs with one of the takeover bases.
+    if written_by in ("self", "on_behalf"):
+        if payload["basis"] != written_by:
+            raise ValidationError(
+                f"ownership_stood_down payload written_by={written_by!r} requires "
+                f"basis={written_by!r} too, got {payload['basis']!r}"
+            )
+    elif payload["basis"] not in ("notified", "archived", "deleted"):
         raise ValidationError(
-            "ownership_stood_down payload basis='self' must go together with "
-            "written_by='self', and vice versa"
+            "ownership_stood_down payload written_by='claimant' requires 'basis' to be "
+            f"one of ('notified', 'archived', 'deleted'), got {payload['basis']!r}"
         )
     reason = payload["reason"]
+    if written_by == "on_behalf" and reason is None:
+        raise ValidationError(
+            "ownership_stood_down payload written_by='on_behalf' requires a non-null "
+            "'reason' (R1: an on-behalf stand-down must state why)"
+        )
     if reason is not None:
         _assert_single_line_bounded(
             reason, "ownership_stood_down payload 'reason'", max_len=_REASON_MAX_LEN

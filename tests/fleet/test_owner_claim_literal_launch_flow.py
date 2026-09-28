@@ -143,7 +143,8 @@ def _fill(
         template: a literal command/suffix returned by one of the
             `_..._template` helpers above.
         workspace: the fixture project's root, substituted for
-            `<this project's root>`.
+            `<this project's root>` (session-start) or `<main checkout root>`
+            (owner claim, O14-d).
         slug: substituted for `<this project's slug>`.
         handoff_id: substituted for `<the id above>`, when present.
         harness: substituted for `<h>`, when present.
@@ -155,8 +156,13 @@ def _fill(
     """
     text = template
     # A space-free sentinel, mapped back per token by `_argv_from_command`,
-    # so a workspace path containing a space is never re-split.
+    # so a workspace path containing a space is never re-split. O14-d: the
+    # `owner claim` sentence's placeholder is `<main checkout root>`, not
+    # `<this project's root>` (the session-start sentence's placeholder) --
+    # both map onto the same real fixture workspace here, since this
+    # module's fixture project has no separate worktree to distinguish them.
     text = text.replace("<this project's root>", _WORKSPACE_SENTINEL)
+    text = text.replace("<main checkout root>", _WORKSPACE_SENTINEL)
     text = text.replace("<this project's slug>", slug)
     if handoff_id is not None:
         text = text.replace("<the id above>", handoff_id)

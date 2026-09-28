@@ -78,6 +78,14 @@ def format_handoff_line(handoff_id: str) -> str:
 #: `--handoff-id`) — `observe session-start` accepts all three (it
 #: supersets the old `observe launch` signature), so no other change to
 #: this string is needed.
+#: O14-d amendment: the `owner claim` sentence's `--workspace` placeholder is
+#: `<main checkout root>`, not `<this project's root>` (the session-start
+#: sentence's placeholder, left unchanged) — node ids hash the workspace
+#: (`workspace_component`, above), so a session working in a linked git
+#: worktree of the project and one working in its main checkout resolve to
+#: TWO DIFFERENT node ids for the exact same logical project. Ownership is a
+#: property of the project, not of any one worktree, so the claim step
+#: always names the project's single, stable main checkout root.
 _LAUNCH_INSTRUCTION = (
     "If this project uses fleet session observation, run "
     "`python -m scripts.fleet.cli observe session-start "
@@ -89,7 +97,7 @@ _LAUNCH_INSTRUCTION = (
     "fleet observation is disabled, unavailable, or the command fails, skip "
     "it and proceed with the work above regardless — it never blocks."
     " Then, if this handoff makes you the project's owning session, run "
-    "`python -m scripts.fleet.cli owner claim --workspace <this project's root> "
+    "`python -m scripts.fleet.cli owner claim --workspace <main checkout root> "
     "--slug <this project's slug> --harness claude` from the same skill root if you "
     "are a Claude session (no id flag needed — it is read from your own environment "
     "automatically), or add `--harness <h> --local-id <one stable name you choose, "

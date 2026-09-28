@@ -20,10 +20,15 @@ All notable changes to this project will be documented in this file. Format adap
   - Whether a prior owner is archived comes only from supplied `--sessions-json` records, by exact id;
     anything uncertain counts as active.
   - Handoff launch instructions carry the claim step; `roles/pm.md` gains a stand-down step at handoff.
-    A claim registers the session if needed. Claude sessions are identified from
-    `CLAUDE_CODE_SESSION_ID`; other harnesses pass a stable `--local-id`.
-  - On a project with no ownership events yet, the newest relayed or manual `pm` registration counts
-    as the prior owner for coordination, and can stand itself down.
+    A claim registers the session if needed. Claude sessions are identified from `--session-id`, or
+    `CLAUDE_CODE_SESSION_ID` when `--session-id` is not given (`--session-id` always takes
+    precedence when both are present); other harnesses pass a stable `--local-id`.
+  - On a project with no ownership events yet, the newest relayed or manual `pm` registration by a
+    node OTHER THAN THE CLAIMANT counts as the prior owner for coordination, and can stand itself
+    down.
+  - `owner stand-down --node-id` (a `cto` writer acting on a different node's behalf) requires
+    `--reason` and records the stand-down honestly as `written_by="on_behalf"` — distinct from
+    `"self"`, which is now reserved for the standing-down node's own voluntary choice.
 
 - **Every dispatch resolves a model AND a reasoning effort (roadmap#275).** Measured before this
   change: 801 of 802 subagents ran at exactly the parent session's effort (62% at high), and ~40%

@@ -2093,20 +2093,31 @@ def _format_coordination_refusal(
         f"current owner: {owner_node_id}",
     ]
     if harness or local_id:
-        lines.append(f"  harness={harness} local_id={local_id}")
+        # F3: `local_id` (from `parse_node_id` of `owner_node_id`, itself
+        # ultimately from another session's own claim) is rendered `!r` so
+        # an embedded control character (newline, ANSI escape) shows up as
+        # a visible escape sequence, never literal control-plane bytes that
+        # could forge extra lines or mislead in a terminal.
+        lines.append(f"  harness={harness} local_id={local_id!r}")
 
     registration = _find_latest_registration(events, project_id, owner_node_id)
     if registration is not None:
         payload = registration.payload
+        # F3: `workspace` is untrusted the same way `branch` already was
+        # (both from a registration payload another session wrote) -- `!r`
+        # both, not just `branch`.
         lines.append(
-            f"  workspace={payload.get('workspace')} branch={payload.get('branch')!r} "
+            f"  workspace={payload.get('workspace')!r} branch={payload.get('branch')!r} "
             f"origination={payload.get('origination')}"
         )
 
     if harness == "claude":
         title = _find_session_record_title(sessions, local_id)
         if title:
-            lines.append(f"  title={title}")
+            # F3: `title` comes straight from a `--sessions-json` record --
+            # a raw, un-vetted file the caller supplied -- so it is labeled
+            # untrusted and rendered `!r`, never printed verbatim.
+            lines.append(f"  title (untrusted, from --sessions-json)={title!r}")
 
     lines.append(
         f"re-run adding --prior-owner-notified {owner_node_id} --notified-via <how you reached it>"
@@ -2161,6 +2172,7 @@ def _cmd_owner_claim(args: argparse.Namespace) -> int:
     if resolved is None:
         return _OWNER_EXIT_NOT_APPLICABLE
     log_path, project_id = resolved
+    sessions_dir = log_path.parent / "sessions"
 
     identity_flags_exit = _resolve_owner_self_identity_flags(args, verb="claim")
     if identity_flags_exit is not None:
@@ -2181,9 +2193,12 @@ def _cmd_owner_claim(args: argparse.Namespace) -> int:
 
     try:
         events = read_all(log_path)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         # M4: bare read_all calls elsewhere crashed uncaught on this; wrap
-        # it the same way `owner show` already does.
+        # it the same way `owner show` already does. F4: `ValueError` too --
+        # `read_all`'s `Path.read_text(encoding="utf-8")` raises
+        # `UnicodeDecodeError` (a `ValueError` subclass) on an invalid-UTF-8
+        # manifest file, which `OSError` alone never caught.
         print(f"fleet owner claim: could not read manifest: {exc}", file=sys.stderr)
         return 1
     # C1: build liveness for EVERY node registered in this project, not just
@@ -2237,6 +2252,27 @@ def _cmd_owner_claim(args: argparse.Namespace) -> int:
         print(f"fleet owner claim: could not write: {exc}", file=sys.stderr)
         return 1
 
+    if claimant_session is not None:
+        # R2: O14-a's register-if-absent writes a `session_registered` event
+        # to the log when the claimant had none, but writing to the log
+        # alone does not make the claimant show up in `list_sessions`/fleet
+        # queries -- unlike `register_session` (used by `fleet register`),
+        # nothing here ever projected that event into a fragment. Read the
+        # registration back and project it the same way `register_session`
+        # does, with the same `FragmentCorrupt` -> `rebuild()` fallback.
+        # Harmless (a no-op re-apply) when the claimant was already
+        # registered and already projected before this call.
+        try:
+            registration = _find_latest_registration(read_all(log_path), project_id, claimant)
+        except OSError as exc:
+            print(f"fleet owner claim: could not read manifest: {exc}", file=sys.stderr)
+            return 1
+        if registration is not None:
+            try:
+                project_event(registration, sessions_dir)
+            except FragmentCorrupt:
+                rebuild(log_path, sessions_dir, project_id=project_id)
+
     if event is None:
         print(f"{claimant} already owns this project")
     else:
@@ -2257,17 +2293,28 @@ def _cmd_owner_stand_down(args: argparse.Namespace) -> int:
             write (lock timeout, validation/ownership error, re-evaluation
             budget exhausted, adapter-construction/identity failure, an I/O
             error); `2` a usage error -- `--node-id` was combined with a
-            self-identity flag, or a required self-identity flag is missing
-            (O14-b, same rule as `claim`); `4` refused (`--node-id` without
-            `--writer-role cto`, or `node` is neither the project's current
-            declared owner nor its legacy owner -- O14-c); `5` not
-            applicable (fleet disabled, an invalid slug, or the project
-            identity could not be resolved).
+            self-identity flag, a required self-identity flag is missing
+            (O14-b, same rule as `claim`), or `--node-id` was given without
+            `--reason` (R1: an on-behalf stand-down must state why); `4`
+            refused (`--node-id` without `--writer-role cto`, or `node` is
+            neither the project's current declared owner nor its legacy
+            owner -- O14-c); `5` not applicable (fleet disabled, an invalid
+            slug, or the project identity could not be resolved).
     """
     if _node_id_conflicts_with_self_identity(args):
         print(
             "fleet owner stand-down: --node-id is mutually exclusive with self-identity flags "
             "(--harness/--session-id/--local-id/--session-relay-script)",
+            file=sys.stderr,
+        )
+        return 2
+
+    acting_on_behalf = args.node_id is not None
+    if acting_on_behalf and (args.reason is None or not args.reason.strip()):
+        print(
+            "fleet owner stand-down: --node-id requires --reason (R1: an on-behalf "
+            "stand-down must state why, honestly distinguishing it from the target's "
+            "own voluntary self stand-down)",
             file=sys.stderr,
         )
         return 2
@@ -2293,6 +2340,7 @@ def _cmd_owner_stand_down(args: argparse.Namespace) -> int:
                 node=node,
                 writer_role=args.writer_role,
                 reason=args.reason,
+                acting_on_behalf=acting_on_behalf,
             ),
             attempts=args.lock_retry_attempts,
             backoff=_DEFAULT_LOCK_RETRY_BACKOFF,
@@ -2335,7 +2383,10 @@ def _cmd_owner_show(args: argparse.Namespace) -> int:
 
     try:
         events = read_all(log_path)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # F4: `ValueError` too -- see the matching comment in
+        # `_cmd_owner_claim`'s pre-read (`UnicodeDecodeError` on an
+        # invalid-UTF-8 manifest file).
         print(f"fleet owner show: could not read manifest: {exc}", file=sys.stderr)
         return 1
 
@@ -2478,7 +2529,11 @@ def _add_owner_subparsers(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help="stand down this node id instead of self (requires --writer-role cto)",
     )
-    stand_down_parser.add_argument("--reason", default=None, help="optional single-line free-text reason")
+    stand_down_parser.add_argument(
+        "--reason",
+        default=None,
+        help="single-line free-text reason; optional for self, REQUIRED with --node-id (R1)",
+    )
     stand_down_parser.add_argument(
         "--lock-retry-attempts", type=_positive_int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )

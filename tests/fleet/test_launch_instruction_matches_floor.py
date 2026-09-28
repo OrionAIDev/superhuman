@@ -134,7 +134,7 @@ class TestAdapterLaunchInstructionNamesTheFloorVerb:
 
 _OWNER_CLAIM_COMMAND_RE = re.compile(
     r"python -m scripts\.fleet\.cli owner claim\s+"
-    r"--workspace <this project's root> --slug <[^>]+>"
+    r"--workspace <main checkout root> --slug <[^>]+>"
 )
 _EXIT_3_MARKERS = ("exit 3",)
 _EXIT_5_MARKERS = ("exit 5",)
@@ -194,7 +194,7 @@ class TestOwnerClaimLaunchInstructionSeam:
         text = format_launch_instruction()
         assert _OWNER_CLAIM_COMMAND_RE.search(text), (
             "the launch instruction's owner-claim addition does not name the literal "
-            "command shape `owner claim --workspace <this project's root> --slug <...>`"
+            "command shape `owner claim --workspace <main checkout root> --slug <...>`"
         )
 
     def test_owner_claim_line_states_exit_3_and_exit_5_handling(self) -> None:

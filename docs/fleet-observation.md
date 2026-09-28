@@ -494,13 +494,29 @@ loudly with a stated, non-zero exit rather than the fail-soft façade's always-e
 a refused or failed call leaves the manifest log byte-unchanged.
 
 **The two events and the read rule.** A claim writes an `ownership_declared` event; a stand-down
-writes an `ownership_stood_down` event. Read ownership by folding these two event types in log
-order — the most recent one for a project names the current owner (or "no declared owner" after a
-stand-down), never by counting or assuming pairing between them. A stand-down clears the owner only
-when it is written for the owner's OWN declaration (its `stood_down_from` names that exact
-declaration's event id) — an orphaned on-behalf stand-down (one naming a declaration that is no
-longer the current one) is skipped and vacates nothing. `fleet owner show` performs this read for
-you and also prints the basis and attestation of the claim that made the current owner current.
+writes an `ownership_stood_down` event. Ownership is read by *folding* every one of a project's
+events, in log order (`core.project_owner.fold_owner`) — never by counting lines or assuming any
+pairing between the two event types. The fold's actual rules:
+
+- A declaration always makes its node the current owner — even displacing a prior owner with no
+  stand-down in between, so a forged or legacy sequence still has exactly one answer.
+- A stand-down clears the owner only when it names that owner's own declaring `event_id` as its
+  `stood_down_from` — or, on a project with no `ownership_declared` event at all, the OQ-1 legacy
+  owner's `session_registered` event id. Any other valid stand-down still moves the fold's anchor
+  (so `fleet owner show` reflects it happened) but leaves the current owner unchanged.
+- A stand-down written `written_by="claimant"` (the paired takeover stand-down a claim writes for
+  the prior owner) is skipped entirely — as if it never happened, an *orphan* — unless its
+  `claim_key` matches the `idempotency_key` of some real `ownership_declared` event by that exact
+  `claimant`. This is what makes a torn write (an interrupted batch that persisted only the
+  stand-down half of a claim) invisible to every reader, rather than a phantom vacated ownership.
+  A `written_by="self"` or `written_by="on_behalf"` stand-down (the CLI's own-identity and
+  `--node-id` paths, respectively — the latter honestly recording that the acting identity differs
+  from the standing-down node, R1) is never subject to this orphan check; only the `stood_down_from`
+  rule above governs whether either one clears the owner.
+
+`fleet owner show` performs this fold for you and also prints the basis and attestation of the
+claim that made the current owner current — read it (or call `fold_owner` directly), never derive
+ownership by scanning the raw event log yourself.
 
 **Exit codes.**
 - **Exit 0** — the claim or stand-down was written (or was already a no-op, e.g. re-claiming your
@@ -637,7 +653,37 @@ confident-looking surface that quietly covers less than it appears to.
     `--notified-via` are taken at face value — the fleet has no way to confirm the named prior
     owner ever actually received the notification (O-NFR-2). Both the successor's launch-instruction
     claim step and PM's own stand-down-at-handoff step are, in addition, reachable only through
-    prose a launched session or PM must act on — see "Declaring ownership" above.
+    prose a launched session or PM must act on — see "Declaring ownership" above. F5: the SAME
+    unverified-self-report caveat applies to `--sessions-json`-sourced liveness (DESIGN O.4) — an
+    `isArchived`/`isDeleted` flag is taken from whatever the caller supplied, not independently
+    confirmed against the harness; a caller could supply a stale or fabricated snapshot and a claim
+    would take it at face value the same way it takes an attestation at face value.
+12. **An `owner stand-down --node-id` records ITS OWN honest `written_by`/`basis` value,
+    `"on_behalf"` — distinct from `"self"` (R1).** Before this, every stand-down through the CLI,
+    including the `--node-id` on-behalf path, was recorded identically as `written_by="self"`,
+    misreporting a third party's action as the standing-down node's own voluntary choice.
+    `fold_owner` treats `"on_behalf"` exactly like `"self"` for clearing ownership (never subject to
+    the orphan check that only applies to `written_by="claimant"`); only the recorded `written_by`/
+    `basis`/`reason` differ. `--node-id` requires `--reason` (exit 2 if missing) precisely because
+    this is now a distinguishable, audited act.
+13. **`fleet owner show` names the OQ-1 legacy owner when the project has no `ownership_declared`
+    event at all**, the same as a claim's own coordination check would — read its output (or the
+    `legacy_owner` field in `--json` mode), not just `owner`, before assuming "no declared owner"
+    means no coordination is needed.
+14. **`--harness claude`'s explicit `--session-id` always takes precedence over
+    `CLAUDE_CODE_SESSION_ID`** when both are present — the environment variable is read only as a
+    fallback when `--session-id` was not given (or was blank).
+
+**Known limitation: a torn batch that persists only a claim's registration half can leave that
+claimant looking like a legacy owner.** O14-a's register-if-absent writes the claimant's
+`session_registered` event in the SAME locked `append_batch` call as the claim (and any on-behalf
+stand-down) — but if the process is killed between that batch partially landing and completing (the
+same class of interruption "Torn batches" above documents for a claim's paired stand-down), the
+registration alone can persist while the `ownership_declared` half does not. If that registration
+happens to be `relayed`/`manual` and written by `pm`, the claimant then resolves as the OQ-1 legacy
+owner on the next read — not a real claim, but indistinguishable from one until a re-run. Re-running
+the SAME claim completes it: the registration half dedupes as a no-op (its idempotency key already
+exists) and only the still-missing `ownership_declared` half is written.
 
 ## Manual-smoke log
 
