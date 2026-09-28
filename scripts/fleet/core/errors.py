@@ -86,6 +86,55 @@ class SessionIdentityUnresolved(FleetError):
     """
 
 
+class OwnershipRefused(FleetError):
+    """A ``fleet owner claim``/``stand-down`` call was refused by policy (O-NFR-1).
+
+    Raised by ``core.project_owner.claim``/``stand_down`` for a deliberate,
+    loud refusal — never for a malformed input (that is ``ValidationError``)
+    or a non-owner writer_role (that is ``OwnershipError``). Nothing is
+    written on this error; the caller (the CLI, in a later increment) maps
+    ``code`` to a specific non-zero exit status.
+
+    Attributes:
+        code: one of ``"coordination_required"`` (an active prior owner
+            exists and no attestation was given, or none matching),
+            ``"attestation_mismatch"`` (the attestation names a node that is
+            not the current owner), ``"not_current_owner"`` (a stand-down by
+            a session that does not currently own the project), or
+            ``"not_registered"`` (the claimant/target has no
+            ``session_registered`` event in this project).
+        current_owner: the project's current owner `node_id` at the moment
+            of refusal, or `None` if there is no current owner (e.g.
+            ``not_registered``).
+    """
+
+    def __init__(self, code: str, *, current_owner: str | None = None, message: str | None = None) -> None:
+        """Initialize an OwnershipRefused error.
+
+        Args:
+            code: the refusal code (see class docstring).
+            current_owner: the project's current owner `node_id`, or `None`.
+            message: an optional human-readable message; a default is
+                generated from `code` and `current_owner` if omitted.
+        """
+        self.code = code
+        self.current_owner = current_owner
+        super().__init__(
+            message or f"ownership action refused ({code}); current_owner={current_owner!r}"
+        )
+
+
+class OwnershipContended(FleetError):
+    """A ``claim``/``stand_down`` exhausted its bounded re-evaluation budget (O-FR-6).
+
+    Raised when the underlying ownership state kept changing out from under
+    the caller across every retry `core.project_owner` allows (see its
+    module docstring). This is a genuine contention failure, not a policy
+    refusal — the caller should retry the whole operation later. Nothing is
+    written on this error.
+    """
+
+
 class DonePolicyError(FleetError):
     """A ``done_level`` advance was rejected by policy, not malformed input.
 

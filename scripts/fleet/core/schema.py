@@ -10,6 +10,7 @@ collapsing enum, and a caller cannot smuggle one in.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, fields
 from typing import Any, Final
 
@@ -60,8 +61,68 @@ EVENT_TYPES: Final[frozenset[str]] = frozenset(
         "orphan_flagged",
         "observation",
         "recommendation",
+        "ownership_declared",
+        "ownership_stood_down",
     }
 )
+
+#: `ownership_declared` payload — required keys, exactly (increment O, O.1).
+_OWNERSHIP_DECLARED_REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "claim_id",
+        "anchor",
+        "prior_owner",
+        "prior_owner_kind",
+        "basis",
+        "prior_owner_liveness",
+        "liveness_source",
+        "attestation",
+    }
+)
+
+#: `ownership_stood_down` payload — required keys, exactly (increment O, O.1).
+_OWNERSHIP_STOOD_DOWN_REQUIRED_KEYS: Final[frozenset[str]] = frozenset(
+    {"stood_down_from", "written_by", "basis", "claimant", "claim_key", "reason"}
+)
+
+#: Enum vocabularies for the two new event types (increment O, O.1).
+_PRIOR_OWNER_KINDS: Final[frozenset[str]] = frozenset({"none", "declared", "legacy"})
+_CLAIM_BASIS_VALUES: Final[frozenset[str]] = frozenset(
+    {"unowned", "notified", "archived", "deleted"}
+)
+_LIVENESS_VALUES: Final[frozenset[str]] = frozenset({"active", "unknown", "archived", "deleted"})
+_LIVENESS_SOURCE_VALUES: Final[frozenset[str]] = frozenset({"sessions-json", "not-supplied"})
+#: R1 (increment O amendment): `"on_behalf"` is an HONEST third `written_by`
+#: value for a stand-down recorded by a caller other than the standing-down
+#: node itself (the CLI's `--node-id` path) — distinct from `"self"` (the
+#: node stood itself down) and `"claimant"` (a claim's own paired takeover
+#: stand-down). Before this, `--node-id` on-behalf stand-downs were written
+#: `written_by="self"`, misreporting a third party's action as the node's
+#: own voluntary choice.
+_STANDDOWN_WRITTEN_BY_VALUES: Final[frozenset[str]] = frozenset({"self", "claimant", "on_behalf"})
+#: `basis="on_behalf"` is the sole basis value paired with
+#: `written_by="on_behalf"` (mirroring `basis="self"` <-> `written_by="self"`,
+#: below) — chosen over reusing `basis="self"` because that would still say
+#: the SAME thing R1 exists to stop saying.
+_STANDDOWN_BASIS_VALUES: Final[frozenset[str]] = frozenset(
+    {"self", "on_behalf", "notified", "archived", "deleted"}
+)
+
+#: F1: public aliases of the four enum vocabularies above, for a consumer
+#: outside this package that needs to interpret the two ownership event
+#: types' payloads (e.g. `superhuman-cto`'s FR-29, which imports
+#: `core.project_owner.fold_owner`) without hand-copying this module's own
+#: private vocabulary. `core.project_owner` re-exports these under the same
+#: names (see its own module-level `__all__`); this module is the one
+#: source of truth both places read from.
+PRIOR_OWNER_KINDS: Final[frozenset[str]] = _PRIOR_OWNER_KINDS
+CLAIM_BASES: Final[frozenset[str]] = _CLAIM_BASIS_VALUES
+STANDDOWN_WRITTEN_BY: Final[frozenset[str]] = _STANDDOWN_WRITTEN_BY_VALUES
+STANDDOWN_BASES: Final[frozenset[str]] = _STANDDOWN_BASIS_VALUES
+
+_ATTESTATION_REQUIRED_KEYS: Final[frozenset[str]] = frozenset({"notified_owner", "notified_via"})
+_NOTIFIED_VIA_MAX_LEN: Final[int] = 200
+_REASON_MAX_LEN: Final[int] = 1000
 
 #: The five decomposed status fields (FR-5) — never collapsed into one enum.
 STATUS_FIELDS: Final[tuple[str, ...]] = (
@@ -113,6 +174,14 @@ FIELD_OWNERS: Final[dict[str, str]] = {
     "done_level": "shared",
     "observation": "cto",
     "recommendation": "cto",
+    # DESIGN O.2 Decision O2: both classes may write these event types in
+    # principle; the actual restriction to `pm`/`cto` is a role ALLOWLIST
+    # (`core.ownership._EVENT_WRITER_ROLES`), checked before this table is
+    # ever consulted, so this entry never changes what is actually allowed
+    # — it just keeps the two ownership event types documented here too,
+    # the way `done_level`'s "shared" entry documents its own dual writers.
+    "ownership_declared": "shared",
+    "ownership_stood_down": "shared",
 }
 
 #: writer_role denylist (NFR-6) — model/vendor names, never a role. Substring
@@ -295,6 +364,7 @@ def validate_event(data: dict[str, Any]) -> Event:
     _assert_done_level_write_boundary(event_type, payload)
     _assert_payload_status_values_are_valid(payload)
     _assert_done_level_value_is_recognized(event_type, payload)
+    _assert_ownership_payload_is_valid(event_type, payload)
 
     return Event(
         schema_version=data["schema_version"],
@@ -459,6 +529,273 @@ def _assert_done_level_value_is_recognized(event_type: str, payload: dict[str, A
             f"done_level_advanced payload 'done_level' {value!r} is not a "
             f"recognized done_level (expected one of {DONE_LEVELS})"
         )
+
+
+def _assert_single_line_bounded(value: Any, what: str, *, max_len: int) -> None:
+    """Raise ValidationError unless `value` is a non-empty single-line string within `max_len`.
+
+    Shared bound for free-text payload fields on the two ownership event
+    types (increment O, O-NFR-2): `notified_via` and `reason` must each be
+    non-empty, one line, and bounded, so a runaway, blank, or multi-line
+    value can never be persisted (NFR-7).
+
+    The single-line check uses `len(value.splitlines()) > 1` rather than a
+    literal `"\\n" in value or "\\r" in value` search (M5): Python's
+    `str.splitlines()` also treats U+2028 LINE SEPARATOR, U+0085 NEL,
+    vertical tab (`\\v`), and form feed (`\\f`) as line breaks, so this
+    catches every one of those, not just `\\n`/`\\r`.
+
+    F2: separately, any remaining Unicode "Cc" (control) character — ESC
+    (`\\x1b`), BEL (`\\x07`), and the rest of the C0/C1 control ranges — is
+    rejected too. `splitlines()` above only catches the control characters
+    Python treats as line terminators; most C0/C1 controls are not among
+    them (ESC and BEL do not end a line), so a value like `"done\\x1b[31mred"`
+    would otherwise pass every check above and be persisted verbatim.
+
+    Item 6: any Unicode "Cf" (format) character is rejected too — bidi
+    overrides (U+202E RIGHT-TO-LEFT OVERRIDE and the rest of the
+    directional-formatting block) and zero-width characters (U+200B
+    ZERO WIDTH SPACE, U+2066 LEFT-TO-RIGHT ISOLATE, etc.). None of these are
+    "Cc" controls, so the check above never caught them, yet a bidi override
+    can visually reorder a rendered value (e.g. to disguise its content in a
+    terminal or log viewer) without tripping the control-character or
+    line-break checks at all.
+
+    Args:
+        value: the candidate value.
+        what: noun/description used in the error message.
+        max_len: the maximum allowed length, inclusive.
+
+    Raises:
+        ValidationError: if `value` is not a string, is empty/blank,
+            contains an embedded line break of any kind, contains any
+            Unicode control ("Cc" category) or format ("Cf" category)
+            character, or exceeds `max_len` characters.
+    """
+    if not isinstance(value, str):
+        raise ValidationError(f"{what} must be a string, got {value!r}")
+    if not value.strip():
+        raise ValidationError(f"{what} must not be empty")
+    # `splitlines() != [value]`, not `len(...) > 1`: `splitlines()` drops a
+    # final terminator, so the length form would accept "abc\n".
+    if value.splitlines() != [value]:
+        raise ValidationError(
+            f"{what} must be a single line (no embedded line break, including "
+            "U+2028/U+0085/vertical-tab/form-feed)"
+        )
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        raise ValidationError(f"{what} must not contain a control character (e.g. ESC, BEL)")
+    if any(unicodedata.category(ch) == "Cf" for ch in value):
+        raise ValidationError(
+            f"{what} must not contain a Unicode format character (e.g. a bidi override or "
+            "zero-width character)"
+        )
+    if len(value) > max_len:
+        raise ValidationError(f"{what} must be at most {max_len} characters, got {len(value)}")
+
+
+def _assert_nullable_nonempty_string(value: Any, what: str) -> None:
+    """Raise ValidationError unless `value` is `None` or a non-empty string.
+
+    Args:
+        value: the candidate value.
+        what: noun/description used in the error message.
+
+    Raises:
+        ValidationError: if `value` is neither `None` nor a non-empty string.
+    """
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValidationError(f"{what} must be null or a non-empty string, got {value!r}")
+
+
+def _assert_ownership_declared_payload(payload: dict[str, Any]) -> None:
+    """Raise ValidationError if an `ownership_declared` payload is malformed (O.1).
+
+    Args:
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: on a missing/unrecognized key, an out-of-enum
+            value, or a malformed `attestation`.
+    """
+    missing = _OWNERSHIP_DECLARED_REQUIRED_KEYS - payload.keys()
+    if missing:
+        raise ValidationError(
+            f"ownership_declared payload missing required key(s): {sorted(missing)}"
+        )
+    unknown = payload.keys() - _OWNERSHIP_DECLARED_REQUIRED_KEYS
+    if unknown:
+        raise ValidationError(
+            f"ownership_declared payload has unrecognized key(s): {sorted(unknown)}"
+        )
+
+    if not isinstance(payload["claim_id"], str) or not payload["claim_id"]:
+        raise ValidationError("ownership_declared payload 'claim_id' must be a non-empty string")
+    if not isinstance(payload["anchor"], str) or not payload["anchor"]:
+        raise ValidationError("ownership_declared payload 'anchor' must be a non-empty string")
+    _assert_nullable_nonempty_string(
+        payload["prior_owner"], "ownership_declared payload 'prior_owner'"
+    )
+    if payload["prior_owner_kind"] not in _PRIOR_OWNER_KINDS:
+        raise ValidationError(
+            "ownership_declared payload 'prior_owner_kind' must be one of "
+            f"{sorted(_PRIOR_OWNER_KINDS)}, got {payload['prior_owner_kind']!r}"
+        )
+    if payload["basis"] not in _CLAIM_BASIS_VALUES:
+        raise ValidationError(
+            f"ownership_declared payload 'basis' must be one of {sorted(_CLAIM_BASIS_VALUES)}, "
+            f"got {payload['basis']!r}"
+        )
+    if payload["basis"] == "unowned" and payload["prior_owner"] is not None:
+        raise ValidationError(
+            "ownership_declared payload basis='unowned' requires 'prior_owner' to be null"
+        )
+    if payload["prior_owner_kind"] == "none" and payload["prior_owner"] is not None:
+        raise ValidationError(
+            "ownership_declared payload prior_owner_kind='none' requires 'prior_owner' to be null"
+        )
+    if payload["basis"] != "unowned" and (
+        payload["prior_owner"] is None or payload["prior_owner_kind"] == "none"
+    ):
+        raise ValidationError(
+            f"ownership_declared payload basis={payload['basis']!r} is a takeover and requires "
+            "a non-null 'prior_owner' with 'prior_owner_kind' other than 'none'"
+        )
+    liveness = payload["prior_owner_liveness"]
+    if liveness is not None and liveness not in _LIVENESS_VALUES:
+        raise ValidationError(
+            "ownership_declared payload 'prior_owner_liveness' must be null or one of "
+            f"{sorted(_LIVENESS_VALUES)}, got {liveness!r}"
+        )
+    if payload["liveness_source"] not in _LIVENESS_SOURCE_VALUES:
+        raise ValidationError(
+            "ownership_declared payload 'liveness_source' must be one of "
+            f"{sorted(_LIVENESS_SOURCE_VALUES)}, got {payload['liveness_source']!r}"
+        )
+
+    attestation = payload["attestation"]
+    if attestation is not None:
+        if not isinstance(attestation, dict):
+            raise ValidationError(
+                "ownership_declared payload 'attestation' must be null or a dict"
+            )
+        if attestation.keys() != _ATTESTATION_REQUIRED_KEYS:
+            raise ValidationError(
+                "ownership_declared payload 'attestation' must have exactly keys "
+                f"{sorted(_ATTESTATION_REQUIRED_KEYS)}, got {sorted(attestation.keys())}"
+            )
+        if not isinstance(attestation["notified_owner"], str) or not attestation["notified_owner"]:
+            raise ValidationError(
+                "ownership_declared payload attestation 'notified_owner' must be a "
+                "non-empty string"
+            )
+        _assert_single_line_bounded(
+            attestation["notified_via"],
+            "ownership_declared payload attestation 'notified_via'",
+            max_len=_NOTIFIED_VIA_MAX_LEN,
+        )
+
+
+def _assert_ownership_stood_down_payload(payload: dict[str, Any]) -> None:
+    """Raise ValidationError if an `ownership_stood_down` payload is malformed (O.1).
+
+    Args:
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: on a missing/unrecognized key, an out-of-enum
+            value, or `written_by="claimant"` missing `claimant`/`claim_key`.
+    """
+    missing = _OWNERSHIP_STOOD_DOWN_REQUIRED_KEYS - payload.keys()
+    if missing:
+        raise ValidationError(
+            f"ownership_stood_down payload missing required key(s): {sorted(missing)}"
+        )
+    unknown = payload.keys() - _OWNERSHIP_STOOD_DOWN_REQUIRED_KEYS
+    if unknown:
+        raise ValidationError(
+            f"ownership_stood_down payload has unrecognized key(s): {sorted(unknown)}"
+        )
+
+    if not isinstance(payload["stood_down_from"], str) or not payload["stood_down_from"]:
+        raise ValidationError(
+            "ownership_stood_down payload 'stood_down_from' must be a non-empty string"
+        )
+    written_by = payload["written_by"]
+    if written_by not in _STANDDOWN_WRITTEN_BY_VALUES:
+        raise ValidationError(
+            "ownership_stood_down payload 'written_by' must be one of "
+            f"{sorted(_STANDDOWN_WRITTEN_BY_VALUES)}, got {written_by!r}"
+        )
+    if payload["basis"] not in _STANDDOWN_BASIS_VALUES:
+        raise ValidationError(
+            "ownership_stood_down payload 'basis' must be one of "
+            f"{sorted(_STANDDOWN_BASIS_VALUES)}, got {payload['basis']!r}"
+        )
+    _assert_nullable_nonempty_string(
+        payload["claimant"], "ownership_stood_down payload 'claimant'"
+    )
+    _assert_nullable_nonempty_string(
+        payload["claim_key"], "ownership_stood_down payload 'claim_key'"
+    )
+    if written_by == "claimant" and (payload["claimant"] is None or payload["claim_key"] is None):
+        raise ValidationError(
+            "ownership_stood_down payload written_by='claimant' requires both "
+            "'claimant' and 'claim_key' to be set"
+        )
+    if written_by != "claimant" and (
+        payload["claimant"] is not None or payload["claim_key"] is not None
+    ):
+        raise ValidationError(
+            f"ownership_stood_down payload written_by={written_by!r} requires both "
+            "'claimant' and 'claim_key' to be null"
+        )
+    # R1: `"self"`/`"on_behalf"` each pair with the identically-named basis
+    # value (a self stand-down is basis='self'; an honest on-behalf
+    # stand-down is basis='on_behalf' — never basis='self', which would be
+    # exactly the misreport R1 exists to stop). `written_by='claimant'`
+    # instead pairs with one of the takeover bases.
+    if written_by in ("self", "on_behalf"):
+        if payload["basis"] != written_by:
+            raise ValidationError(
+                f"ownership_stood_down payload written_by={written_by!r} requires "
+                f"basis={written_by!r} too, got {payload['basis']!r}"
+            )
+    elif payload["basis"] not in ("notified", "archived", "deleted"):
+        raise ValidationError(
+            "ownership_stood_down payload written_by='claimant' requires 'basis' to be "
+            f"one of ('notified', 'archived', 'deleted'), got {payload['basis']!r}"
+        )
+    reason = payload["reason"]
+    if written_by == "on_behalf" and reason is None:
+        raise ValidationError(
+            "ownership_stood_down payload written_by='on_behalf' requires a non-null "
+            "'reason' (R1: an on-behalf stand-down must state why)"
+        )
+    if reason is not None:
+        _assert_single_line_bounded(
+            reason, "ownership_stood_down payload 'reason'", max_len=_REASON_MAX_LEN
+        )
+
+
+def _assert_ownership_payload_is_valid(event_type: str, payload: dict[str, Any]) -> None:
+    """Dispatch payload validation for the two ownership event types (increment O).
+
+    A no-op for every other event type — this is purely additive to the
+    existing checks `validate_event` already runs.
+
+    Args:
+        event_type: the event's `type`.
+        payload: the event's payload dict (already confirmed to be a dict).
+
+    Raises:
+        ValidationError: see `_assert_ownership_declared_payload` /
+            `_assert_ownership_stood_down_payload`.
+    """
+    if event_type == "ownership_declared":
+        _assert_ownership_declared_payload(payload)
+    elif event_type == "ownership_stood_down":
+        _assert_ownership_stood_down_payload(payload)
 
 
 def fold_done_level(current_level: str, event: Event) -> str:

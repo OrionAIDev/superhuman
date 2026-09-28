@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Added
 
+- **A session can declare that it owns a fleet project, and ownership hands over in a coordinated
+  way (roadmap#282).** Before this, ownership rode on `session_registered`, which dedupes on
+  `register:<node_id>`: a session first registered by the SessionStart hook could never declare
+  ownership afterwards. Now:
+  - Two new event types, `ownership_declared` and `ownership_stood_down`, are written with
+    `fleet owner claim` and `fleet owner stand-down`. `fleet owner show` prints the current owner and
+    the claim that made it owner. `core/project_owner.fold_owner` is the read rule.
+  - A claim over a still-active owner is refused (exit 3, naming the owner) unless the claimant
+    attests it notified that owner (`--prior-owner-notified`, `--notified-via`; recorded, not
+    verified). The claim then writes the prior owner's stand-down in the same locked write
+    (`core.events.append_batch`), so the log never shows two owners and claims cannot race.
+  - Whether a prior owner is archived comes only from supplied `--sessions-json` records, by exact id;
+    anything uncertain counts as active.
+  - Handoff launch instructions carry the claim step; `roles/pm.md` gains a stand-down step at handoff.
+    A claim registers the session if needed. Claude sessions are identified from `--session-id`, or
+    `CLAUDE_CODE_SESSION_ID` when `--session-id` is not given (`--session-id` always takes
+    precedence when both are present); other harnesses pass a stable `--local-id`.
+  - On a project with no ownership events yet, the newest relayed or manual `pm` registration by a
+    node OTHER THAN THE CLAIMANT counts as the prior owner for coordination, and can stand itself
+    down.
+  - `owner stand-down --node-id` (a `cto` writer acting on a different node's behalf) requires
+    `--reason` and records the stand-down honestly as `written_by="on_behalf"` — distinct from
+    `"self"`, which is now reserved for the standing-down node's own voluntary choice.
+
 - **Every dispatch resolves a model AND a reasoning effort (roadmap#275).** Measured before this
   change: 801 of 802 subagents ran at exactly the parent session's effort (62% at high), and ~40%
   of superhuman dispatches passed no model at all. Now:

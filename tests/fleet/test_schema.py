@@ -17,6 +17,7 @@ from scripts.fleet.core.events import append, read_all
 from scripts.fleet.core.projection import rebuild
 from scripts.fleet.core.query import list_sessions
 from scripts.fleet.core.schema import (
+    EVENT_TYPES,
     REQUIRED_EVENT_FIELDS,
     Event,
     Fragment,
@@ -497,3 +498,397 @@ class TestInvalidPayloadStatusIsRejectedAtAppendAndNeverStrandsASession:
         sessions = list_sessions(sessions_dir, project_id=good["project_id"])
         assert len(sessions) == 1
         assert sessions[0].lifecycle == "active"
+
+
+def _ownership_declared_payload() -> dict:
+    return {
+        "claim_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        "anchor": "genesis",
+        "prior_owner": None,
+        "prior_owner_kind": "none",
+        "basis": "unowned",
+        "prior_owner_liveness": None,
+        "liveness_source": "not-supplied",
+        "attestation": None,
+    }
+
+
+def _ownership_declared_event() -> dict:
+    data = _valid_event()
+    data["type"] = "ownership_declared"
+    data["idempotency_key"] = "own:proj-abc123:portable/ws/proj/local-1:after:genesis"
+    data["payload"] = _ownership_declared_payload()
+    return data
+
+
+def _ownership_stood_down_payload() -> dict:
+    return {
+        "stood_down_from": "eid-declared-1",
+        "written_by": "self",
+        "basis": "self",
+        "claimant": None,
+        "claim_key": None,
+        "reason": None,
+    }
+
+
+def _ownership_stood_down_event() -> dict:
+    data = _valid_event()
+    data["type"] = "ownership_stood_down"
+    data["idempotency_key"] = "standdown:proj-abc123:portable/ws/proj/local-1:from:eid-declared-1:self"
+    data["payload"] = _ownership_stood_down_payload()
+    return data
+
+
+class TestOwnershipEventTypesAreRegistered:
+    """TC-O1: both new types are recognized in EVENT_TYPES (increment O)."""
+
+    def test_ownership_declared_and_stood_down_are_registered(self) -> None:
+        assert "ownership_declared" in EVENT_TYPES
+        assert "ownership_stood_down" in EVENT_TYPES
+
+
+class TestOwnershipDeclaredPayloadValidation:
+    """TC-O1: `ownership_declared` payload validation (increment O, O.1)."""
+
+    def test_well_formed_payload_is_accepted(self) -> None:
+        event = validate_event(_ownership_declared_event())
+        assert event.type == "ownership_declared"
+        assert event.payload["basis"] == "unowned"
+
+    def test_well_formed_payload_with_attestation_is_accepted(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["prior_owner_kind"] = "declared"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["prior_owner_liveness"] = "active"
+        data["payload"]["liveness_source"] = "sessions-json"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "slack DM",
+        }
+        event = validate_event(data)
+        assert event.payload["attestation"]["notified_via"] == "slack DM"
+
+    def test_missing_claim_id_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        del data["payload"]["claim_id"]
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_missing_anchor_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        del data["payload"]["anchor"]
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_out_of_enum_basis_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["basis"] = "bogus"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_out_of_enum_prior_owner_kind_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner_kind"] = "bogus"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_multiline_notified_via_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "line one\nline two",
+        }
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_notified_via_over_200_chars_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "x" * 201,
+        }
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_attestation_missing_notified_via_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["attestation"] = {"notified_owner": "portable/ws/proj/local-2"}
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_unrecognized_payload_key_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["extra"] = "nope"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_basis_unowned_with_non_null_prior_owner_is_rejected(self) -> None:
+        """M5: `basis="unowned"` (the default fixture) asserts there was no
+        prior owner at all — a non-null `prior_owner` alongside it is a
+        self-contradictory payload."""
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        # prior_owner_kind/basis left as the fixture's "none"/"unowned".
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_prior_owner_kind_none_with_non_null_prior_owner_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["prior_owner_kind"] = "none"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_empty_string_notified_via_is_rejected(self) -> None:
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "   ",
+        }
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_line_separator_u2028_in_notified_via_is_rejected(self) -> None:
+        """M5: the single-line check must use `len(value.splitlines()) > 1`,
+        which (unlike a literal `\\n`/`\\r` search) also catches U+2028 LINE
+        SEPARATOR, U+0085 NEL, vertical tab, and form feed."""
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "line one line two",
+        }
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize("terminator", ["\n", "\r\n", "\r", " ", "\x85"])
+    def test_trailing_line_break_in_notified_via_is_rejected(self, terminator: str) -> None:
+        """Fix round 2: `splitlines()` drops a final terminator, so a
+        trailing break must be rejected too, not only an embedded one."""
+        data = _ownership_declared_event()
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        data["payload"]["prior_owner_kind"] = "declared"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["attestation"] = {
+            "notified_owner": "portable/ws/proj/local-2",
+            "notified_via": "slack" + terminator,
+        }
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize("basis", ["notified", "archived", "deleted"])
+    def test_takeover_basis_with_null_prior_owner_is_rejected(self, basis: str) -> None:
+        """Fix round 2: a takeover basis must name the prior owner it displaced."""
+        data = _ownership_declared_event()
+        data["payload"]["basis"] = basis
+        data["payload"]["prior_owner_kind"] = "declared"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_takeover_basis_with_prior_owner_kind_none_is_rejected(self) -> None:
+        """Fix round 2: a takeover basis requires a prior-owner kind other than 'none'."""
+        data = _ownership_declared_event()
+        data["payload"]["basis"] = "archived"
+        data["payload"]["prior_owner"] = "portable/ws/proj/local-2"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_malformed_variant_never_reaches_the_log(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "events.jsonl"
+        data = _ownership_declared_event()
+        data["writer_role"] = "pm"
+        del data["payload"]["claim_id"]
+        with pytest.raises(ValidationError):
+            append(log_path, data)
+        assert read_all(log_path) == []
+
+
+class TestOwnershipStoodDownPayloadValidation:
+    """TC-O1: `ownership_stood_down` payload validation (increment O, O.1)."""
+
+    def test_well_formed_self_standdown_is_accepted(self) -> None:
+        event = validate_event(_ownership_stood_down_event())
+        assert event.payload["written_by"] == "self"
+
+    def test_well_formed_on_behalf_standdown_is_accepted(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "claimant"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        data["payload"]["claim_key"] = "own:proj-abc123:portable/ws/proj/local-2:after:eid-declared-1"
+        event = validate_event(data)
+        assert event.payload["claimant"] == "portable/ws/proj/local-2"
+
+    def test_well_formed_on_behalf_stand_down_written_by_is_accepted(self) -> None:
+        """R1: an honest on-behalf stand-down (`--node-id`, distinct from the
+        acting identity) is its own `written_by`/`basis` value — never
+        misreported as the target's own voluntary self stand-down."""
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "on_behalf"
+        data["payload"]["reason"] = "handing off before a maintenance window"
+        event = validate_event(data)
+        assert event.payload["written_by"] == "on_behalf"
+        assert event.payload["basis"] == "on_behalf"
+        assert event.payload["claimant"] is None
+        assert event.payload["claim_key"] is None
+
+    def test_on_behalf_stand_down_requires_a_reason(self) -> None:
+        """R1: `--node-id`'s CLI usage check requires `--reason`; the schema
+        enforces the same rule for any direct `core.events.append` caller."""
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "on_behalf"
+        data["payload"]["reason"] = None
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_on_behalf_with_non_null_claimant_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "on_behalf"
+        data["payload"]["reason"] = "handing off"
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_on_behalf_basis_written_by_mismatch_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "on_behalf"
+        data["payload"]["basis"] = "self"
+        data["payload"]["reason"] = "handing off"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_missing_stood_down_from_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        del data["payload"]["stood_down_from"]
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_out_of_enum_written_by_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "bogus"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_out_of_enum_basis_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["basis"] = "bogus"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_claimant_written_by_without_claim_key_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "claimant"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        # claim_key left None
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_multiline_reason_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "line one\nline two"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_empty_string_reason_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "   "
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize("terminator", ["\n", "\r\n", "\r", " "])
+    def test_trailing_line_break_in_reason_is_rejected(self, terminator: str) -> None:
+        """Fix round 2: a trailing line break in `reason` is rejected."""
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "done" + terminator
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_line_separator_u2028_in_reason_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "line one line two"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_c0_control_character_in_reason_is_rejected(self) -> None:
+        """F2: `unicodedata.category(ch) == "Cc"` catches a C0/C1 control
+        character embedded mid-string (e.g. ESC, BEL) that `splitlines()`
+        does not treat as a line break, so it would otherwise slip through
+        the single-line check unbounded."""
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = "done[31mred"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    @pytest.mark.parametrize(
+        "char, label",
+        [
+            ("‮", "U+202E RIGHT-TO-LEFT OVERRIDE"),
+            ("​", "U+200B ZERO WIDTH SPACE"),
+            ("⁦", "U+2066 LEFT-TO-RIGHT ISOLATE"),
+        ],
+        ids=["u202e-bidi-override", "u200b-zero-width-space", "u2066-lr-isolate"],
+    )
+    def test_cf_format_character_in_reason_is_rejected(self, char: str, label: str) -> None:
+        """Item 6: `unicodedata.category(ch) == "Cf"` catches a Unicode
+        format character embedded mid-string -- a bidi override or a
+        zero-width character -- none of which are "Cc" controls, so the F2
+        check above never caught them, and none of them are line-break
+        characters either, so they would otherwise slip through the
+        single-line check unbounded."""
+        data = _ownership_stood_down_event()
+        data["payload"]["reason"] = f"done{char}red"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_written_by_self_with_non_null_claimant_is_rejected(self) -> None:
+        """M5: `written_by="self"` (the default fixture) asserts the OWNER
+        stood itself down — a non-null `claimant`/`claim_key` alongside it
+        is a self-contradictory payload (that combination belongs to
+        `written_by="claimant"`)."""
+        data = _ownership_stood_down_event()
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_written_by_self_with_non_null_claim_key_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["claim_key"] = "own:proj-abc123:portable/ws/proj/local-2:after:genesis"
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_basis_self_with_written_by_claimant_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "claimant"
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        data["payload"]["claim_key"] = "own:proj-abc123:portable/ws/proj/local-2:after:genesis"
+        # basis left as the fixture's "self" — invalid for written_by="claimant".
+        with pytest.raises(ValidationError):
+            validate_event(data)
+
+    def test_written_by_claimant_with_basis_notified_and_matching_pair_is_accepted(self) -> None:
+        """Sanity check alongside the two rejection tests above: the valid
+        combination must still be accepted."""
+        data = _ownership_stood_down_event()
+        data["payload"]["written_by"] = "claimant"
+        data["payload"]["basis"] = "notified"
+        data["payload"]["claimant"] = "portable/ws/proj/local-2"
+        data["payload"]["claim_key"] = "own:proj-abc123:portable/ws/proj/local-2:after:genesis"
+        event = validate_event(data)
+        assert event.payload["basis"] == "notified"
+
+    def test_unrecognized_payload_key_is_rejected(self) -> None:
+        data = _ownership_stood_down_event()
+        data["payload"]["extra"] = "nope"
+        with pytest.raises(ValidationError):
+            validate_event(data)

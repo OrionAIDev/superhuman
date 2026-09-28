@@ -483,6 +483,67 @@ def _ends_with_newline(log_path: Path) -> bool:
         return f.read(1) == b"\n"
 
 
+def _append_lines(log_path: Path, lines: str) -> None:
+    """Append pre-serialized, newline-terminated JSON line(s) to `log_path`.
+
+    Shared write tail for both `append` (one line) and `append_batch` (one
+    or more lines written together): if the log's final byte is not a
+    newline (a torn line from a crashed prior append), a newline is written
+    first so `lines` parses as its own complete record(s) — the torn line is
+    left behind as a separate, harmlessly-skippable line rather than being
+    glued onto the new content. Must be called with the log's exclusive lock
+    already held.
+
+    Args:
+        log_path: path to the event log (already resolved to a `Path`).
+        lines: one or more complete, newline-terminated JSON lines to append,
+            concatenated into a single string.
+    """
+    needs_leading_newline = not _ends_with_newline(log_path)
+    with open(log_path, "a", encoding="utf-8", newline="\n") as f:
+        if needs_leading_newline:
+            f.write("\n")
+        f.write(lines)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _validate_and_check_ownership(raw: Event | dict[str, Any]) -> Event:
+    """Validate `raw` and enforce write-boundary ownership on it (shared by `append`/`append_batch`).
+
+    Args:
+        raw: an `Event`, or a raw dict to validate first (NFR-7).
+
+    Returns:
+        Event: the validated, typed event.
+
+    Raises:
+        ValidationError: if `raw` fails schema validation. Nothing is written.
+        OwnershipError: if the event's `writer_role` may not write its `type`
+            or one of its owned payload fields (FR-8). Nothing is written.
+    """
+    data = asdict(raw) if isinstance(raw, Event) else raw
+    ev = validate_event(data)
+
+    # Ownership applies to the event's TYPE as well as its payload fields
+    # (GPT-5 review finding #1): FIELD_OWNERS marks `observation` and
+    # `recommendation` cto-owned, and schema.py documents them as
+    # "ownership-checked the same way" — but only checking `ev.payload` keys
+    # left `ev.type` itself unchecked, so a superhuman-side writer could
+    # forge `type="observation"` and it would sail through untouched.
+    # assert_writer_may() no-ops for any type with no FIELD_OWNERS/
+    # `_EVENT_WRITER_ROLES` entry (ordinary types like session_registered),
+    # so this is a pure addition.
+    assert_writer_may(ev.type, ev.writer_role)
+    for field in ev.payload:
+        # assert_writer_may() itself no-ops for a field with no FIELD_OWNERS
+        # entry (unowned/free) — calling it for every payload key is simpler
+        # and no less correct than pre-filtering to FIELD_OWNERS here.
+        assert_writer_may(field, ev.writer_role)
+
+    return ev
+
+
 def append(
     log_path: Path | str,
     event: Event | dict[str, Any],
@@ -559,23 +620,7 @@ def append(
     # the log untouched, defeating NFR-7's "nothing bad is ever persisted"
     # guarantee for that one call path. This is the safety-critical write
     # boundary (DP#5): it validates every time, with no shortcut.
-    raw = asdict(event) if isinstance(event, Event) else event
-    ev = validate_event(raw)
-
-    # Ownership applies to the event's TYPE as well as its payload fields
-    # (GPT-5 review finding #1): FIELD_OWNERS marks `observation` and
-    # `recommendation` cto-owned, and schema.py documents them as
-    # "ownership-checked the same way" — but only checking `ev.payload` keys
-    # left `ev.type` itself unchecked, so a superhuman-side writer could
-    # forge `type="observation"` and it would sail through untouched.
-    # assert_writer_may() no-ops for any type with no FIELD_OWNERS entry
-    # (ordinary types like session_registered), so this is a pure addition.
-    assert_writer_may(ev.type, ev.writer_role)
-    for field in ev.payload:
-        # assert_writer_may() itself no-ops for a field with no FIELD_OWNERS
-        # entry (unowned/free) — calling it for every payload key is simpler
-        # and no less correct than pre-filtering to FIELD_OWNERS here.
-        assert_writer_may(field, ev.writer_role)
+    ev = _validate_and_check_ownership(event)
 
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -592,15 +637,105 @@ def append(
                 "nothing was written"
             )
 
-        needs_leading_newline = not _ends_with_newline(log_path)
-        with open(log_path, "a", encoding="utf-8", newline="\n") as f:
-            if needs_leading_newline:
-                f.write("\n")
-            f.write(_event_to_json_line(ev) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        _append_lines(log_path, _event_to_json_line(ev) + "\n")
 
     return ev
+
+
+def append_batch(
+    log_path: Path | str,
+    events: list[Event | dict[str, Any]],
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    retry_interval: float = _DEFAULT_RETRY_INTERVAL,
+    precondition: Callable[[list[Event]], bool] | None = None,
+) -> list[Event]:
+    """Append a batch of validated events under ONE lock hold (increment O, O.5).
+
+    A sibling of `append`, added for O-FR-4: some callers (`core.project_owner
+    .claim`) need two events — an on-behalf stand-down plus the claim itself —
+    written atomically, so no racing writer can observe one without the
+    other. `append` itself is unchanged (see `_append_lines`/
+    `_validate_and_check_ownership`, the two private helpers this function
+    shares with it) and its own test suite pins that.
+
+    Every event is validated and ownership-checked (same rules as `append`)
+    **before** the lock is taken, and a duplicate `idempotency_key` within
+    one batch is rejected before the lock too — nothing partial is ever
+    attempted. Under a single lock hold: the log is read once; events whose
+    `idempotency_key` already exists are dropped (per-event dedupe,
+    mirroring `append`'s unconditional dedupe). If every event was already
+    present, `precondition` is **not** called and `[]` is returned — a pure
+    retry of an already-fully-recorded batch is a safe no-op, exactly like
+    `append`'s own dedupe semantics. Otherwise `precondition` (if given) runs
+    **once**, against the fresh, post-dedupe `existing` list, immediately
+    before the remaining events are written as a single write + single fsync.
+
+    Args:
+        log_path: path to the event log.
+        events: the events to append, in the order they should be written
+            (O-FR-4's on-behalf stand-down goes first, then the claim).
+            `Event`s or raw dicts; each is independently validated.
+        timeout: seconds to keep retrying lock acquisition.
+        retry_interval: seconds to sleep between lock-acquisition retries.
+        precondition: optional callable taking the event list already
+            persisted in the log (fresh, under the lock) and returning
+            whether the write may proceed. Runs at most once per call, and
+            only when at least one event in the batch is not yet present.
+
+    Returns:
+        list[Event]: the events actually appended, in the order given
+        (already-present events are omitted); `[]` if every event in the
+        batch was already recorded.
+
+    Raises:
+        ValidationError: if any event fails schema validation. Nothing is
+            written.
+        OwnershipError: if any event's `writer_role` may not write its type
+            or an owned payload field. Nothing is written.
+        ValueError: if `events` is empty, or two events in the batch compute
+            to the same `idempotency_key` (O-FR-4 — a batch cannot dedupe
+            against itself the way repeated calls dedupe against the log).
+            Raised before the lock is taken; nothing is written.
+        PreconditionUnmet: if `precondition` is given and returns falsy.
+            Nothing is written.
+        LockTimeoutError: if the lock could not be acquired in time.
+    """
+    if not events:
+        raise ValueError("append_batch: events must be non-empty")
+
+    validated = [_validate_and_check_ownership(event) for event in events]
+
+    seen_keys: set[str] = set()
+    for ev in validated:
+        if ev.idempotency_key in seen_keys:
+            raise ValueError(
+                f"append_batch: duplicate idempotency_key {ev.idempotency_key!r} "
+                "within one batch — a batch cannot contain the same event twice"
+            )
+        seen_keys.add(ev.idempotency_key)
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with LockedLog(log_path, timeout=timeout, retry_interval=retry_interval):
+        existing = read_all(log_path)
+        existing_keys = {e.idempotency_key for e in existing}
+        to_write = [ev for ev in validated if ev.idempotency_key not in existing_keys]
+
+        if not to_write:
+            return []
+
+        if precondition is not None and not precondition(existing):
+            raise PreconditionUnmet(
+                "precondition rejected append_batch of idempotency_key(s)="
+                f"{[ev.idempotency_key for ev in to_write]!r}; nothing was written"
+            )
+
+        lines = "".join(_event_to_json_line(ev) + "\n" for ev in to_write)
+        _append_lines(log_path, lines)
+
+    return to_write
 
 
 def read_all(log_path: Path | str) -> list[Event]:

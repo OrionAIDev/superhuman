@@ -487,6 +487,123 @@ actually unlaunched. If a handoff you know was emitted is missing from `fleet ha
 did not expect it to have launched yet, that is worth checking too, not just the rows the command
 actually lists.
 
+## Declaring ownership (`fleet owner`)
+
+Unlike every `observe` verb, `fleet owner claim|stand-down|show` is a **deliberate act**: it fails
+loudly with a stated, non-zero exit rather than the fail-soft façade's always-exits-0 contract, and
+a refused or failed call leaves the manifest log byte-unchanged.
+
+**The two events and the read rule.** A claim writes an `ownership_declared` event; a stand-down
+writes an `ownership_stood_down` event. Ownership is read by *folding* every one of a project's
+events, in log order (`core.project_owner.fold_owner`) — never by counting lines or assuming any
+pairing between the two event types. The fold's actual rules:
+
+- A declaration always makes its node the current owner — even displacing a prior owner with no
+  stand-down in between, so a forged or legacy sequence still has exactly one answer.
+- A stand-down clears the owner only when it names that owner's own declaring `event_id` as its
+  `stood_down_from`. On a project with no `ownership_declared` event at all there is no declared
+  owner to clear, so this never fires there — but any valid stand-down still counts as an
+  ownership event (`has_ownership_events` becomes `True`), and in that no-declaration case the
+  only stand-down `fleet owner stand-down` permits at all is the legacy owner's own. So the
+  practical effect there is not "clearing the owner" but ending OQ-1 legacy-owner resolution
+  (which only runs while `has_ownership_events` is `False`) — after it, `fold_owner` reports
+  `owner=None` on its own, with no legacy fallback. Any other valid stand-down (one that does not
+  match the current owner's declaring `event_id`) still moves the fold's anchor (so `fleet owner
+  show` reflects it happened) but leaves the current owner unchanged.
+- A stand-down written `written_by="claimant"` (the paired takeover stand-down a claim writes for
+  the prior owner) is skipped entirely — as if it never happened, an *orphan* — unless its
+  `claim_key` matches the `idempotency_key` of some real `ownership_declared` event by that exact
+  `claimant`. This is what makes a torn write (an interrupted batch that persisted only the
+  stand-down half of a claim) invisible to every reader, rather than a phantom vacated ownership.
+  A `written_by="self"` or `written_by="on_behalf"` stand-down (the CLI's own-identity and
+  `--node-id` paths, respectively — the latter honestly recording that the acting identity differs
+  from the standing-down node, R1) is never subject to this orphan check; only the `stood_down_from`
+  rule above governs whether either one clears the owner.
+
+`fleet owner show` performs this fold for you and also prints the basis and attestation of the
+claim that made the current owner current — read it (or call `fold_owner` directly), never derive
+ownership by scanning the raw event log yourself.
+
+**Exit codes.**
+- **Exit 0** — the claim or stand-down was written (or was already a no-op, e.g. re-claiming your
+  own existing ownership).
+- **Exit 1** — could not write: a lock timeout after bounded retry, a validation/ownership error,
+  the bounded re-evaluation budget exhausted against a changing ownership state, an
+  adapter-construction/identity failure, an unusable `--sessions-json` (missing, unreadable, not
+  JSON, or not a list of objects), or an I/O error reading/writing the manifest.
+- **Exit 2** — a usage error: `--prior-owner-notified` and `--notified-via` were not given
+  together, `--node-id` was combined with a self-identity flag, or a required self-identity flag is
+  missing (`--harness claude` with no `--session-id`/`CLAUDE_CODE_SESSION_ID`, or a non-claude
+  harness with no `--local-id` — see "Identity" below); these hand-checked cases are printed and
+  returned the same way every other refusal is, never routed through argparse's own usage path. A
+  plain argparse-level usage error (e.g. `--lock-retry-attempts` given a value below 1) still exits
+  2 as well, via argparse's own path, before any of this project's own checks run.
+- **Exit 3** — coordination required: an active prior owner exists with no or mismatched
+  attestation. The message names the current owner's node id; re-run adding
+  `--prior-owner-notified <that node id> --notified-via <how you reached it>` once you have told
+  that session.
+- **Exit 4** — refused: state is not what was assumed (`--node-id` given without
+  `--writer-role cto`, the claimant/node is not registered in this project when no session facts
+  could be supplied to register it — see "Claim registers the session if needed" below —, or a
+  stand-down was attempted by a node that is neither the project's current declared owner nor its
+  legacy owner).
+- **Exit 5** — not applicable: fleet is disabled, the slug is invalid, or the project identity
+  could not be resolved. Skip it and proceed.
+
+**The coordination rule.** A claim over an *active* prior owner is refused (exit 3) unless the
+claimant attests it notified that owner — `--prior-owner-notified`/`--notified-via` together. This
+is what makes takeover a deliberate, coordinated act rather than a silent race.
+
+**The legacy-owner coordination rule.** A project with no `ownership_declared` event yet is not
+automatically unowned for coordination purposes: if it has a `relayed`/`manual` registration
+written by `pm` for a node other than the claimant, that registration counts as a *legacy* prior
+owner, and claiming over it needs the same coordination (or the same liveness-based exception) a
+real declared owner would. Only the NEWEST such qualifying registration counts — if more than one
+node was ever registered this way for the project, every earlier one is irrelevant to this rule,
+never coordinated with. `fleet owner show` says so — a project with no ownership events at all
+still names its legacy owner (and notes it is not a real declared owner yet) when one exists,
+instead of silently reporting "no declared owner" as if the project had never been touched.
+
+**Claim registers the session if needed.** A claimant with no prior `session_registered` event in
+the project is no longer refused outright: `fleet owner claim`'s self path (not the `--node-id`
+on-behalf path, which has no session facts to offer) registers the claimant in the SAME write as
+the claim itself, using the identity it already resolved. This closes the gap where a session
+started with the plain `observe session-start` line (no `--harness`, so it registered under a
+different, process-lifetime-only identity) could never satisfy a later `owner claim` under its real
+harness identity — see "Identity" just below for why that gap existed.
+
+**Identity.** An owner verb needs an identity that is stable ACROSS separate process invocations,
+not just within one — a claim and its later stand-down are always two different processes.
+`--harness claude` reads `--session-id` if given, else the `CLAUDE_CODE_SESSION_ID` environment
+variable; if neither is present, the verb refuses with exit 2 rather than guessing. Every other
+harness (`portable`, `subagent`) requires an explicit `--local-id` — a bare process id is a new
+value on every invocation and is therefore useless as a repeatable identity. The on-behalf
+`--node-id` path (paired with `--writer-role cto`) names its target directly and has none of this
+to resolve.
+
+**Legacy stand-down.** A node that IS the legacy prior owner described above (the newest
+`relayed`/`manual` `pm` registration, with no `ownership_declared` event yet for the project) can
+stand itself down the same way a real declared owner would, even though no one has formally claimed
+the project yet. That stand-down is recorded as a real `ownership_stood_down` event, so the project
+now shows its ownership as vacated, and a successor's claim lands uncontested rather than needing to
+coordinate with a registration that was never a real claim to begin with.
+
+**The O-NFR-2 limit, stated plainly: the fleet records the attestation and does not and cannot
+verify that the message was delivered.** `--prior-owner-notified`/`--notified-via` are taken at
+face value and stored with the claim; nothing in this project confirms the named prior owner ever
+actually saw the notification.
+
+**The `unknown`-counts-as-active rule.** Liveness is read only from records supplied via
+`--sessions-json` (DESIGN O.4); when no record matches a node — or no `--sessions-json` was given
+at all — its liveness is `unknown`, and `unknown` counts as **active** for the coordination rule
+above. This is the conservative default: it is always safer to ask for coordination when liveness
+can't be confirmed than to let an unconfirmed takeover through.
+
+**The `deleted`-reachability note.** Liveness resolution never infers `deleted` from a session's
+absence in `--sessions-json` — an absent or ambiguous match always resolves to `unknown`, never
+`deleted`. `deleted` (were it ever produced) would mean positive evidence the harness reports the
+session gone, not merely "not found in this snapshot."
+
 ## Stated limitations
 
 This project is deliberately honest about where it does not reach, rather than presenting a
@@ -538,6 +655,50 @@ confident-looking surface that quietly covers less than it appears to.
     the full list), and every fault in its own machinery already lets the dispatch through by
     design. Treat a passing gate as evidence of an honest mistake avoided, never as proof against a
     determined attempt.
+11. **An `owner claim`'s attestation is recorded, not verified.** `--prior-owner-notified`/
+    `--notified-via` are taken at face value — the fleet has no way to confirm the named prior
+    owner ever actually received the notification (O-NFR-2). Both the successor's launch-instruction
+    claim step and PM's own stand-down-at-handoff step are, in addition, reachable only through
+    prose a launched session or PM must act on — see "Declaring ownership" above. F5: the SAME
+    unverified-self-report caveat applies to `--sessions-json`-sourced liveness (DESIGN O.4) — an
+    `isArchived`/`isDeleted` flag is taken from whatever the caller supplied, not independently
+    confirmed against the harness; a caller could supply a stale or fabricated snapshot and a claim
+    would take it at face value the same way it takes an attestation at face value.
+12. **An `owner stand-down --node-id` records its own `written_by`/`basis` value, `"on_behalf"` —
+    distinct from `"self"` (R1) — but this is a coordination aid, not an access control.** Before
+    this, every stand-down through the CLI, including the `--node-id` on-behalf path, was recorded
+    identically as `written_by="self"`, misreporting a third party's action as the standing-down
+    node's own voluntary choice. `fold_owner` treats `"on_behalf"` exactly like `"self"` for
+    clearing ownership (never subject to the orphan check that only applies to
+    `written_by="claimant"`); only the recorded `written_by`/`basis`/`reason` differ. `--node-id`
+    requires `--reason` (exit 2 if missing) and `--writer-role cto` — but self-identity flags
+    (`--session-id`, `--local-id`, `CLAUDE_CODE_SESSION_ID`) and `--writer-role` are asserted by
+    the caller, not independently verified: `written_by` records which CLI path was used, not a
+    verified actor, and the `cto`-writer-role gate on `--node-id` guards against an honest mistake
+    (an ordinary session accidentally acting on another's behalf), not a deliberate misuse by a
+    caller willing to pass `--writer-role cto`. The asymmetry runs the other way for `owner claim`:
+    an on-behalf claim (`owner claim --node-id`) carries no `on_behalf` marker in its payload at
+    all, so there is no distinguishable record for a claim made on another node's behalf, only for
+    a stand-down. Ownership here is a coordination aid among cooperating sessions, not an
+    access-control boundary.
+13. **`fleet owner show` names the OQ-1 legacy owner when the project has no `ownership_declared`
+    event at all**, the same as a claim's own coordination check would — read its output (or the
+    `legacy_owner` field in `--json` mode), not just `owner`, before assuming "no declared owner"
+    means no coordination is needed.
+14. **`--harness claude`'s explicit `--session-id` always takes precedence over
+    `CLAUDE_CODE_SESSION_ID`** when both are present — the environment variable is read only as a
+    fallback when `--session-id` was not given (or was blank).
+
+**Known limitation: a torn batch that persists only a claim's registration half can leave that
+claimant looking like a legacy owner.** O14-a's register-if-absent writes the claimant's
+`session_registered` event in the SAME locked `append_batch` call as the claim (and any on-behalf
+stand-down) — but if the process is killed between that batch partially landing and completing (the
+same class of interruption "Torn batches" above documents for a claim's paired stand-down), the
+registration alone can persist while the `ownership_declared` half does not. If that registration
+happens to be `relayed`/`manual` and written by `pm`, the claimant then resolves as the OQ-1 legacy
+owner on the next read — not a real claim, but indistinguishable from one until a re-run. Re-running
+the SAME claim completes it: the registration half dedupes as a no-op (its idempotency key already
+exists) and only the still-missing `ownership_declared` half is written.
 
 ## Manual-smoke log
 

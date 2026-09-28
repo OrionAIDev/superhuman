@@ -17,6 +17,7 @@ from scripts.fleet.core.ownership import (
     _role_class,
     assert_writer_may,
 )
+from scripts.fleet.core.schema import FIELD_OWNERS
 
 
 class TestSuperhumanOwnedField:
@@ -214,3 +215,94 @@ class TestCtoRoleName:
 
     def test_cto_may_write_the_shared_done_level_field(self) -> None:
         assert_writer_may("done_level", "CTO")  # must not raise
+
+
+class TestOwnershipEventTypesAreDocumentedSharedInFieldOwnersM6:
+    """M6: DESIGN O.2 documents `ownership_declared`/`ownership_stood_down`
+    as `FIELD_OWNERS["...] = "shared"` — the actual gate is still the role
+    ALLOWLIST (`_EVENT_WRITER_ROLES`, checked first), so adding these
+    entries must not change what is allowed (`TestOwnershipEventWriterAllowlist`
+    below stays green unmodified); this only makes the two types show up in
+    the table the way `done_level`'s own "shared" entry already does."""
+
+    @pytest.mark.parametrize("event_type", ["ownership_declared", "ownership_stood_down"])
+    def test_field_owners_marks_both_types_shared(self, event_type: str) -> None:
+        assert FIELD_OWNERS[event_type] == "shared"
+
+
+class TestOwnershipEventWriterAllowlist:
+    """TC-O2 (increment O, Decision O2): `pm`/`cto`/legacy `ceo` may write the
+    two ownership event types; every other role — including every other
+    `superhuman`-class role — is refused, at the `core.events.append` write
+    boundary itself, not only at a future CLI layer.
+    """
+
+    @pytest.mark.parametrize("event_type", ["ownership_declared", "ownership_stood_down"])
+    @pytest.mark.parametrize("role", ["pm", "PM", "cto", "CTO", "ceo", "CEO"])
+    def test_allowlisted_roles_may_write_both_new_types(self, event_type: str, role: str) -> None:
+        assert_writer_may(event_type, role)  # must not raise
+
+    @pytest.mark.parametrize("event_type", ["ownership_declared", "ownership_stood_down"])
+    @pytest.mark.parametrize("role", ["Developer", "Architect", "QA", "Tester", "Project Manager"])
+    def test_non_allowlisted_roles_are_refused(self, event_type: str, role: str) -> None:
+        with pytest.raises(OwnershipError):
+            assert_writer_may(event_type, role)
+
+    def _ownership_event(self, idempotency_key: str, writer_role: str, event_type: str) -> dict:
+        payload = (
+            {
+                "claim_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "anchor": "genesis",
+                "prior_owner": None,
+                "prior_owner_kind": "none",
+                "basis": "unowned",
+                "prior_owner_liveness": None,
+                "liveness_source": "not-supplied",
+                "attestation": None,
+            }
+            if event_type == "ownership_declared"
+            else {
+                "stood_down_from": "eid-declared-1",
+                "written_by": "self",
+                "basis": "self",
+                "claimant": None,
+                "claim_key": None,
+                "reason": None,
+            }
+        )
+        return {
+            "schema_version": 1,
+            "event_id": f"eid-{idempotency_key}",
+            "idempotency_key": idempotency_key,
+            "ts": "2026-08-14T12:00:00Z",
+            "type": event_type,
+            "project_id": "proj-abc",
+            "node_id": "portable/ws/proj/local-1",
+            "writer_role": writer_role,
+            "payload": payload,
+        }
+
+    @pytest.mark.parametrize("event_type", ["ownership_declared", "ownership_stood_down"])
+    def test_developer_is_refused_via_direct_append_and_writes_nothing(
+        self, event_type: str, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        with pytest.raises(OwnershipError):
+            append(
+                log_path,
+                self._ownership_event(f"key-{event_type}-dev", "Developer", event_type),
+            )
+        assert read_all(log_path) == []
+
+    @pytest.mark.parametrize("event_type", ["ownership_declared", "ownership_stood_down"])
+    @pytest.mark.parametrize("role", ["pm", "cto", "ceo"])
+    def test_allowlisted_role_via_direct_append_succeeds(
+        self, event_type: str, role: str, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "events.jsonl"
+        result = append(
+            log_path,
+            self._ownership_event(f"key-{event_type}-{role}", role, event_type),
+        )
+        assert result is not None
+        assert read_all(log_path)[0].type == event_type

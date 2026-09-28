@@ -19,7 +19,15 @@ so the identical class of defect stood unfixed in a sibling module.
 
 from __future__ import annotations
 
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
+
+
+class InvalidSlug(ValueError):
+    """`slug` cannot be safely joined onto a project path (FIX 4).
+
+    Raised by `default_fleet_dir` — never a path-traversal-shaped or
+    symlink-confined result, only a clean rejection before any I/O.
+    """
 
 
 def slug_is_safe(slug: str) -> bool:
@@ -63,3 +71,48 @@ def slug_is_safe(slug: str) -> bool:
     if PureWindowsPath(slug).drive:
         return False
     return True
+
+
+def default_fleet_dir(workspace: Path | str, slug: str) -> Path:
+    """Return the slug-validated default per-project fleet manifest directory.
+
+    The single shared, validated home for `<workspace>/docs/superhuman/<slug>/
+    fleet` (Phase 3.3 preflight FIX 4). `observe.py`'s `_default_fleet_dir`
+    delegates to this function; `cli.py`'s own `_default_fleet_dir` does
+    **not** (it predates this validation and is unchanged — DESIGN O.3: "Do
+    not reuse `cli._default_fleet_dir`: it lacks FIX 4's slug validation").
+    Any new caller that resolves a fleet manifest directory from a
+    caller-supplied `slug` — the `fleet owner` verb group, increment O —
+    must call this one, not build the path itself.
+
+    Args:
+        workspace: the project's working tree root.
+        slug: the superhuman project slug.
+
+    Returns:
+        Path: `<workspace>/docs/superhuman/<slug>/fleet`.
+
+    Raises:
+        InvalidSlug: if `slug` contains `/`, `\\`, `..`, or a Windows drive
+            segment (`slug_is_safe` is `False`), or if the final `fleet`
+            path component itself resolves outside
+            `<workspace>/docs/superhuman/<slug>/` — defense in depth
+            against `fleet` specifically being (or being replaced by) a
+            symlink pointing elsewhere. F8: this check is scoped to that one
+            component; it does NOT defend against `workspace`, `docs`,
+            `superhuman`, or `<slug>` themselves being symlinks elsewhere on
+            disk (both `fleet_dir` and `expected_root` below are built from,
+            and resolve through, the SAME unresolved `workspace_path`, so a
+            symlink earlier in the path is followed consistently by both
+            sides and never trips this check either way) — a caller passing
+            an attacker-influenced `workspace` is a distinct, unaddressed
+            concern.
+    """
+    if not slug_is_safe(slug):
+        raise InvalidSlug(f"invalid slug {slug!r}: path separators and '..' are not permitted")
+    workspace_path = Path(workspace)
+    fleet_dir = workspace_path / "docs" / "superhuman" / slug / "fleet"
+    expected_root = (workspace_path / "docs" / "superhuman" / slug).resolve()
+    if not fleet_dir.resolve().is_relative_to(expected_root):
+        raise InvalidSlug(f"slug {slug!r} resolves outside the workspace ({workspace_path})")
+    return fleet_dir

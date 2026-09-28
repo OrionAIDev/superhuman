@@ -480,6 +480,35 @@ and the project being observed is normally a different directory from the skill 
 
 ---
 
+## Ownership stand-down at handoff
+
+When PM emits a handoff that hands the project to a successor session (not a side task), PM runs
+`python -m scripts.fleet.cli owner stand-down --workspace ... --slug ... <identity>` after the
+prompt is produced, using the exact SAME `--workspace` and identity it claimed with (O14-d: node
+ids hash the workspace, so a different `--workspace` value — e.g. the current worktree instead of
+the main checkout root the claim used — resolves to a different node and this stand-down will not
+find PM's own ownership at all). `<identity>` is `--harness claude` (no id flag needed — PM's own
+session id is read from its environment automatically) for a Claude PM session, or `--harness <h>
+--local-id <the same stable name this PM session used to claim>` for any other harness. Standing
+down first is what makes the successor's later `owner claim` land without needing the coordination
+step; skipping it does not block anything — it just means the successor's claim will hit exit 3
+(an active prior owner) and go through `--prior-owner-notified`/`--notified-via` instead.
+(If you never ran `owner claim`, use the `--workspace` you passed to `observe session-start`.)
+
+Exit 4 here means THIS identity (the exact `--workspace`/harness/id combination just used) holds no
+ownership — either PM never actually claimed, or it claimed under a different `--workspace` or
+identity than this stand-down is using — so there is nothing for this call to stand down. Report it
+as "nothing to stand down," not a failure to report as a defect (exit 5 means fleet is not in use
+here and is skipped; other refusals, e.g. exit 1/2, are still reported, per the paragraph below).
+
+This is non-gating: it never changes a gate's meaning, order, or pass condition. A refusal or
+failure is reported, not ignored — but the gate outcome never depends on it, and PM's own
+progression continues unaffected either way.
+
+When reporting an owner to a person, name the session by its title, not its node id.
+
+---
+
 ## Fleet dispatch observation (spawned path)
 
 After PM issues a subagent dispatch — any `<dispatch:agent>` call whose prompt leads with a
