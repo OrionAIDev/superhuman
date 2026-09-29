@@ -320,6 +320,10 @@ class TestErrorClassAndFR13Surfacing:
                 str(workspace),
                 "--slug",
                 slug,
+                # superhuman#43: a stable identity, so the run reaches the
+                # Project-id check instead of stopping at the missing one.
+                "--local-id",
+                "fr13-session",
             ]
         )
 
@@ -349,6 +353,61 @@ class TestErrorClassAndFR13Surfacing:
 
         assert result.error_class == "identity_unresolved"
         assert capsys.readouterr().out == ""
+
+
+class TestNoPidDerivedIdentity:
+    """superhuman#43: the bare SKILL.md line (no --hook-payload, no
+    --local-id, default --harness portable) used to register
+    `portable/<ws>/<slug>/<pid>` -- the pid of a process that exits at once,
+    so every run minted a new phantom node. It now records nothing."""
+
+    def _registered_node_ids(self, workspace: Path, slug: str) -> list[str]:
+        log_path = _fleet_dir(workspace, slug) / "events.jsonl"
+        if not log_path.exists():
+            return []
+        events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return [e["node_id"] for e in events if e.get("type") == "session_registered"]
+
+    def test_bare_portable_session_start_records_nothing(
+        self, enabled_project: tuple[Path, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace, slug = enabled_project
+        argv = ["observe", "session-start", "--workspace", str(workspace), "--slug", slug]
+
+        assert fleet_cli.main(argv) == 0
+        assert fleet_cli.main(argv) == 0
+
+        assert self._registered_node_ids(workspace, slug) == []
+        assert "--local-id" in capsys.readouterr().err
+
+    def test_portable_with_local_id_registers_that_stable_node(
+        self, enabled_project: tuple[Path, str]
+    ) -> None:
+        workspace, slug = enabled_project
+        argv = ["observe", "session-start", "--workspace", str(workspace), "--slug", slug,
+                "--local-id", "stable-session-1"]
+
+        assert fleet_cli.main(argv) == 0
+        assert fleet_cli.main(argv) == 0
+
+        node_ids = self._registered_node_ids(workspace, slug)
+        assert len(node_ids) == 1
+        assert node_ids[0].startswith("portable/")
+        assert node_ids[0].endswith("/stable-session-1")
+
+    def test_claude_harness_reads_session_id_from_environment(
+        self, enabled_project: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace, slug = enabled_project
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-env-session-1")
+        argv = ["observe", "session-start", "--workspace", str(workspace), "--slug", slug,
+                "--harness", "claude"]
+
+        assert fleet_cli.main(argv) == 0
+
+        node_ids = self._registered_node_ids(workspace, slug)
+        assert len(node_ids) == 1
+        assert node_ids[0].endswith("/claude-env-session-1")
 
 
 class TestHookPayloadWiring:

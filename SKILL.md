@@ -53,7 +53,8 @@ You MUST follow Phase 0 BEFORE making ANY other decision when invoked.
 ## Fleet observation — session-start floor (non-gating)
 
 As your first action on every superhuman invocation, before Phase 0's HARD-GATE step 1, attempt
-`python -m scripts.fleet.cli observe session-start --workspace <project-root> --slug <slug>`,
+`python -m scripts.fleet.cli observe session-start --workspace <project-root> --slug <slug> --harness claude`
+(any other harness swaps `claude` for its own name and adds `--local-id <a stable session name>`),
 adding `--handoff-id <the id from that line>` when the invoking prompt carries a
 `FLEET-HANDOFF-ID:` line (fleet-wiring Chunk 3, Decision E — a prior session's `handoff-emit`
 embeds this line, along with its own self-register instruction, next to the id). This is purely
@@ -62,7 +63,10 @@ phase, it is idempotent (a repeat call on an already-registered session is a no-
 error), and with no `FLEET-HANDOFF-ID:` line to find it still registers the session — it simply
 attempts no id-anchored launch flip, rather than attempting nothing at all. Any failure (fleet
 disabled, an unavailable manifest write, or any other fault) is logged and kickoff proceeds
-unaffected — this step never determines whether Phase 0 or a resume proceeds.
+unaffected — this step never determines whether Phase 0 or a resume proceeds. Never run it
+bare: a Claude session's id is read from its own environment, but with neither `--harness claude`
+nor a stable local id the command records nothing, because a bare process id is not a stable
+identity (it is a new process every invocation).
 
 Run it from the superhuman **skill root** — the checkout holding this `SKILL.md`. There is no bare
 `fleet` executable to find: superhuman is a skill loaded by path, not an installed Python

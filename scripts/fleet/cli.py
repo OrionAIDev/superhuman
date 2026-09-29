@@ -1753,6 +1753,26 @@ def _cmd_observe_session_start(args: argparse.Namespace) -> int:
     args.workspace = workspace
     args.slug = slug
 
+    # superhuman#43: the same rule O14-b applies to the owner
+    # verbs. With no --hook-payload, `--harness portable` and no --local-id
+    # would fall back to PortableAdapter's `str(os.getpid())` -- the pid of
+    # THIS short-lived process, which no later command can ever resolve
+    # again. Registering it minted a phantom node per invocation (and landed
+    # any --handoff-id flip on that phantom). Record nothing instead; the
+    # verb stays non-gating (exit 0).
+    if args.harness == "claude" and not (args.session_id and args.session_id.strip()):
+        env_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+        if env_session_id:
+            args.session_id = env_session_id
+    if args.harness == "portable" and not (args.local_id and args.local_id.strip()):
+        print(
+            "fleet observe session-start: --harness portable needs --local-id (a stable "
+            "name for this session) -- a bare process id is not a stable identity, so "
+            "nothing was recorded; a Claude session passes --harness claude instead",
+            file=sys.stderr,
+        )
+        return 0
+
     adapter = _safe_build_adapter_for_observe(args, event="session-start")
     if adapter is None:
         return 0

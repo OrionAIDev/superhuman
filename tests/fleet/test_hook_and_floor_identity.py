@@ -375,12 +375,14 @@ class TestIdenticalVerb:
             "FR-15 requires the identical verb in both places, no parallel or "
             "divergent invocation"
         )
+        # superhuman#43: --harness/--local-id are part of the floor step --
+        # without them the portable default registered a phantom pid node.
         assert floor_session_flags == frozenset(
-            {"--workspace", "--slug", "--handoff-id"}
+            {"--workspace", "--slug", "--handoff-id", "--harness", "--local-id"}
         ), (
             f"SKILL.md's session-start-floor step names flags "
             f"{sorted(floor_session_flags)} -- expected "
-            "['--handoff-id', '--slug', '--workspace']"
+            "['--handoff-id', '--harness', '--local-id', '--slug', '--workspace']"
         )
         # NOTE: the hook's flags and the floor's flags are asserted
         # separately above, never against EACH OTHER -- they legitimately
@@ -398,7 +400,7 @@ class TestIdenticalVerb:
         # source, so this reads the actual text a launched session would
         # see, not a comment near it. Unlike the hook-vs-floor pair above,
         # this carrier and SKILL.md's floor step use the SAME explicit-flag
-        # form (both name --workspace/--slug/--handoff-id directly), so verb
+        # form (both name --workspace/--slug/--handoff-id/--harness directly), so verb
         # AND flags are required to match exactly here.
         base_instruction = format_launch_instruction()
         base_match = _VERB_INVOCATION_RE.search(base_instruction)
@@ -419,7 +421,7 @@ class TestIdenticalVerb:
             f"scripts/fleet/adapter/base.py's format_launch_instruction() names "
             f"flags {sorted(base_flags)}, but SKILL.md's floor step names "
             f"{sorted(floor_session_flags)} -- both carriers use the same explicit "
-            "--workspace/--slug/--handoff-id form and must name the same flags"
+            "--workspace/--slug/--handoff-id/--harness form and must name the same flags"
         )
 
         # --- Dispatch pair: the SubagentStart hook vs. both prose ----------
