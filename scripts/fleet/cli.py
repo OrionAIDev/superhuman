@@ -2727,7 +2727,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_parser.add_argument(
         "--lock-retry-attempts",
-        type=int,
+        type=_positive_int,
         default=_DEFAULT_LOCK_RETRY_ATTEMPTS,
         help=f"bounded registrar-level lock-contention retries (default: "
         f"{_DEFAULT_LOCK_RETRY_ATTEMPTS})",
@@ -3266,7 +3266,7 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         help="write the emitted prompt here instead of stdout",
     )
     emit_parser.add_argument(
-        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+        "--lock-retry-attempts", type=_positive_int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     emit_parser.set_defaults(func=_cmd_handoff_emit)
 
@@ -3288,7 +3288,7 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     cancel_parser.add_argument(
-        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+        "--lock-retry-attempts", type=_positive_int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     cancel_parser.set_defaults(func=_cmd_handoff_cancel)
 
@@ -3387,7 +3387,7 @@ def _add_handoff_subparsers(subparsers: argparse._SubParsersAction) -> None:
         "fleet.manifest_dir, else <workspace>/docs/superhuman/<slug>/fleet)",
     )
     self_register_parser.add_argument(
-        "--lock-retry-attempts", type=int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
+        "--lock-retry-attempts", type=_positive_int, default=_DEFAULT_LOCK_RETRY_ATTEMPTS
     )
     self_register_parser.set_defaults(func=_cmd_handoff_self_register)
 
