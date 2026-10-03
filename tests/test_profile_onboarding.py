@@ -890,6 +890,28 @@ def test_models_set_cli_answers_json_file_stdin_decodes_utf8_not_locale(
     )
 
 
+def test_models_set_cli_banner_survives_cp1252_stdout(tmp_path: Path) -> None:
+    """The success banner echoes the resolved alias with a bare `print()`.
+
+    On a cp1252 console U+2192 has no mapping, so the banner used to raise
+    `UnicodeEncodeError` AFTER the profile was already written -- a nonzero
+    exit for a command that had in fact succeeded. The env is passed through
+    the subprocess call, not a shell prefix, so the child's stdout really is
+    cp1252 on every platform.
+    """
+    dest = tmp_path / "p.yaml"
+    answers_json = json.dumps({"standard": {"primary": "opus→x"}})
+    result = subprocess.run(
+        [sys.executable, str(RESOLVER), "models", "set", "--profile", str(dest),
+         "--answers-json", answers_json],
+        capture_output=True, check=False,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == sp.EXIT_OK, result.stderr.decode("cp1252", errors="replace")
+    assert dest.is_file()
+    assert sp.load_profile(dest).models["standard"]["primary"] == "opus→x"
+
+
 def test_models_set_cli_both_answers_sources_exits_nonzero(tmp_path: Path) -> None:
     """FIX B (round 3): --answers-json and --answers-json-file are mutually exclusive."""
     dest = tmp_path / "profile.yaml"

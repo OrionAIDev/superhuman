@@ -169,6 +169,11 @@ All notable changes to this project will be documented in this file. Format adap
 
 ### Fixed
 
+- **`superhuman_profile.py` no longer crashes printing its banner on a narrow console codepage.**
+  `models set` echoes the resolved model aliases with a bare `print()`; on a cp1252 console an alias
+  containing a character such as U+2192 raised `UnicodeEncodeError` after the profile had already
+  been written, so a successful command exited nonzero. `main()` now reconfigures stdout and stderr
+  with `errors="backslashreplace"`. Decoding of input is unchanged.
 - **Every fleet verb now reads and writes the same manifest directory.** `fleet register`,
   `fleet handoff emit|cancel|stale|self-register`, `fleet done advance`, `fleet query edges`,
   `fleet status` and `fleet gen-view` ignored the profile's `fleet.manifest_dir` override; only

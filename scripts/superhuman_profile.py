@@ -3184,6 +3184,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         Process exit code.
     """
+    # Banners echo user-supplied model aliases with bare print(). On a console
+    # whose codepage cannot represent a character (cp1252 has no U+2192) that
+    # would raise after the work was already done; escape it instead.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args))
